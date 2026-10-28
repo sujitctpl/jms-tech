@@ -1,0 +1,92 @@
+{
+  "default_channel": "101",
+  "api_url": "http://127.0.0.1:8000",
+  "model": "models/yolo11m.pt",
+  "confidence": 0.25,
+  "imgsz": 960,
+  "face_model": "models/scrfd_2.5g_bnkps.onnx",
+  "face_confidence": 0.35,
+  "show_entry_line": true,
+  "face_scale": 1.05,
+  "allow_standalone_faces": false,
+  "box_smoothing": true,
+  "smoothing_alpha": 0.7,
+  "face_persistence": 8,
+  "body_persistence": 40,
+  "deadband_px": 3.5,
+  "line_y": 0.35,
+  "direction": "top_to_bottom",
+  "cameras": {
+    "101": {
+      "name": "Showroom Camera 101 (Main Glass Entrance)",
+      "camera_id": "88970b31-d885-4fd5-a24a-bdc969c96240",
+      "source": "rtsp://username:password@192.168.1.101:554/Streaming/Channels/101",
+      "entry_line": {
+        "enabled": true,
+        "p1": [
+          389,
+          250
+        ],
+        "p2": [
+          551,
+          113
+        ],
+        "direction": "top_to_bottom"
+      },
+      "sections": [
+        {
+          "id": "sales",
+          "name": "Sales Section",
+          "color": [
+            0,
+            200,
+            255
+          ],
+          "box": [
+            17,
+            283,
+            398,
+            609
+          ]
+        },
+        {
+          "id": "accounts",
+          "name": "Accounts Section",
+          "color": [
+            255,
+            140,
+            0
+          ],
+          "box": [
+            756,
+            60,
+            1035,
+            434
+          ]
+        }
+      ]
+    },
+    "201": {
+      "name": "Showroom Camera 201 (Floor & Display Area)",
+      "camera_id": "0e7e29df-7375-47ce-8c3f-bf03c14d6e67",
+      "source": "rtsp://username:password@192.168.1.101:554/Streaming/Channels/201",
+      "entry_line": null,
+      "sections": []
+    },
+    "301": {
+      "name": "Showroom Camera 301 (Lounge & Billing Desk)",
+      "camera_id": "8da1af51-b4fb-4745-bc47-a5a5c0e4571e",
+      "source": "rtsp://username:password@192.168.1.101:554/Streaming/Channels/301",
+      "entry_line": null,
+      "sections": []
+    },
+    "401": {
+      "name": "Showroom Camera 401 (Delivery Bay & Service Gate)",
+      "camera_id": "f959f6fc-eb56-4515-85c6-510f5c7fb27d",
+      "source": "rtsp://username:password@192.168.1.101:554/Streaming/Channels/401",
+      "entry_line": null,
+      "sections": []
+    }
+  }
+}
+

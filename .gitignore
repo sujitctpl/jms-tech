@@ -1,0 +1,102 @@
+# =============================================================================
+# Git Ignore - Showroom Visitor Intelligence System
+# =============================================================================
+
+# 1. Credentials, Secrets & Local Configs (NEVER COMMIT)
+.env
+.env.*
+!.env.example
+camera_config.json
+!camera_config.example.json
+*.pem
+*.key
+*.crt
+credentials.json
+token.json
+
+# 2. Python Virtual Environments & Packages
+.venv/
+venv/
+env/
+ENV/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 3. Python Bytecode, Caching & Testing
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# 4. Large Machine Learning Model Weights & Binaries
+*.pt
+*.pth
+*.onnx
+*.engine
+*.bin
+models/*
+!models/.gitkeep
+
+# 5. Frontend & Node.js (Dashboard)
+node_modules/
+dashboard/node_modules/
+dashboard/dist/
+dashboard/dist-ssr/
+dashboard/.env.local
+dashboard/.env.*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# 6. Database Files & Backups
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.sql
+
+# 7. Application Logs & Temporary Dumps
+logs/
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# 8. Build Artifacts & PyInstaller Executables
+build/
+dist/
+*.spec
+*.exe
+
+# 9. Media, Recordings & Screen Captures
+*.mp4
+*.avi
+*.mov
+*.mkv
+recordings/
+captures/
+temp_frames/
+
+# 10. OS & Editor Artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+

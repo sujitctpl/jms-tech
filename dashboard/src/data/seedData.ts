@@ -1,0 +1,283 @@
+import { Employee, AttendanceRecord, VisitorRecord, StoreHoursConfig, ShowroomSettings, VisitPurpose } from '../types';
+
+export const INITIAL_EMPLOYEES: Employee[] = [
+  {
+    id: 'emp-1',
+    name: 'Rajesh Kumar',
+    role: 'Senior Sales Consultant',
+    department: 'Sales',
+    phone: '+91 98450 12345',
+    email: 'rajesh.k@apexmotors.in',
+    avatarUrl: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=120&auto=format&fit=crop&q=80',
+  },
+  {
+    id: 'emp-2',
+    name: 'Priya Sharma',
+    role: 'Customer Experience & Delivery Lead',
+    department: 'Customer Relations',
+    phone: '+91 98450 23456',
+    email: 'priya.s@apexmotors.in',
+    avatarUrl: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=120&auto=format&fit=crop&q=80',
+  },
+  {
+    id: 'emp-3',
+    name: 'Amit Patel',
+    role: 'Service Workshop Manager',
+    department: 'Service',
+    phone: '+91 98450 34567',
+    email: 'amit.p@apexmotors.in',
+    avatarUrl: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=120&auto=format&fit=crop&q=80',
+  },
+  {
+    id: 'emp-4',
+    name: 'Vikram Singh',
+    role: 'Test Ride Specialist & Sales Executive',
+    department: 'Sales',
+    phone: '+91 98450 45678',
+    email: 'vikram.s@apexmotors.in',
+    avatarUrl: 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=120&auto=format&fit=crop&q=80',
+  },
+  {
+    id: 'emp-5',
+    name: 'Neha Gupta',
+    role: 'Vehicle Finance & Insurance Advisor',
+    department: 'Finance & Insurance',
+    phone: '+91 98450 56789',
+    email: 'neha.g@apexmotors.in',
+    avatarUrl: 'https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?w=120&auto=format&fit=crop&q=80',
+  },
+  {
+    id: 'emp-6',
+    name: 'Sunil Verma',
+    role: 'Genuine Spares & Accessories Executive',
+    department: 'Accessories & Spares',
+    phone: '+91 98450 67890',
+    email: 'sunil.v@apexmotors.in',
+    avatarUrl: 'https://images.unsplash.com/photo-1519085360753-af0119f7cbe7?w=120&auto=format&fit=crop&q=80',
+  },
+  {
+    id: 'emp-7',
+    name: 'Ananya Roy',
+    role: 'Front Desk Host & Visitor Relations',
+    department: 'Customer Relations',
+    phone: '+91 98450 78901',
+    email: 'ananya.r@apexmotors.in',
+    avatarUrl: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=120&auto=format&fit=crop&q=80',
+  },
+  {
+    id: 'emp-8',
+    name: 'Deepak Chauhan',
+    role: 'Pre-Delivery Inspector & Technician',
+    department: 'Service',
+    phone: '+91 98450 89012',
+    email: 'deepak.c@apexmotors.in',
+    avatarUrl: 'https://images.unsplash.com/photo-1522075469751-3a6694fb2f61?w=120&auto=format&fit=crop&q=80',
+  },
+];
+
+export const INITIAL_ATTENDANCE: AttendanceRecord[] = [
+  {
+    id: 'att-1',
+    employeeId: 'emp-1',
+    employeeName: 'Rajesh Kumar',
+    role: 'Senior Sales Consultant',
+    department: 'Sales',
+    avatarUrl: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=120&auto=format&fit=crop&q=80',
+    date: '2026-10-26',
+    checkInTime: null,
+    checkOutTime: null,
+    status: 'Absent',
+    workHours: 0,
+    method: 'Biometric',
+  },
+  {
+    id: 'att-2',
+    employeeId: 'emp-2',
+    employeeName: 'Priya Sharma',
+    role: 'Customer Experience & Delivery Lead',
+    department: 'Customer Relations',
+    avatarUrl: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=120&auto=format&fit=crop&q=80',
+    date: '2026-10-26',
+    checkInTime: null,
+    checkOutTime: null,
+    status: 'Absent',
+    workHours: 0,
+    method: 'Biometric',
+  },
+  {
+    id: 'att-3',
+    employeeId: 'emp-3',
+    employeeName: 'Amit Patel',
+    role: 'Service Workshop Manager',
+    department: 'Service',
+    avatarUrl: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=120&auto=format&fit=crop&q=80',
+    date: '2026-10-26',
+    checkInTime: null,
+    checkOutTime: null,
+    status: 'Absent',
+    workHours: 0,
+    method: 'CCTV AI Check-in',
+  },
+  {
+    id: 'att-4',
+    employeeId: 'emp-4',
+    employeeName: 'Vikram Singh',
+    role: 'Test Ride Specialist & Sales Executive',
+    department: 'Sales',
+    avatarUrl: 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=120&auto=format&fit=crop&q=80',
+    date: '2026-10-26',
+    checkInTime: null,
+    checkOutTime: null,
+    status: 'Absent',
+    workHours: 0,
+    method: 'Manual Override',
+  },
+  {
+    id: 'att-5',
+    employeeId: 'emp-5',
+    employeeName: 'Neha Gupta',
+    role: 'Vehicle Finance & Insurance Advisor',
+    department: 'Finance & Insurance',
+    avatarUrl: 'https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?w=120&auto=format&fit=crop&q=80',
+    date: '2026-10-26',
+    checkInTime: null,
+    checkOutTime: null,
+    status: 'Absent',
+    workHours: 0,
+    method: 'Biometric',
+  },
+  {
+    id: 'att-6',
+    employeeId: 'emp-6',
+    employeeName: 'Sunil Verma',
+    role: 'Genuine Spares & Accessories Executive',
+    department: 'Accessories & Spares',
+    avatarUrl: 'https://images.unsplash.com/photo-1519085360753-af0119f7cbe7?w=120&auto=format&fit=crop&q=80',
+    date: '2026-10-26',
+    checkInTime: null,
+    checkOutTime: null,
+    status: 'Absent',
+    workHours: 0,
+    method: 'Manual Override',
+  },
+  {
+    id: 'att-7',
+    employeeId: 'emp-7',
+    employeeName: 'Ananya Roy',
+    role: 'Front Desk Host & Visitor Relations',
+    department: 'Customer Relations',
+    avatarUrl: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=120&auto=format&fit=crop&q=80',
+    date: '2026-10-26',
+    checkInTime: null,
+    checkOutTime: null,
+    status: 'Absent',
+    workHours: 0,
+    method: 'Biometric',
+  },
+  {
+    id: 'att-8',
+    employeeId: 'emp-8',
+    employeeName: 'Deepak Chauhan',
+    role: 'Pre-Delivery Inspector & Technician',
+    department: 'Service',
+    avatarUrl: 'https://images.unsplash.com/photo-1522075469751-3a6694fb2f61?w=120&auto=format&fit=crop&q=80',
+    date: '2026-10-26',
+    checkInTime: null,
+    checkOutTime: null,
+    status: 'Absent',
+    workHours: 0,
+    method: 'Manual Override',
+  },
+];
+
+export const INITIAL_STORE_HOURS: StoreHoursConfig = {
+  openingTime: '09:30',
+  closingTime: '20:30',
+  timezone: 'Asia/Kolkata (IST +5:30)',
+  isOpenSunday: true,
+  notes: 'Showroom open 7 days a week. Service workshop closes at 7:00 PM on Sundays.',
+  actualFirstEntryToday: '09:34 AM',
+  actualLastExitToday: '02:28 PM', // Updated in real time as visitors leave
+};
+
+export const INITIAL_SHOWROOM_SETTINGS: ShowroomSettings = {
+  showroomName: 'Capermint Showroom',
+  brandDealership: 'Capermint Tech Intelligence',
+  address: 'Plot 42, Commercial Zone, Tech Park Corridor',
+  phone: '+91 11 4509 8800',
+  email: 'admin@capermint.com',
+  cameraStreams: [
+    {
+      id: 'cam-entry-1',
+      name: 'Main Glass Entrance NVR-01',
+      rtspUrl: 'rtsp://192.168.1.120:554/live/stream1',
+      zone: 'Main Entrance & Footfall Line',
+      status: 'online',
+      fps: 25,
+    },
+    {
+      id: 'cam-floor-2',
+      name: 'Scooter & Bike Display Floor NVR-02',
+      rtspUrl: 'rtsp://192.168.1.121:554/live/stream1',
+      zone: 'Display Lounge',
+      status: 'online',
+      fps: 25,
+    },
+    {
+      id: 'cam-delivery-3',
+      name: 'New Vehicle Delivery Bay NVR-03',
+      rtspUrl: 'rtsp://192.168.1.122:554/live/stream1',
+      zone: 'Ceremony Delivery Area',
+      status: 'online',
+      fps: 20,
+    },
+    {
+      id: 'cam-service-4',
+      name: 'Quick Service Reception NVR-04',
+      rtspUrl: 'rtsp://192.168.1.123:554/live/stream1',
+      zone: 'Service Entry Gate',
+      status: 'online',
+      fps: 25,
+    },
+  ],
+  cctvAiEnabled: true,
+  privacyComplianceEnabled: true,
+  autoTaggingAssistance: true,
+};
+
+export const INITIAL_VISITORS: VisitorRecord[] = [];
+
+// Historical footfall for the day (9 AM to 8 PM) - initialized to 0
+export const TODAY_HOURLY_FOOTFALL = [
+  { hour: '09:00 - 10:00 AM', visitors: 0, newVisitors: 0, returningVisitors: 0, testRides: 0, deliveries: 0 },
+  { hour: '10:00 - 11:00 AM', visitors: 0, newVisitors: 0, returningVisitors: 0, testRides: 0, deliveries: 0 },
+  { hour: '11:00 - 12:00 PM', visitors: 0, newVisitors: 0, returningVisitors: 0, testRides: 0, deliveries: 0 },
+  { hour: '12:00 - 01:00 PM', visitors: 0, newVisitors: 0, returningVisitors: 0, testRides: 0, deliveries: 0 },
+  { hour: '01:00 - 02:00 PM', visitors: 0, newVisitors: 0, returningVisitors: 0, testRides: 0, deliveries: 0 },
+  { hour: '02:00 - 03:00 PM', visitors: 0, newVisitors: 0, returningVisitors: 0, testRides: 0, deliveries: 0 },
+  { hour: '03:00 - 04:00 PM', visitors: 0, newVisitors: 0, returningVisitors: 0, testRides: 0, deliveries: 0 },
+  { hour: '04:00 - 05:00 PM', visitors: 0, newVisitors: 0, returningVisitors: 0, testRides: 0, deliveries: 0 },
+  { hour: '05:00 - 06:00 PM', visitors: 0, newVisitors: 0, returningVisitors: 0, testRides: 0, deliveries: 0 },
+  { hour: '06:00 - 07:00 PM', visitors: 0, newVisitors: 0, returningVisitors: 0, testRides: 0, deliveries: 0 },
+  { hour: '07:00 - 08:00 PM', visitors: 0, newVisitors: 0, returningVisitors: 0, testRides: 0, deliveries: 0 },
+];
+
+export const YESTERDAY_METRICS = {
+  totalVisitors: 0,
+  newVisitors: 0,
+  returningVisitors: 0,
+  avgDuration: 0,
+  peakHour: 'N/A',
+  peakCount: 0,
+};
+
+export const PURPOSE_COLORS: Record<VisitPurpose, string> = {
+  'Test Ride': '#ef4444', // Red (Capermint brand accent)
+  'Vehicle Enquiry': '#2563eb', // Blue (Capermint brand primary)
+  'Booking': '#10b981', // Emerald green
+  'Service': '#8b5cf6', // Violet
+  'Vehicle Delivery': '#f59e0b', // Amber (Capermint brand yellow accent)
+  'Spare Parts': '#06b6d4', // Cyan
+  'General Enquiry': '#64748b', // Slate
+  'Other': '#94a3b8', // Gray
+};
