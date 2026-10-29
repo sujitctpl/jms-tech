@@ -21,7 +21,7 @@ class Settings(BaseSettings):
 
     # Vision & Detection Settings
     YOLO_MODEL_PATH: str = "models/yolo11m.pt"
-    DETECTION_CONFIDENCE_THRESHOLD: float = 0.25
+    DETECTION_CONFIDENCE_THRESHOLD: float = 0.10
     PERSON_CLASS_ID: int = 0
     DEVICE: str = "cuda:0"
     TRACKER_TYPE: str = "bytetrack.yaml"
@@ -34,6 +34,20 @@ class Settings(BaseSettings):
 
     # Logging
     LOG_LEVEL: str = "INFO"
+
+    # Face Embedding & Identity Recovery Settings
+    ARCFACE_MODEL_PATH: str = "models/w600k_r50.onnx"
+    FACE_SIMILARITY_THRESHOLD: float = 0.52  # Calibrated threshold (rejects impostor/noise matches below 0.50)
+    FACE_MIN_SIZE: int = 24  # Minimum face width/height in pixels
+    FACE_MIN_CONFIDENCE: float = 0.35  # Minimum face detector confidence
+    FACE_BLUR_THRESHOLD: float = 12.0  # Minimum Laplacian variance for blur filtering
+    FACE_RECOGNITION_COOLDOWN_FRAMES: int = 5  # Cooldown between recognition attempts on unresolved tracks
+    FACE_MAX_RECOGNITION_ATTEMPTS: int = 5  # Maximum attempts per track to avoid redundant inference
+
+    # 14-Day Rolling Biometric Retention Policy Settings
+    FACE_RETENTION_DAYS: int = 14  # Expire embeddings not recognized for 14 days
+    RETENTION_CLEANUP_INTERVAL_HOURS: int = 24  # Run scheduled cleanup at least once daily
+    RETENTION_AUTO_CLEANUP_ENABLED: bool = True  # Enable background scheduled cleanup
 
 
 settings = Settings()

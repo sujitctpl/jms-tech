@@ -17,6 +17,7 @@ class TrackedPerson:
     box: Tuple[float, float, float, float]  # (x1, y1, x2, y2)
     confidence: float
     class_id: int
+    person_id: Optional[str] = None  # Persistent visitor identity (separated from temporary tracker_id)
 
     @property
     def bottom_center(self) -> Tuple[float, float]:
@@ -144,7 +145,7 @@ class PersonTracker:
 
         for det in detections:
             best_id = None
-            best_iou = 0.25  # minimum IoU threshold to match
+            best_iou = 0.10  # minimum IoU threshold to match
 
             for trk_id, prev_box in self._prev_tracks.items():
                 iou = self._calculate_iou(det.box, prev_box)

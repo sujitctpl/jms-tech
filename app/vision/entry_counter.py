@@ -21,6 +21,8 @@ class EntryLineCounter:
         self.track_positions: Dict[str, Tuple[float, float]] = {}
         # Duplicate prevention set: tracker_ids that have already triggered an entry event
         self.counted_track_ids: Set[str] = set()
+        # Duplicate prevention set for persistent person identities across tracking sessions
+        self.counted_person_ids: Set[str] = set()
 
     def update_config(self, config: Dict[str, Any]) -> None:
         self.config = config
@@ -68,16 +70,26 @@ class EntryLineCounter:
                 self.track_positions[tid] = curr_point
                 continue
 
+            # If persistent person identity has already been counted, link and suppress duplicate
+            pid = getattr(person, "person_id", None)
+            if pid and pid in self.counted_person_ids:
+                self.counted_track_ids.add(tid)
+                self.track_positions[tid] = curr_point
+                continue
+
             prev_point = self.track_positions.get(tid)
             if prev_point is not None:
                 if self._check_crossing(prev_point, curr_point):
                     logger.info(
-                        "Valid entry line crossing detected for track ID %s from %s to %s",
+                        "Valid entry line crossing detected for track ID %s (person: %s) from %s to %s",
                         tid,
+                        pid or "unresolved",
                         prev_point,
                         curr_point,
                     )
                     self.counted_track_ids.add(tid)
+                    if pid:
+                        self.counted_person_ids.add(pid)
                     new_entries.append(person)
 
             # Update tracked position for next frame

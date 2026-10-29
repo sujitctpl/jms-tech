@@ -5,6 +5,8 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 from app.core.logging import logger
 from app.db.models.camera import Camera
+from app.db.models.footfall_event import FootfallEvent
+from app.db.models.visitor_track import VisitorTrack
 from app.repositories.camera_repo import CameraRepository
 from app.repositories.footfall_event_repo import FootfallEventRepository
 from app.repositories.processing_run_repo import ProcessingRunRepository
@@ -149,6 +151,8 @@ class CameraService:
         run_repo = ProcessingRunRepository(self.db)
         track_repo = VisitorTrackRepository(self.db)
         footfall_repo = FootfallEventRepository(self.db)
+        from app.repositories.person_identity_repo import PersonIdentityRepository
+        identity_repo = PersonIdentityRepository(self.db)
 
         run_id = footfall_in.processing_run_id
         if not run_id:
@@ -157,12 +161,48 @@ class CameraService:
                 active_run = run_repo.create(camera.id)
             run_id = active_run.id
 
+        # Resolve persistent identity if provided
+        identity = None
+        if footfall_in.person_id:
+            identity = identity_repo.get_by_person_id(footfall_in.person_id)
+            # Reliable identity match updates last_seen_at
+            identity_repo.update_last_seen(footfall_in.person_id, footfall_in.occurred_at)
+
         vt = track_repo.get_or_create(
             camera_id=camera.id,
             processing_run_id=run_id,
             tracker_id=footfall_in.tracker_id,
             timestamp=footfall_in.occurred_at,
+            person_id=footfall_in.person_id,
+            person_identity_id=identity.id if identity else None,
         )
+
+        # Duplicate prevention: If this persistent person already entered during this run, suppress duplicate
+        if footfall_in.person_id:
+            existing_person_event = (
+                self.db.query(FootfallEvent)
+                .join(VisitorTrack, FootfallEvent.visitor_track_id == VisitorTrack.id)
+                .filter(
+                    VisitorTrack.processing_run_id == run_id,
+                    VisitorTrack.person_id == footfall_in.person_id,
+                )
+                .first()
+            )
+            if existing_person_event:
+                total_count = footfall_repo.get_total_entries(camera_id=camera.id)
+                logger.info(
+                    "Duplicate footfall suppressed: persistent visitor %s already counted in run %s",
+                    footfall_in.person_id,
+                    run_id,
+                )
+                return FootfallRecordResponse(
+                    success=True,
+                    camera_id=camera.id,
+                    visitor_track_id=vt.id,
+                    footfall_event_id=existing_person_event.id,
+                    total_camera_footfall=total_count,
+                    message="Visitor already recorded in current session. Duplicate entry suppressed.",
+                )
 
         event = footfall_repo.record_entry(
             camera_id=camera.id,

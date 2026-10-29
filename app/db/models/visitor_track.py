@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from app.db.models.processing_run import ProcessingRun
     from app.db.models.detection_event import DetectionEvent
     from app.db.models.footfall_event import FootfallEvent
+    from app.db.models.person_identity import PersonIdentity
 
 
 class VisitorTrack(Base):
@@ -46,6 +47,15 @@ class VisitorTrack(Base):
     status: Mapped[str] = mapped_column(
         String(20), default="ACTIVE", nullable=False, index=True
     )
+    person_identity_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("person_identities.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    person_id: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -62,4 +72,7 @@ class VisitorTrack(Base):
     )
     footfall_event: Mapped[Optional["FootfallEvent"]] = relationship(
         "FootfallEvent", back_populates="visitor_track", uselist=False
+    )
+    person_identity: Mapped[Optional["PersonIdentity"]] = relationship(
+        "PersonIdentity", back_populates="visitor_tracks"
     )

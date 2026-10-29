@@ -4,16 +4,20 @@ import { useAuth } from '../../context/AuthContext';
 import { AttendanceRecord, AttendanceStatus } from '../../types';
 import {
   UserCheck,
+  UserPlus,
   Search,
   Filter,
   FileSpreadsheet,
   Clock,
   CheckCircle,
+  CheckCircle2,
   AlertCircle,
   Calendar,
   Shield,
   Edit,
+  X,
 } from 'lucide-react';
+import { AddEmployeeModal } from '../modals/AddEmployeeModal';
 
 export const AttendanceView: React.FC = () => {
   const { user } = useAuth();
@@ -29,6 +33,8 @@ export const AttendanceView: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState('');
   const [departmentFilter, setDepartmentFilter] = useState('all');
   const [statusFilter, setStatusFilter] = useState('all');
+  const [isAddEmployeeModalOpen, setIsAddEmployeeModalOpen] = useState(false);
+  const [addedEmployeeNotification, setAddedEmployeeNotification] = useState<string | null>(null);
 
   // Edit attendance modal
   const [editingRecord, setEditingRecord] = useState<AttendanceRecord | null>(null);
@@ -42,16 +48,23 @@ export const AttendanceView: React.FC = () => {
 
   const filteredAttendance = attendance.filter((a) => {
     const q = searchQuery.toLowerCase();
-    const matchSearch =
-      a.employeeName.toLowerCase().includes(q) ||
-      a.role.toLowerCase().includes(q) ||
-      a.department.toLowerCase().includes(q);
+    const empName = (a.employeeName || '').toLowerCase();
+    const role = (a.role || '').toLowerCase();
+    const dept = (a.department || '').toLowerCase();
+    const matchSearch = empName.includes(q) || role.includes(q) || dept.includes(q);
 
     if (!matchSearch) return false;
     if (departmentFilter !== 'all' && a.department !== departmentFilter) return false;
     if (statusFilter !== 'all' && a.status !== statusFilter) return false;
     return true;
   });
+
+  const handleEmployeeAdded = (name: string) => {
+    setAddedEmployeeNotification(name);
+    setTimeout(() => {
+      setAddedEmployeeNotification(null);
+    }, 5000);
+  };
 
   const handleOpenEdit = (rec: AttendanceRecord) => {
     setEditingRecord(rec);
@@ -68,7 +81,37 @@ export const AttendanceView: React.FC = () => {
   };
 
   return (
-    <div className="space-y-6 pb-12">
+    <div className="space-y-6 pb-12 relative">
+      {/* Employee Added Toast / Popup Message */}
+      {addedEmployeeNotification && (
+        <div className="fixed top-6 right-6 z-50 animate-bounce-short max-w-md w-[92vw] sm:w-auto p-4 bg-emerald-600 text-white rounded-2xl shadow-2xl shadow-emerald-600/40 border border-emerald-400 flex items-center justify-between gap-3.5">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-white/20 flex items-center justify-center shrink-0">
+              <CheckCircle2 className="w-6 h-6 text-white" />
+            </div>
+            <div>
+              <span className="text-[10px] font-extrabold uppercase tracking-wider text-emerald-200">
+                Staff Registered
+              </span>
+              <h4 className="text-sm font-extrabold font-['Outfit'] leading-tight">
+                Employee <span className="underline decoration-white/70">{addedEmployeeNotification}</span> is added!
+              </h4>
+              <p className="text-[11px] text-emerald-100 mt-0.5">
+                Profile and biometric face photos enrolled. Active on showroom attendance.
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => setAddedEmployeeNotification(null)}
+            className="p-1.5 text-white/80 hover:text-white rounded-xl hover:bg-white/10 transition shrink-0"
+            title="Dismiss popup"
+            type="button"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
@@ -83,13 +126,23 @@ export const AttendanceView: React.FC = () => {
           </p>
         </div>
 
-        <button
-          onClick={exportAttendanceCSV}
-          className="px-3.5 py-2 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 rounded-xl text-xs font-semibold shadow-xs flex items-center gap-1.5 transition self-start sm:self-auto"
-        >
-          <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
-          <span>Export Attendance CSV</span>
-        </button>
+        <div className="flex items-center gap-2.5 self-start sm:self-auto">
+          <button
+            onClick={() => setIsAddEmployeeModalOpen(true)}
+            className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-semibold shadow-xs flex items-center gap-1.5 transition"
+          >
+            <UserPlus className="w-4 h-4" />
+            <span>Add Employee</span>
+          </button>
+
+          <button
+            onClick={exportAttendanceCSV}
+            className="px-3.5 py-2 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 rounded-xl text-xs font-semibold shadow-xs flex items-center gap-1.5 transition"
+          >
+            <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+            <span>Export Attendance CSV</span>
+          </button>
+        </div>
       </div>
 
       {/* 4 Stat KPI Cards */}
@@ -114,7 +167,7 @@ export const AttendanceView: React.FC = () => {
           </div>
           <p className="text-3xl font-extrabold text-emerald-900 font-['Outfit'] mt-1">{metrics.employeesPresent}</p>
           <span className="text-[11px] text-emerald-700 mt-0.5 block font-semibold">
-            {Math.round((metrics.employeesPresent / metrics.employeesTotal) * 100)}% attendance rate
+            {metrics.employeesTotal > 0 ? Math.round((metrics.employeesPresent / metrics.employeesTotal) * 100) : 0}% attendance rate
           </span>
         </div>
 
@@ -139,7 +192,9 @@ export const AttendanceView: React.FC = () => {
           <p className="text-3xl font-extrabold text-rose-900 font-['Outfit'] mt-1">
             {metrics.employeesAbsent + metrics.employeesOnLeave}
           </p>
-          <span className="text-[11px] text-rose-700 mt-0.5 block font-semibold">1 Absent, 1 On Leave</span>
+          <span className="text-[11px] text-rose-700 mt-0.5 block font-semibold">
+            {metrics.employeesAbsent} Absent{metrics.employeesOnLeave > 0 ? `, ${metrics.employeesOnLeave} On Leave` : ''}
+          </span>
         </div>
       </div>
 
@@ -380,6 +435,13 @@ export const AttendanceView: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* Add Employee Biometric Enrollment Modal */}
+      <AddEmployeeModal
+        isOpen={isAddEmployeeModalOpen}
+        onClose={() => setIsAddEmployeeModalOpen(false)}
+        onEmployeeAdded={handleEmployeeAdded}
+      />
     </div>
   );
 };

@@ -1,40 +1,78 @@
-# Showroom Visitor Intelligence - Phase 1: AI-Based Visitor Detection & Entry Counting
+# Showroom Visitor Intelligence & Footfall Analytics Platform
 
-An AI-powered Showroom Visitor Intelligence backend service utilizing existing CCTV infrastructure to detect visitors, maintain continuity tracking across video frames, detect directional virtual entry-line crossings, and calculate footfall analytics while strictly preventing duplicate counts.
-
----
-
-## 1. Features (Phase 1 Scope)
-
-- **Person Detection:** Powered by Ultralytics YOLO with configurable confidence thresholds and person class isolation (`class_id=0`).
-- **Visitor Tracking:** Integrated ByteTrack tracking preserving temporary tracking IDs across frames, handling occlusions without creating spurious tracks.
-- **Virtual Entry-Line Crossing:** Geometric 2D line segment crossing detection using bottom-center (foot/ground contact) reference points.
-- **Strict Duplicate Prevention:** Enforced at both the in-memory application level and database constraint level (`UNIQUE` on `visitor_track_id` in `footfall_events`).
-- **Security & Privacy:** Automatic masking of RTSP credentials in API responses and operational logs.
-- **Centralized Endpoint Paths:** Dedicated `app/api/routes.py` path constants consumed across all routers.
-- **Background Video Ingestion:** Multi-threaded asynchronous video ingestion worker with auto-reconnection and clean lifecycle management (`/start`, `/stop`, `/status`).
-- **Footfall Analytics:** Total and daily entry counts aggregated over customizable time ranges and camera filters.
+An enterprise-grade, edge-AI hybrid visitor intelligence and showroom analytics platform. The system leverages existing CCTV / RTSP camera infrastructure to deliver real-time person detection (YOLOv11), persistent multi-object tracking (ByteTrack), face/head detection fallbacks (SCRFD / YuNet), directional virtual entry-line crossing, dwell-time analytics, showroom zone occupancy, and an interactive React 19 web dashboard.
 
 ---
 
-## 2. Technology Stack
+## 1. System Overview & Architecture
 
-- **Backend Framework:** FastAPI
-- **Database:** PostgreSQL (with `psycopg` 3)
-- **ORM:** SQLAlchemy 2.x
-- **Database Migrations:** Alembic
-- **Data Validation:** Pydantic v2 & `pydantic-settings`
-- **Video Processing:** OpenCV
-- **Computer Vision:** Ultralytics YOLO & ByteTrack
-- **Testing:** pytest & HTTPX
+The platform operates on a high-efficiency **Edge-AI Hybrid Architecture**:
+
+```mermaid
+graph TD
+    subgraph Edge Layer [Showroom Edge / Local Machine]
+        CCTV["CCTV / IP Cameras (RTSP TCP)"]
+        Detector["Edge AI Engine (local_detector.py)\n• YOLOv11 Person Detection\n• SCRFD / YuNet Face Tracking\n• ByteTrack & Bounding Box Smoothing\n• Entry/Exit Line & Zone Dwell Timers\n• Local MJPEG Stream Server"]
+        SyncQueue["Background Sync Client (Queue)"]
+    end
+
+    subgraph Backend Layer [FastAPI & Express Backend]
+        API["FastAPI Analytics Backend (:8000)\n• Camera Management & Masked RTSP\n• Footfall & Daily Analytics\n• Telemetry & Worker Health"]
+        AuthSrv["Express Auth Server (:5000)\n• User & Admin Authentication\n• PostgreSQL Session Pool"]
+        DB[("PostgreSQL Database (:5432)\n• cameras\n• visitor_tracks\n• footfall_events\n• detection_events")]
+    end
+
+    subgraph Client Layer [Modern Web UI]
+        Dashboard["React 19 Dashboard (:5173)\n• Live CCTV Preview & AI Overlays\n• Real-Time Footfall & Peak Hours\n• Attendance & Visitor Tagging\n• Section & Dwell Time Analytics"]
+    end
+
+    CCTV -->|RTSP TCP Stream| Detector
+    Detector -->|Events & Telemetry| SyncQueue
+    SyncQueue -->|REST API JSON| API
+    API --> DB
+    AuthSrv --> DB
+    Dashboard -->|Analytics & Cameras| API
+    Dashboard -->|Auth| AuthSrv
+    Dashboard -.->|MJPEG Live Stream| Detector
+```
+
+Detailed architectural flows, algorithms, and math models are documented in [flow.md](file:///c:/Users/capermint/Desktop/Abhishek/jms/flow.md).
 
 ---
 
-## 3. Project Structure
+## 2. Key Features
+
+- **Local Edge AI Inference (`local_detector.py`)**: Runs YOLOv11 person detection directly on local hardware without sending raw video feeds over the cloud.
+- **RTSP TCP Buffer Management**: Forces TCP transport globally (`rtsp_transport;tcp`) and uses a non-blocking threaded frame grabber (`ThreadedRTSPReader`) to prevent frame delay and macroblock artifacts.
+- **Persistent Tracking & Smoothing**: Powered by ByteTrack and Euclidean centroid tracking with EMA (Exponential Moving Average) bounding box smoothing and deadband jitter suppression.
+- **Face & Torso Alignment**: Integrated SCRFD / YuNet face detection constrained within upper-torso regions to prevent false face detections on posters or clothing graphics.
+- **Virtual Entry-Line Crossing**: 2D ground-plane foot contact point calculation ($\frac{x_1 + x_2}{2}, y_2$) with strict directional validation (`top_to_bottom`, `bottom_to_top`, `left_to_right`, `right_to_left`).
+- **Strict Duplicate Prevention**: Multi-tier duplicate suppression at the in-memory tracker level and database level (`UNIQUE` on `visitor_track_id` in `footfall_events`).
+- **Showroom Zone Occupancy & Dwell Timers**: Configurable polygon sections (e.g. Diamond, Gold, Silver counters) tracking real-time visitor dwell duration.
+- **Live Video Streaming & Overlays**: Built-in HTTP MJPEG streaming server for low-latency live preview with AI bounding boxes directly in the web dashboard.
+- **Modern Web Dashboard (`dashboard/`)**: Built with React 19, Vite, TypeScript, and Tailwind CSS. Provides live previews, visitor tagging, quick add visitor, attendance management, peak hour heatmaps, and exportable reports.
+- **Single-Command Orchestration**: Launch all 3 services (FastAPI, Express Auth, and Vite Dashboard) concurrently via `scripts/run_all.py` or Windows `.bat` / `.ps1` scripts.
+- **Desktop Executable Packaging**: PyInstaller builder script (`build_exe.py`) to compile the edge detector into a standalone Windows `.exe`.
+
+---
+
+## 3. Technology Stack
+
+| Component | Technologies |
+|---|---|
+| **Edge AI Engine** | Python 3.11+, Ultralytics YOLOv11, ByteTrack, OpenCV, NumPy |
+| **Backend API** | FastAPI, SQLAlchemy 2.x, Alembic, Pydantic v2, PostgreSQL (`psycopg` 3) |
+| **Auth Service** | Node.js, Express 5, TypeScript (`tsx`), `pg`, bcryptjs |
+| **Frontend Web** | React 19, TypeScript, Vite, Tailwind CSS v4, Recharts, Lucide Icons |
+| **Packaging & Scripts** | PyInstaller, Python subprocess, Windows Batch, PowerShell |
+
+---
+
+## 4. Project Structure
 
 ```text
-showroom-visitor-intelligence/
-├── app/
+jms/
+├── app/                            # Central FastAPI Backend Service
 │   ├── main.py                     # FastAPI application entrypoint & lifespan
 │   ├── core/
 │   │   ├── config.py               # Pydantic BaseSettings environment config
@@ -47,240 +85,214 @@ showroom-visitor-intelligence/
 │   ├── db/
 │   │   ├── session.py              # Database engine & session generator
 │   │   ├── base.py                 # Declarative Base
-│   │   └── models/
-│   │       ├── camera.py           # cameras table model
-│   │       ├── processing_run.py   # processing_runs table model
-│   │       ├── visitor_track.py    # visitor_tracks table model
-│   │       ├── detection_event.py  # detection_events table model
-│   │       └── footfall_event.py   # footfall_events table model
-│   ├── schemas/
-│   │   ├── camera.py               # Pydantic schemas for cameras & configs
-│   │   └── analytics.py            # Pydantic schemas for footfall results
-│   ├── repositories/
-│   │   ├── camera_repo.py
-│   │   ├── processing_run_repo.py
-│   │   ├── visitor_track_repo.py
-│   │   ├── detection_event_repo.py
-│   │   └── footfall_event_repo.py
-│   ├── services/
-│   │   ├── camera_service.py       # Camera business logic & validations
-│   │   └── analytics_service.py    # Date-range footfall aggregations
-│   ├── vision/
-│   │   ├── detector.py             # YOLO person detector
-│   │   ├── tracker.py              # ByteTrack visitor tracker
-│   │   ├── stream_reader.py        # OpenCV RTSP video stream reader
-│   │   └── entry_counter.py        # Virtual line crossing detector
+│   │   └── models/                 # SQLAlchemy models (Camera, VisitorTrack, FootfallEvent, etc.)
+│   ├── schemas/                    # Pydantic validation schemas
+│   ├── repositories/               # Database repositories
+│   ├── services/                   # Business logic (camera_service, analytics_service)
+│   ├── vision/                     # Server-side vision pipeline & stream readers
 │   └── workers/
-│       └── video_worker.py         # Background worker & WorkerManager
-├── alembic/
-│   ├── env.py
-│   ├── script.py.mako
-│   └── versions/
-│       └── 0001_initial_phase1.py   # Initial database migration
-├── tests/
-│   ├── conftest.py
-│   ├── test_health.py
-│   ├── test_cameras.py
-│   ├── test_analytics.py
-│   ├── test_vision.py
-│   ├── test_entry_counter.py
-│   ├── test_video_worker.py
-│   └── test_database_models.py
-├── alembic.ini
-├── .env.example
-├── requirements.txt
-└── README.md
+│       └── video_worker.py         # Server-side background ingestion worker
+├── dashboard/                      # Modern React 19 Web Dashboard
+│   ├── src/
+│   │   ├── components/             # Live preview, overview, visitors, attendance, peak hours, reports
+│   │   ├── context/                # ShowroomContext & AuthContext state managers
+│   │   ├── services/               # Camera and analytics API services
+│   │   └── types/                  # TypeScript interface definitions
+│   ├── server/
+│   │   ├── index.ts                # Express authentication backend (:5000)
+│   │   └── db.ts                   # PostgreSQL client connection pool
+│   ├── package.json
+│   └── vite.config.ts
+├── scripts/                        # Multi-Service Orchestration Scripts
+│   ├── run_all.py                  # Single-command runner for FastAPI, Auth, and Dashboard
+│   ├── run_detector.bat            # Quick-launch batch script for local_detector.py
+│   ├── start_services.bat / .ps1   # Multi-window startup scripts for Windows
+│   └── stop_services.bat / .ps1    # Safe shutdown scripts for all background services
+├── alembic/                        # Database migration scripts
+├── local_detector.py               # Standalone Local Edge AI Video Processing Engine
+├── build_exe.py                    # PyInstaller standalone EXE compiler
+├── camera_config.example.json      # Camera stream, entry line & section configuration template
+├── flow.md                         # Detailed architectural & data flow documentation
+├── requirements.txt                # Python backend & detector dependencies
+└── README.md                       # Main project documentation
 ```
 
 ---
 
-## 4. Setup and Installation
+## 5. Quick Start Guide
 
 ### Prerequisites
-- Python 3.11+
-- PostgreSQL (or SQLite for local unit testing)
+- **Python 3.11+**
+- **Node.js 18+** & npm
+- **PostgreSQL 14+** running locally or remotely
 
-### Step 1: Install Dependencies
+---
+
+### Option A: One-Command Full Stack Startup (Recommended)
+
+To launch the **FastAPI Backend (8000)**, **Auth Server (5000)**, and **Vite Dashboard (5173)** in unified output:
+
 ```bash
+# 1. Install Python dependencies
 pip install -r requirements.txt
+
+# 2. Install Dashboard dependencies
+cd dashboard && npm install && cd ..
+
+# 3. Launch all services simultaneously
+python scripts/run_all.py
 ```
 
-### Step 2: Configure Environment Variables
-Copy `.env.example` to `.env` and configure your database connection:
+*Or on Windows, simply double-click [scripts/start_services.bat](file:///c:/Users/capermint/Desktop/Abhishek/jms/scripts/start_services.bat) (and use [scripts/stop_services.bat](file:///c:/Users/capermint/Desktop/Abhishek/jms/scripts/stop_services.bat) to stop).*
+
+---
+
+### Option B: Manual Step-by-Step Setup
+
+#### Step 1: Environment Configuration
+Create a `.env` file in the project root:
 ```bash
 cp .env.example .env
 ```
-Key configuration settings in `.env`:
+Key settings:
 ```ini
 DATABASE_URL="postgresql+psycopg://postgres:postgres@localhost:5432/showroom_db"
 YOLO_MODEL_PATH="yolov8n.pt"
 DETECTION_CONFIDENCE_THRESHOLD=0.45
-PERSON_CLASS_ID=0
 DEVICE="cpu"  # Or "cuda" / "0" for GPU acceleration
-SAVE_DETECTION_EVENTS=false
-RECONNECT_INTERVAL_SECONDS=5
-MAX_RECONNECT_ATTEMPTS=5
 ```
 
-### Step 3: Run Database Migrations
-Apply Alembic migrations to set up the database schema:
+Configure `dashboard/.env`:
+```bash
+cp dashboard/.env.example dashboard/.env
+```
+
+#### Step 2: Database Migration
 ```bash
 alembic upgrade head
 ```
 
-### Step 4: Start the API Server
+#### Step 3: Run the Services
+**Terminal 1 — FastAPI Backend:**
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
-Interactive OpenAPI documentation will be available at: `http://localhost:8000/docs`.
+- OpenAPI Documentation: `http://localhost:8000/docs`
+
+**Terminal 2 — Auth Server:**
+```bash
+cd dashboard
+npm run server
+```
+
+**Terminal 3 — React Dashboard:**
+```bash
+cd dashboard
+npm run dev
+```
+- Web Dashboard: `http://localhost:5173`
 
 ---
 
-## 5. API Reference
+## 6. Running the Local Edge AI Detector
 
-All 10 endpoints are registered using path constants defined in `app/api/routes.py`:
+The Edge Detector (`local_detector.py`) processes camera video streams, computes tracks and line crossings, and sends count events to the FastAPI backend.
+
+### Camera Configuration
+Copy `camera_config.example.json` to `camera_config.json` and configure your RTSP camera channels, entry lines, and zones:
+```json
+{
+  "default_channel": "201",
+  "cameras": {
+    "201": {
+      "name": "Main Entrance Camera",
+      "source": "rtsp://admin:password@192.168.1.100:554/Streaming/Channels/201",
+      "camera_id": "88970b31-d885-4fd5-a24a-bdc969c96240",
+      "entry_line": {
+        "line": [[200.0, 450.0], [900.0, 450.0]],
+        "direction": "top_to_bottom"
+      }
+    }
+  }
+}
+```
+
+### Starting the Detector
+Run the detector for a specific channel:
+```bash
+python local_detector.py --channel 201
+```
+
+Or run headless in the background (no desktop GUI window):
+```bash
+python local_detector.py --channel 201 --headless
+```
+
+*Or on Windows, launch [scripts/run_detector.bat](file:///c:/Users/capermint/Desktop/Abhishek/jms/scripts/run_detector.bat).*
+
+### Useful Detector CLI Arguments
+| Flag | Description | Default |
+|---|---|---|
+| `--channel`, `-c` | Camera channel key defined in `camera_config.json` | `201` |
+| `--source`, `-s` | Direct RTSP URL, video file path, or webcam index (`0`) | None |
+| `--conf` | Person detection confidence threshold | `0.35` |
+| `--model`, `-m` | YOLO model weights (`yolo11n.pt`, `yolov8n.pt`, etc.) | `yolo11n.pt` |
+| `--headless` | Run as background service without local OpenCV window | `False` |
+| `--api-url` | Base URL of FastAPI backend for syncing events | `http://localhost:8000` |
+| `--face-scale` | Multiplier for face detection scanning scale | `1.0` |
+| `--deadband` | Pixel deadband filter to eliminate stationary jitter | `3.5` |
+
+---
+
+## 7. Packaging into Standalone Windows Executable
+
+To compile `local_detector.py` into a portable Windows executable using PyInstaller:
+
+```bash
+python build_exe.py
+```
+
+The resulting executable will be placed in:
+```text
+dist/CapermintLocalDetector/CapermintLocalDetector.exe
+```
+
+---
+
+## 8. API Reference Summary
+
+Registered routes defined centrally in `app/api/routes.py`:
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/health` | Check API service health |
-| `POST` | `/api/v1/cameras` | Register a new CCTV camera |
-| `GET` | `/api/v1/cameras` | List configured cameras |
-| `GET` | `/api/v1/cameras/{camera_id}` | Retrieve camera details |
-| `PATCH` | `/api/v1/cameras/{camera_id}` | Update camera settings / soft deactivation |
-| `POST` | `/api/v1/cameras/{camera_id}/start` | Start background video processing |
-| `POST` | `/api/v1/cameras/{camera_id}/stop` | Stop background video processing |
-| `GET` | `/api/v1/cameras/{camera_id}/status` | Retrieve camera processing status |
-| `GET` | `/api/v1/analytics/footfall` | Retrieve total entry counts |
-| `GET` | `/api/v1/analytics/footfall/daily` | Retrieve daily entry counts |
-
-### Example 1: Register a Camera
-```bash
-curl -X POST "http://localhost:8000/api/v1/cameras" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "Main Showroom Entrance",
-    "stream_url": "rtsp://user:adminpass@192.168.1.50:554/live",
-    "location": "North Wing Entrance",
-    "entry_line_config": {
-      "line": [[200.0, 400.0], [800.0, 400.0]],
-      "direction": "top_to_bottom"
-    }
-  }'
-```
-*Note: The response will automatically mask credentials:*
-```json
-{
-  "id": "c1388653-ff8f-4bc4-b7c1-7a66fbc4b25b",
-  "name": "Main Showroom Entrance",
-  "stream_url": "rtsp://***:***@192.168.1.50:554/live",
-  "location": "North Wing Entrance",
-  "is_active": true,
-  "entry_line_config": {
-    "line": [[200.0, 400.0], [800.0, 400.0]],
-    "direction": "top_to_bottom"
-  },
-  "created_at": "2026-10-27T12:00:00Z",
-  "updated_at": "2026-10-27T12:00:00Z"
-}
-```
-
-### Example 2: Start Video Processing
-```bash
-curl -X POST "http://localhost:8000/api/v1/cameras/c1388653-ff8f-4bc4-b7c1-7a66fbc4b25b/start"
-```
-*Response:*
-```json
-{
-  "message": "Video processing started successfully.",
-  "camera_id": "c1388653-ff8f-4bc4-b7c1-7a66fbc4b25b",
-  "is_processing": true
-}
-```
-
-### Example 3: Get Processing Status
-```bash
-curl -X GET "http://localhost:8000/api/v1/cameras/c1388653-ff8f-4bc4-b7c1-7a66fbc4b25b/status"
-```
-*Response:*
-```json
-{
-  "camera_id": "c1388653-ff8f-4bc4-b7c1-7a66fbc4b25b",
-  "name": "Main Showroom Entrance",
-  "is_active": true,
-  "is_processing": true,
-  "active_run_id": "d9818815-1815-4602-9e90-c11df5fb1390",
-  "frames_processed": 1420,
-  "last_error": null
-}
-```
-
-### Example 4: Retrieve Total Footfall
-```bash
-curl -X GET "http://localhost:8000/api/v1/analytics/footfall?start_time=2026-10-20T00:00:00Z&end_time=2026-10-27T23:59:59Z"
-```
-*Response:*
-```json
-{
-  "total_entries": 148,
-  "camera_id": null,
-  "start_time": "2026-10-20T00:00:00Z",
-  "end_time": "2026-10-27T23:59:59Z"
-}
-```
-
-### Example 5: Retrieve Daily Footfall
-```bash
-curl -X GET "http://localhost:8000/api/v1/analytics/footfall/daily?start_date=2026-10-25&end_date=2026-10-27"
-```
-*Response:*
-```json
-{
-  "daily_footfall": [
-    {"date": "2026-10-25", "entries": 42},
-    {"date": "2026-10-26", "entries": 55},
-    {"date": "2026-10-27", "entries": 51}
-  ],
-  "total_entries": 148,
-  "camera_id": null,
-  "start_date": "2026-10-25",
-  "end_date": "2026-10-27"
-}
-```
+| `GET` | `/health` | API health status check |
+| `POST` | `/api/v1/cameras` | Register a new CCTV camera (masks stream credentials) |
+| `GET` | `/api/v1/cameras` | List all configured cameras |
+| `GET` | `/api/v1/cameras/{camera_id}` | Retrieve single camera details |
+| `PATCH` | `/api/v1/cameras/{camera_id}` | Update camera settings / active status |
+| `POST` | `/api/v1/cameras/{camera_id}/start` | Start server-side background video ingestion |
+| `POST` | `/api/v1/cameras/{camera_id}/stop` | Stop server-side background video ingestion |
+| `GET` | `/api/v1/cameras/{camera_id}/status` | Check processing run status & frame counters |
+| `GET` | `/api/v1/analytics/footfall` | Retrieve total footfall counts with date/camera filters |
+| `GET` | `/api/v1/analytics/footfall/daily` | Retrieve daily aggregated footfall entries |
 
 ---
 
-## 6. Virtual Entry-Line Crossing & Duplicate Prevention
+## 9. Automated Testing
 
-### Reference Point Calculation
-The system calculates the **bottom-center** of the detected bounding box:
-$$\text{Point} = \left(\frac{x_1 + x_2}{2}, y_2\right)$$
-This corresponds to the visitor's foot position on the ground plane, eliminating false crossings caused by torso or head tilt.
-
-### Crossing Geometry & Direction Validation
-1. Segment intersection test between previous/current frame trajectory and the configured entry line $P_1P_2$.
-2. Orientation check: Ensures the crossing vector corresponds strictly to the designated entry direction (`top_to_bottom`, `bottom_to_top`, `left_to_right`, `right_to_left`, or `positive_to_negative`/`inward`).
-
-### Duplicate Prevention Architecture
-- **Application Level:** Tracked persons maintain an in-memory set of counted `tracker_id`s. Once a track crosses the line, subsequent frames or hovering movements near the line will never trigger another entry event.
-- **Database Level:** The `footfall_events` table enforces a `UNIQUE (visitor_track_id)` constraint and a check constraint `event_type = 'entry'`. Any attempted duplicate insertion is safely handled and discarded.
-
----
-
-## 7. Running Automated Tests
-
-Run the complete test suite using `pytest`:
+Run the test suite via `pytest`:
 ```bash
 python -m pytest tests -v
 ```
 
-The tests cover:
-- Health check endpoint
+The test suite validates:
+- Health check and API routing
 - Camera CRUD, credential masking, and validation
-- Pre-processing camera configuration validation
-- Database models, foreign keys, and unique/check constraints
-- Person detection edge cases (invalid frames, empty arrays, confidence thresholds)
-- Tracking continuity across frames using ByteTrack logic
-- Virtual entry-line crossing in designated directions & wrong-direction rejections
-- Duplicate entry-count prevention
-- Background worker start, stop, duplicate prevention, and status retrieval
-- Footfall analytics (total & daily aggregations, date-range validation)
+- Pre-processing camera configuration constraints
+- Database models, foreign keys, and unique constraints
+- Person detection edge cases and confidence thresholding
+- ByteTrack temporal tracking continuity across frames
+- Virtual entry-line crossing geometry & wrong-direction rejections
+- Duplicate footfall event prevention
+- Background worker lifecycle and status tracking
+- Total and daily footfall analytics aggregations

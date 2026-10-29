@@ -15,3 +15,13 @@ CAMERA_HEARTBEAT = "/api/v1/cameras/{camera_id}/heartbeat"
 
 FOOTFALL_ANALYTICS = "/api/v1/analytics/footfall"
 DAILY_FOOTFALL_ANALYTICS = "/api/v1/analytics/footfall/daily"
+
+RETENTION_CLEANUP = "/api/v1/identity/cleanup"
+RETENTION_STATUS = "/api/v1/identity/status"
+
+EMPLOYEES = "/api/v1/employees"
+EMPLOYEE_DETAIL = "/api/v1/employees/{employee_id}"
+EMPLOYEE_FACE = "/api/v1/employees/{employee_id}/face"
+EMPLOYEE_ATTENDANCE = "/api/v1/employees/{employee_id}/attendance"
+ATTENDANCE_PUNCH = "/api/v1/attendance/punch"
+ATTENDANCE_DAILY = "/api/v1/attendance/daily"

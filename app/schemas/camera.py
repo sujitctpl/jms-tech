@@ -104,6 +104,7 @@ class FootfallRecordRequest(BaseModel):
     processing_run_id: Optional[uuid.UUID] = Field(None, description="Optional active run ID")
     section_id: Optional[str] = Field(None, description="Section ID if entering a section")
     section_name: Optional[str] = Field(None, description="Section Name (e.g. Sales, Accounts)")
+    person_id: Optional[str] = Field(None, description="Persistent person ID if identity recovered")
 
 
 class FootfallRecordResponse(BaseModel):

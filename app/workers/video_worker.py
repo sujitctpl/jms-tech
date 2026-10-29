@@ -76,6 +76,52 @@ class VideoWorker(threading.Thread):
         entry_counter = EntryLineCounter(self.entry_line_config)
         persistent_tracker = PersistentCameraTracker(ttl_seconds=5.0)
 
+        # Persistent Identity Recovery & FAISS Similarity Search (14-Day Retention)
+        from datetime import datetime, timezone
+        import numpy as np
+        from app.repositories.employee_attendance_repo import EmployeeAttendanceRepository
+        from app.repositories.employee_repo import EmployeeRepository
+        from app.repositories.person_identity_repo import PersonIdentityRepository
+        from app.vision.employee_recognizer import EmployeeRecognitionManager
+        from app.vision.face_embedder import FaceEmbedder
+        from app.vision.identity_tracker import IdentityRecoveryManager
+        from app.vision.vector_store import PgVectorStoreManager
+
+        identity_repo = PersonIdentityRepository(db)
+        emp_repo = EmployeeRepository(db)
+        emp_attendance_repo = EmployeeAttendanceRepository(db)
+        face_embedder = FaceEmbedder()
+        vector_store = PgVectorStoreManager(db=db, similarity_threshold=settings.FACE_SIMILARITY_THRESHOLD)
+
+        # Dedicated Employee Recognition Engine backed by pgvector
+        employee_recognizer = EmployeeRecognitionManager(
+            embedder=face_embedder,
+            vector_store=vector_store,
+            similarity_threshold=settings.FACE_SIMILARITY_THRESHOLD,
+        )
+
+        def handle_matched(pid: str, ts: float):
+            try:
+                dt_ts = datetime.fromtimestamp(ts, tz=timezone.utc)
+                identity_repo.update_last_seen(pid, dt_ts)
+            except Exception as ex:
+                logger.error("Failed to update last_seen_at for %s: %s", pid, str(ex))
+
+        def handle_created(pid: str, emb: np.ndarray, ts: float):
+            try:
+                dt_ts = datetime.fromtimestamp(ts, tz=timezone.utc)
+                identity_repo.create_or_update(pid, emb, dt_ts)
+            except Exception as ex:
+                logger.error("Failed to persist new identity %s: %s", pid, str(ex))
+
+        identity_manager = IdentityRecoveryManager(
+            embedder=face_embedder,
+            vector_store=vector_store,
+            similarity_threshold=settings.FACE_SIMILARITY_THRESHOLD,
+            on_matched_callback=handle_matched,
+            on_created_callback=handle_created,
+        )
+
         # Connect to stream
         if not stream_reader.connect():
             logger.warning("Initial connection failed for camera %s. Will retry in loop.", self.camera_id)
@@ -158,14 +204,63 @@ class VideoWorker(threading.Thread):
                 except Exception:
                     pass
 
-                # Process tracks in database
+                # Track lifecycle cleanup for lost tracks
+                current_tids = {str(p.tracker_id) for p in tracked_persons}
+                for old_tid in list(employee_recognizer.track_to_employee.keys()):
+                    if old_tid not in current_tids:
+                        employee_recognizer.on_track_lost(old_tid)
+                for old_tid in list(identity_manager.track_to_person.keys()):
+                    if old_tid not in current_tids:
+                        identity_manager.on_track_lost(old_tid)
+
+                # Process tracks in database with persistent identity recovery
                 track_model_map = {}
                 for person in tracked_persons:
                     try:
+                        str_tid = str(person.tracker_id)
+                        # Attempt face identity recovery if face region is available
+                        px1, py1, px2, py2 = map(int, person.box)
+                        h_box = py2 - py1
+                        w_box = px2 - px1
+                        if h_box > 40 and w_box > 40:
+                            fy2 = py1 + int(h_box * 0.28)
+                            fx1 = max(0, px1 + int(w_box * 0.15))
+                            fx2 = min(frame.shape[1], px2 - int(w_box * 0.15))
+                            fy1 = max(0, py1)
+                            if fy2 > fy1 + 20 and fx2 > fx1 + 20:
+                                face_crop = frame[fy1:fy2, fx1:fx2]
+                                # 1. Check if recognized as showroom employee first
+                                emp_match = employee_recognizer.evaluate_track_face(
+                                    tracker_id=str_tid,
+                                    face_crop=face_crop,
+                                    face_conf=person.confidence,
+                                )
+                                if emp_match:
+                                    emp_id, emp_conf = emp_match
+                                    try:
+                                        emp_attendance_repo.record_attendance_event(
+                                            employee_id=emp_id,
+                                            camera_id=self.camera_id,
+                                            event_type="CHECK_IN",
+                                            confidence=emp_conf,
+                                        )
+                                    except Exception as ex:
+                                        logger.error("Failed to record employee punch for %s: %s", emp_id, str(ex))
+                                else:
+                                    # 2. Otherwise process as customer visitor identity
+                                    identity_manager.process_track_face(
+                                        tracker_id=person.tracker_id,
+                                        face_crop=face_crop,
+                                        face_conf=person.confidence,
+                                    )
+
+                        person.person_id = identity_manager.get_person_id(person.tracker_id)
+
                         vt = track_repo.get_or_create(
                             camera_id=self.camera_id,
                             processing_run_id=self.run_id,
                             tracker_id=person.tracker_id,
+                            person_id=person.person_id,
                         )
                         track_model_map[person.tracker_id] = vt
 
@@ -188,6 +283,16 @@ class VideoWorker(threading.Thread):
                 # Evaluate entry line crossing
                 new_entries = entry_counter.process_frame(tracked_persons)
                 for entry_person in new_entries:
+                    # Suppress visitor entry count if the person is a recognized showroom employee
+                    if employee_recognizer.is_track_employee(str(entry_person.tracker_id)):
+                        emp_id = employee_recognizer.get_employee_id(str(entry_person.tracker_id))
+                        logger.info(
+                            "Staff member %s crossed entry line on camera %s - visitor footfall count suppressed.",
+                            emp_id,
+                            self.camera_id,
+                        )
+                        continue
+
                     vt = track_model_map.get(entry_person.tracker_id)
                     if vt:
                         try:

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { ShowroomProvider } from './context/ShowroomContext';
+import { ErrorBoundary } from './components/common/ErrorBoundary';
 import { AuthPage } from './components/auth/AuthPage';
 import { Sidebar, ActiveTab } from './components/layout/Sidebar';
 import { Navbar } from './components/layout/Navbar';
@@ -103,11 +104,13 @@ const DashboardContent: React.FC = () => {
 
 export function App() {
   return (
-    <AuthProvider>
-      <ShowroomProvider>
-        <DashboardContent />
-      </ShowroomProvider>
-    </AuthProvider>
+    <ErrorBoundary>
+      <AuthProvider>
+        <ShowroomProvider>
+          <DashboardContent />
+        </ShowroomProvider>
+      </AuthProvider>
+    </ErrorBoundary>
   );
 }
 

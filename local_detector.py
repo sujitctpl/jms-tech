@@ -67,13 +67,14 @@ class DashboardSyncClient:
         self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker_thread.start()
 
-    def send_entry_event(self, tracker_id: str, confidence: float = 0.92, section_id: Optional[str] = None, section_name: Optional[str] = None) -> None:
+    def send_entry_event(self, tracker_id: str, confidence: float = 0.92, section_id: Optional[str] = None, section_name: Optional[str] = None, person_id: Optional[str] = None) -> None:
         """Enqueue an entry event detected locally."""
         payload = {
             "tracker_id": str(tracker_id),
             "confidence": float(confidence),
             "section_id": section_id,
             "section_name": section_name,
+            "person_id": str(person_id) if person_id else None,
             "occurred_at": datetime.now(timezone.utc).isoformat(),
         }
         try:
@@ -92,6 +93,20 @@ class DashboardSyncClient:
         }
         try:
             self.queue.put_nowait(("section_entry", payload))
+        except queue.Full:
+            pass
+
+    def send_employee_punch_event(self, employee_id: str, event_type: str = "CHECK_IN", confidence: float = 0.95) -> None:
+        """Enqueue an employee check-in/out punch event detected locally."""
+        payload = {
+            "employee_id": str(employee_id),
+            "camera_id": self.camera_id if self.camera_id and len(self.camera_id) == 36 else None,
+            "event_type": event_type,
+            "confidence": float(confidence),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            self.queue.put_nowait(("employee_punch", payload))
         except queue.Full:
             pass
 
@@ -151,6 +166,9 @@ class DashboardSyncClient:
                 ok = self._post(endpoint, payload)
                 if ok:
                     self.total_synced_entries += 1
+            elif event_type == "employee_punch":
+                endpoint = "/api/v1/attendance/punch"
+                self._post(endpoint, payload)
             elif event_type == "heartbeat":
                 endpoint = f"/api/v1/cameras/{self.camera_id}/heartbeat"
                 self._post(endpoint, payload)
@@ -168,11 +186,19 @@ class LocalTracker:
     """Lightweight Euclidean tracker for continuous person IDs across frames."""
 
     def __init__(self, max_disappeared: int = 25, max_distance: float = 90.0):
-        self.next_id = 1
+        self.next_id = 10001
         self.objects: Dict[int, Tuple[float, float, float, float]] = {}  # id -> (x1, y1, x2, y2)
         self.disappeared: Dict[int, int] = {}
         self.max_disappeared = max_disappeared
         self.max_distance = max_distance
+
+    def sync_active_tracks(self, active_objects: Dict[int, Tuple[float, float, float, float]]) -> None:
+        """Synchronizes tracked objects from ByteTrack to keep ID continuity if fallback occurs."""
+        self.objects = dict(active_objects)
+        self.disappeared = {oid: 0 for oid in active_objects.keys()}
+        max_id = max(active_objects.keys(), default=0)
+        if max_id >= self.next_id:
+            self.next_id = max_id + 1
 
     def update(self, detections: List[Tuple[float, float, float, float]]) -> Dict[int, Tuple[float, float, float, float]]:
         if len(detections) == 0:
@@ -285,6 +311,73 @@ class TrackSmoother:
 
         # Track disappeared counter for GC
         self.disappeared: Dict[int, int] = {}
+        # Persistent ID alias mapping to maintain consistent IDs across frames
+        self.id_aliases: Dict[int, int] = {}
+
+    @staticmethod
+    def _compute_iou(
+        boxA: Tuple[float, float, float, float], boxB: Tuple[float, float, float, float]
+    ) -> float:
+        """Calculates Intersection-over-Union (IoU) between two bounding boxes."""
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[2], boxB[2])
+        yB = min(boxA[3], boxB[3])
+        interArea = max(0.0, xB - xA) * max(0.0, yB - yA)
+        boxAArea = max(0.0, boxA[2] - boxA[0]) * max(0.0, boxA[3] - boxA[1])
+        boxBArea = max(0.0, boxB[2] - boxB[0]) * max(0.0, boxB[3] - boxB[1])
+        denom = float(boxAArea + boxBArea - interArea)
+        return (interArea / denom) if denom > 0.0 else 0.0
+
+    def recover_missing_tracks(
+        self,
+        unmatched_boxes: List[Tuple[float, float, float, float]],
+        max_dist: float = 110.0,
+        min_iou: float = 0.20,
+    ) -> Dict[int, Tuple[float, float, float, float]]:
+        """
+        Attempts to associate detections without IDs to recently missing tracks
+        in the smoother persistence buffer, preventing duplicate tracks and identity switches.
+        """
+        recovered: Dict[int, Tuple[float, float, float, float]] = {}
+        if not self.enabled or not unmatched_boxes:
+            return recovered
+
+        missing_ids = [
+            tid
+            for tid, count in self.disappeared.items()
+            if 0 < count <= self.body_persistence and tid in self.body_boxes
+        ]
+        if not missing_ids:
+            return recovered
+
+        used_missing: Set[int] = set()
+        for box in unmatched_boxes:
+            ncx = (box[0] + box[2]) * 0.5
+            ncy = (box[1] + box[3]) * 0.5
+            best_mid = None
+            best_score = float("inf")
+
+            for mid in missing_ids:
+                if mid in used_missing:
+                    continue
+                pbox = self.body_boxes[mid]
+                iou = self._compute_iou(box, pbox)
+                mcx, mcy = self.prev_centroids.get(mid, ((pbox[0] + pbox[2]) * 0.5, (pbox[1] + pbox[3]) * 0.5))
+                dist = math.hypot(ncx - mcx, ncy - mcy)
+
+                if iou >= min_iou or dist < max_dist:
+                    score = dist - (iou * 100.0)
+                    if score < best_score:
+                        best_score = score
+                        best_mid = mid
+
+            if best_mid is not None:
+                recovered[best_mid] = box
+                used_missing.add(best_mid)
+                self.disappeared[best_mid] = 0
+
+        return recovered
 
     def smooth_body_boxes(
         self, tracked_objects: Dict[int, Tuple[float, float, float, float]]
@@ -293,16 +386,24 @@ class TrackSmoother:
         if not self.enabled:
             return tracked_objects
 
-        # 1. Re-associate new ByteTrack IDs to recently missing tracks (prevents ID switches)
+        # 0. Apply persistent ID aliases to maintain consistent IDs across frames
+        if self.id_aliases:
+            remapped_tracked = {}
+            for tid, box in tracked_objects.items():
+                target_id = self.id_aliases.get(tid, tid)
+                remapped_tracked[target_id] = box
+            tracked_objects = remapped_tracked
+
+        # 1. Re-associate new ByteTrack IDs to recently missing/active tracks not in incoming tracked_objects
         missing_ids = [
             tid
-            for tid, count in self.disappeared.items()
-            if 0 < count <= self.body_persistence and tid in self.body_boxes
+            for tid in list(self.body_boxes.keys())
+            if tid not in tracked_objects and self.disappeared.get(tid, 0) <= self.body_persistence
         ]
         remap: Dict[int, int] = {}
         if missing_ids:
             for new_id, box in tracked_objects.items():
-                if new_id not in self.body_boxes:
+                if new_id not in self.body_boxes and new_id not in self.id_aliases:
                     ncx = (box[0] + box[2]) * 0.5
                     ncy = (box[1] + box[3]) * 0.5
                     best_match = None
@@ -315,6 +416,7 @@ class TrackSmoother:
                             best_match = mid
                     if best_match is not None:
                         remap[new_id] = best_match
+                        self.id_aliases[new_id] = best_match
                         missing_ids.remove(best_match)
 
         if remap:
@@ -337,6 +439,8 @@ class TrackSmoother:
                     self.face_tracks.pop(old_id, None)
                     self.head_boxes.pop(old_id, None)
                     self.disappeared.pop(old_id, None)
+                    # Clean up aliases pointing to or from this purged old_id
+                    self.id_aliases = {k: v for k, v in self.id_aliases.items() if v != old_id and k != old_id}
             else:
                 self.disappeared[old_id] = 0
 
@@ -462,7 +566,7 @@ class TrackSmoother:
                 else:
                     smoothed_lms = raw_landmarks
 
-                s_conf = 0.75 * raw_conf + 0.25 * prev_state.get("conf", raw_conf)
+                s_conf = 0.75 * raw_conf + 0.10 * prev_state.get("conf", raw_conf)
                 hit_count = prev_state.get("hit_count", 0) + 1
             else:
                 sbx1, sby1, sbx2, sby2 = raw_bx1, raw_by1, raw_bx2, raw_by2
@@ -617,6 +721,8 @@ class ZoneManager:
 
         # Track history
         self.counted_attendance_ids: Set[int] = set()
+        self.counted_person_ids: Set[str] = set()
+        self.track_identities: Dict[int, str] = {}
         self.person_visited_sections: Dict[int, Set[str]] = {}
         self.track_positions: Dict[int, Tuple[float, float]] = {}  # obj_id -> prev feet (x, y)
 
@@ -637,6 +743,14 @@ class ZoneManager:
         self.btn_sales = (215, 8, 395, 46)
         self.btn_accounts = (405, 8, 615, 46)
         self.btn_clear = (625, 8, 745, 46)
+
+    def set_identity(self, obj_id: int, person_id: Optional[str]) -> None:
+        """Links temporary ByteTrack ID to persistent person ID to prevent duplicate entry counts."""
+        if person_id:
+            pid = str(person_id)
+            self.track_identities[obj_id] = pid
+            if obj_id in self.counted_attendance_ids:
+                self.counted_person_ids.add(pid)
 
     @staticmethod
     def _ccw(A, B, C):
@@ -674,7 +788,9 @@ class ZoneManager:
             curr_pos = (feet_x, feet_y)
 
             # 1. Check Attendance Line Crossing (if entry line has been drawn)
-            if has_entry_line and obj_id not in self.counted_attendance_ids:
+            pid = self.track_identities.get(obj_id)
+            is_already_counted = (obj_id in self.counted_attendance_ids) or (pid and pid in self.counted_person_ids)
+            if has_entry_line and not is_already_counted:
                 prev_pos = self.track_positions.get(obj_id)
                 if prev_pos is not None:
                     crossed = False
@@ -690,6 +806,8 @@ class ZoneManager:
 
                     if crossed:
                         self.counted_attendance_ids.add(obj_id)
+                        if pid:
+                            self.counted_person_ids.add(pid)
                         self.attendance_total += 1
                         self.line_flash_timer = 25
                         new_attendance_crossings.append(obj_id)
@@ -1024,7 +1142,7 @@ class SCRFDDetector:
     Uses PyTorch CUDA on cuda:0 (10ms inference) with ONNX Runtime & OpenCV DNN fallbacks.
     """
 
-    def __init__(self, model_path: str = "models/scrfd_2.5g_bnkps.pt", conf_thresh: float = 0.35, nms_thresh: float = 0.40):
+    def __init__(self, model_path: str = "models/scrfd_10g_bnkps.onnx", conf_thresh: float = 0.35, nms_thresh: float = 0.40):
         import torch
         self.conf_thresh = conf_thresh
         self.nms_thresh = nms_thresh
@@ -1035,10 +1153,10 @@ class SCRFDDetector:
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
         # Check for Native PyTorch GPU Model (.pt)
-        pt_path = get_resource_path("models/scrfd_2.5g_bnkps.pt")
-        if os.path.exists(pt_path) and torch.cuda.is_available():
+        resolved_path = get_resource_path(model_path)
+        if resolved_path.endswith(".pt") and os.path.exists(resolved_path) and torch.cuda.is_available():
             try:
-                self.torch_model = torch.load(pt_path, weights_only=False).to(self.device).eval()
+                self.torch_model = torch.load(resolved_path, weights_only=False).to(self.device).eval()
                 self.use_torch = True
                 self.engine_name = f"GPU ({self.device.upper()})"
                 print(f"[+] SCRFD Neural Face Detector loaded natively on {self.engine_name}!")
@@ -1046,8 +1164,14 @@ class SCRFDDetector:
             except Exception as e:
                 self.use_torch = False
 
-        # Fallback to ONNX Runtime
-        resolved_onnx = get_resource_path("models/scrfd_2.5g_bnkps.onnx")
+        # Resolve ONNX file
+        resolved_onnx = resolved_path if resolved_path.endswith(".onnx") else resolved_path.replace(".pt", ".onnx")
+        if not os.path.exists(resolved_onnx):
+            for cand in ["models/scrfd_10g_bnkps.onnx", "models/scrfd_2.5g_bnkps.onnx"]:
+                r_cand = get_resource_path(cand)
+                if os.path.exists(r_cand):
+                    resolved_onnx = r_cand
+                    break
         try:
             import onnxruntime as ort
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -1058,7 +1182,7 @@ class SCRFDDetector:
             self.out_names = [o.name for o in self.session.get_outputs()]
             self.use_ort = True
             self.engine_name = "GPU (CUDA)" if "CUDAExecutionProvider" in self.session.get_providers() else "CPU (ORT)"
-            print(f"[+] SCRFD loaded via ONNX Runtime on {self.engine_name}!")
+            print(f"[+] SCRFD 10G loaded via ONNX Runtime on {self.engine_name} ({os.path.basename(resolved_onnx)})!")
             return
         except Exception:
             self.use_ort = False
@@ -1253,11 +1377,11 @@ def run_local_detector(
     headless: bool,
     show_entry_line: bool = True,
     face_scale: float = 1.05,
-    face_model_path: str = "models/scrfd_2.5g_bnkps.onnx",
-    face_confidence: float = 0.35,
+    face_model_path: str = "models/scrfd_2.5g_bnkps.pt",
+    face_confidence: float = 0.30,
     show_head_fallback: bool = True,
     allow_standalone_faces: bool = False,
-    imgsz: int = 960,
+    imgsz: int = 640,
     box_smoothing: bool = True,
     smoothing_alpha: float = 0.70,
     face_persistence: int = 8,
@@ -1357,6 +1481,62 @@ def run_local_detector(
     )
     sync_client = DashboardSyncClient(base_url=api_url, camera_id=camera_id)
 
+    # Face Embedding & Identity Recovery System (ArcFace + pgvector + 14-Day Retention)
+    from app.vision.face_embedder import FaceEmbedder
+    from app.vision.vector_store import PgVectorStoreManager
+    from app.vision.identity_tracker import IdentityRecoveryManager
+    from app.vision.employee_recognizer import EmployeeRecognitionManager
+
+    # Open database session if PostgreSQL is running locally
+    db_session = None
+    try:
+        from app.db.session import SessionLocal
+        db_session = SessionLocal()
+    except Exception as e:
+        print(f"[!] Warning: Could not create direct DB session in detector: {e}")
+
+    from app.core.config import settings
+    face_embedder = FaceEmbedder(
+        min_size=settings.FACE_MIN_SIZE,
+        min_confidence=min(face_confidence, settings.FACE_MIN_CONFIDENCE),
+        blur_threshold=settings.FACE_BLUR_THRESHOLD,
+    )
+    sim_thresh = settings.FACE_SIMILARITY_THRESHOLD
+    vector_store = PgVectorStoreManager(db=db_session, similarity_threshold=sim_thresh)
+    identity_manager = IdentityRecoveryManager(
+        embedder=face_embedder,
+        vector_store=vector_store,
+        similarity_threshold=sim_thresh,
+        max_attempts=5,
+        cooldown_frames=6,
+    )
+    employee_recognizer = EmployeeRecognitionManager(
+        embedder=face_embedder,
+        vector_store=vector_store,
+        similarity_threshold=sim_thresh,
+        min_confirm_frames=3,
+        vote_window=5,
+    )
+
+    # Cooldown buffer for employee check-in punches (punch at most once per 5 mins per staff)
+    punched_employee_ids: Dict[str, float] = {}
+    track_last_recognition_attempt: Dict[str, float] = {}
+
+    # Preload registered employees and names into recognizer
+    employee_names: Dict[str, str] = {}
+    if db_session:
+        try:
+            from app.repositories.employee_repo import EmployeeRepository
+            emp_repo = EmployeeRepository(db_session)
+            active_embs = emp_repo.get_all_active_embeddings()
+            loaded = employee_recognizer.load_active_employees(active_embs)
+            active_emps = emp_repo.list_employees(is_active=True)
+            for ae in active_emps:
+                employee_names[ae.employee_id] = ae.name
+            print(f"[+] Biometric Pipeline: Loaded {loaded} registered employee face embeddings into index.")
+        except Exception as e:
+            print(f"[!] Warning: Could not load employee embeddings from database: {e}")
+
     window_name = f"Capermint Edge AI Detector - Cam {camera_channel}"
     if not headless:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -1367,9 +1547,16 @@ def run_local_detector(
     fps = 0.0
     fps_timer = time.time()
     last_heartbeat_time = time.time()
+    last_employee_reload_time = time.time()
     show_hud = True
     track_start_times: Dict[int, float] = {}
     track_last_seen: Dict[int, float] = {}
+    bytetrack_empty_streak = 0
+
+    # Ensure local bytetrack.yaml is resolved directly
+    tracker_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bytetrack.yaml")
+    if not os.path.exists(tracker_config):
+        tracker_config = "bytetrack.yaml"
 
     print("\n[+] Edge Video Processor running. Press 'q' or 'ESC' in the window to quit.\n")
 
@@ -1391,9 +1578,11 @@ def run_local_detector(
 
             h, w = frame.shape[:2]
 
-            # YOLO tracking (class 0 = person) with ByteTrack & LocalTracker fallback
+            # YOLO tracking (class 0 = person) with ByteTrack primary & LocalTracker controlled fallback
             tracked_objects: Dict[int, Tuple[float, float, float, float]] = {}
             detections: List[Tuple[float, float, float, float]] = []
+            unmatched_boxes: List[Tuple[float, float, float, float]] = []
+            bytetrack_failed = False
 
             try:
                 results = model.track(
@@ -1402,7 +1591,7 @@ def run_local_detector(
                     conf=confidence_thresh,
                     imgsz=imgsz,
                     persist=True,
-                    tracker="bytetrack.yaml",
+                    tracker=tracker_config,
                     verbose=False,
                 )
                 if results and len(results) > 0 and results[0].boxes is not None:
@@ -1414,26 +1603,75 @@ def run_local_detector(
                                 track_id = int(box.id[0].item())
                                 tracked_objects[track_id] = (x1, y1, x2, y2)
                             except Exception:
-                                pass
+                                unmatched_boxes.append((x1, y1, x2, y2))
+                        else:
+                            unmatched_boxes.append((x1, y1, x2, y2))
             except Exception:
+                bytetrack_failed = True
                 # Fallback to model.predict if tracking plugin encounters issue
-                results = model.predict(
-                    source=frame,
-                    classes=[0],
-                    conf=confidence_thresh,
-                    imgsz=imgsz,
-                    verbose=False,
-                )
-                if results and len(results) > 0 and results[0].boxes is not None:
-                    for box in results[0].boxes:
-                        x1, y1, x2, y2 = box.xyxy[0].tolist()
-                        detections.append((x1, y1, x2, y2))
+                try:
+                    results = model.predict(
+                        source=frame,
+                        classes=[0],
+                        conf=confidence_thresh,
+                        imgsz=imgsz,
+                        verbose=False,
+                    )
+                    if results and len(results) > 0 and results[0].boxes is not None:
+                        for box in results[0].boxes:
+                            x1, y1, x2, y2 = box.xyxy[0].tolist()
+                            detections.append((x1, y1, x2, y2))
+                            unmatched_boxes.append((x1, y1, x2, y2))
+                except Exception:
+                    pass
 
-            # If ByteTrack did not assign IDs or returned empty, use LocalTracker
-            if not tracked_objects and detections:
-                tracked_objects = tracker.update(detections)
-            elif not detections:
-                tracked_objects = tracker.update([])
+            # Controlled fallback & unmatched detection handling
+            if bytetrack_failed:
+                # Controlled fallback: ByteTrack crashed or failed -> use LocalTracker
+                if detections:
+                    tracked_objects = tracker.update(detections)
+                else:
+                    tracked_objects = tracker.update([])
+            else:
+                # ByteTrack is primary
+                if tracked_objects:
+                    bytetrack_empty_streak = 0
+                    # Handle unmatched detections without mixing LocalTracker IDs or creating duplicate identities
+                    if unmatched_boxes:
+                        # 1. Filter out duplicate / overlapping detections of already tracked persons
+                        novel_unmatched = []
+                        for ubox in unmatched_boxes:
+                            is_dup = any(
+                                smoother._compute_iou(ubox, tbox) > 0.45 for tbox in tracked_objects.values()
+                            )
+                            if not is_dup:
+                                novel_unmatched.append(ubox)
+
+                        # 2. Re-associate valid unmatched detections to recently lost tracks in persistence buffer
+                        if novel_unmatched:
+                            recovered = smoother.recover_missing_tracks(novel_unmatched)
+                            tracked_objects.update(recovered)
+
+                    # Keep LocalTracker state synchronized with ByteTrack tracks (never injecting rogue IDs)
+                    tracker.sync_active_tracks(tracked_objects)
+
+                elif detections:
+                    # ByteTrack returned no tracks despite detections present in the frame
+                    # First check if any unmatched detections recover recently lost ByteTrack tracks
+                    recovered = smoother.recover_missing_tracks(unmatched_boxes)
+                    if recovered:
+                        tracked_objects.update(recovered)
+                        bytetrack_empty_streak = 0
+                        tracker.sync_active_tracks(tracked_objects)
+                    else:
+                        bytetrack_empty_streak += 1
+                        # Controlled fallback: Only activate LocalTracker after sustained ByteTrack silence (>= 5 frames)
+                        if bytetrack_empty_streak >= 5:
+                            tracked_objects = tracker.update(detections)
+                else:
+                    # No detections in this frame
+                    bytetrack_empty_streak = 0
+                    tracker.update([])
 
             # Apply Anti-Jitter Smoothing & Deadband to Person Bounding Boxes
             tracked_objects = smoother.smooth_body_boxes(tracked_objects)
@@ -1450,12 +1688,23 @@ def run_local_detector(
                 if now_ts - track_last_seen.get(old_id, 0.0) > 15.0:
                     track_start_times.pop(old_id, None)
                     track_last_seen.pop(old_id, None)
+                    identity_manager.on_track_lost(str(old_id))
+                    employee_recognizer.on_track_lost(str(old_id))
+                    track_last_recognition_attempt.pop(str(old_id), None)
 
             # Evaluate Dynamic Entry Line Crossing & Multi-Zone Section Visits
             new_attendance, new_sections = zone_manager.process(tracked_objects)
             for crossed_id in new_attendance:
-                print(f"[--> ATTENDANCE DETECTED] Person #{crossed_id} crossed Entry Line! Total Attendance: {zone_manager.attendance_total}")
-                sync_client.send_entry_event(tracker_id=str(crossed_id), confidence=0.94)
+                # Strictly suppress visitor entry count if the person is a recognized showroom employee
+                if employee_recognizer.is_track_employee(str(crossed_id)):
+                    emp_id = employee_recognizer.get_employee_id(str(crossed_id))
+                    print(f"[*] Staff member #{crossed_id} (EMP: {emp_id}) crossed entry line - visitor footfall count suppressed.")
+                    continue
+
+                pid = identity_manager.get_person_id(crossed_id)
+                pid_desc = f" (PID: {pid})" if pid else " (PID: Unresolved)"
+                print(f"[--> ATTENDANCE DETECTED] Person #{crossed_id}{pid_desc} crossed Entry Line! Total Attendance: {zone_manager.attendance_total}")
+                sync_client.send_entry_event(tracker_id=str(crossed_id), confidence=0.94, person_id=pid)
 
             for (p_id, s_id, s_name) in new_sections:
                 sec_tot = zone_manager.section_totals.get(s_id, 0)
@@ -1475,9 +1724,31 @@ def run_local_detector(
                 )
                 last_heartbeat_time = now
 
+            # Periodically synchronize employee face embeddings from database (every 15s)
+            if db_session and (now - last_employee_reload_time > 15.0):
+                last_employee_reload_time = now
+                try:
+                    from app.repositories.employee_repo import EmployeeRepository
+                    emp_repo = EmployeeRepository(db_session)
+                    active_embs = emp_repo.get_all_active_embeddings()
+                    loaded = employee_recognizer.load_active_employees(active_embs)
+                    active_emps = emp_repo.list_employees(is_active=True)
+                    employee_names.clear()
+                    for ae in active_emps:
+                        employee_names[ae.employee_id] = ae.name
+                except Exception:
+                    pass
+
             # Run Deep Learning Neural Face Detection (InsightFace SCRFD or OpenCV YuNet)
+            # High-Performance Optimization: Execute face inference only when persons are actively tracked
+            # AND cadence on every 2nd frame. TrackSmoother seamlessly coasts and translates faces on skipped frames.
             all_detected_faces = []
-            if face_detector is not None:
+            should_detect_faces = (
+                face_detector is not None
+                and len(tracked_objects) > 0
+                and (frame_counter % 2 == 0)
+            )
+            if should_detect_faces:
                 if face_detector_type == "scrfd":
                     all_detected_faces = face_detector.detect(frame, input_size=(640, 640))
                 elif face_detector_type == "yunet":
@@ -1539,6 +1810,57 @@ def run_local_detector(
 
                 if matched_face is not None:
                     matched_face["matched"] = True
+                    # Attempt Face-Based Recognition (Employees first, then Visitor Recovery)
+                    try:
+                        m_box = matched_face["box"]
+                        cx1 = max(0, int(m_box[0]))
+                        cy1 = max(0, int(m_box[1]))
+                        cx2 = min(w, int(m_box[0] + m_box[2]))
+                        cy2 = min(h, int(m_box[1] + m_box[3]))
+                        if cx2 > cx1 + 10 and cy2 > cy1 + 10:
+                            face_crop = frame[cy1:cy2, cx1:cx2]
+                            raw_lms = matched_face.get("landmarks")
+                            crop_lms = None
+                            if raw_lms:
+                                crop_lms = [(int(lx - cx1), int(ly - cy1)) for (lx, ly) in raw_lms]
+
+                            # 1. First check if recognized as Showroom Employee (throttles unconfirmed evaluation to max 3 Hz per track)
+                            tid = str(obj_id)
+                            is_confirmed = employee_recognizer.is_track_employee(tid)
+                            last_attempt = track_last_recognition_attempt.get(tid, 0.0)
+                            emp_match = None
+
+                            if is_confirmed or (now_ts - last_attempt >= 0.35):
+                                track_last_recognition_attempt[tid] = now_ts
+                                emp_match = employee_recognizer.evaluate_track_face(
+                                    tracker_id=tid,
+                                    face_crop=face_crop,
+                                    face_conf=float(matched_face["conf"]),
+                                    landmarks=crop_lms,
+                                    full_image=frame,
+                                    raw_landmarks=raw_lms,
+                                )
+                            if emp_match:
+                                emp_id, emp_conf = emp_match
+                                last_punch = punched_employee_ids.get(emp_id, 0.0)
+                                if (now_ts - last_punch) > 300.0:
+                                    punched_employee_ids[emp_id] = now_ts
+                                    sync_client.send_employee_punch_event(emp_id, event_type="CHECK_IN", confidence=emp_conf)
+                                    emp_label = employee_names.get(emp_id, emp_id)
+                                    print(f"[+] Biometrics: Verified Staff {emp_label} ({emp_id}) on Track #{obj_id} (conf: {emp_conf:.2f})")
+                            else:
+                                # 2. Otherwise process as customer visitor
+                                match_res = identity_manager.process_track_face(
+                                    tracker_id=str(obj_id),
+                                    face_crop=face_crop,
+                                    face_conf=float(matched_face["conf"]),
+                                    landmarks=crop_lms,
+                                    timestamp=now_ts,
+                                )
+                                if match_res.person_id:
+                                    zone_manager.set_identity(obj_id, match_res.person_id)
+                    except Exception as e:
+                        pass
 
                 # Process face state through Smoother & Hysteresis buffer
                 face_info = smoother.update_face(
@@ -1590,8 +1912,18 @@ def run_local_detector(
                     fx1, fy1, fx2, fy2 = smoother.smooth_head_box(obj_id, (fx1, fy1, fx2, fy2))
                     cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (190, 100, 190), 1)
 
-                # 2. Render Single Unified Header Badge (Person ID + Timer + Face Status)
-                main_label = f"Person #{obj_id} | {timer_str}"
+                # 2. Render Single Unified Header Badge (Person ID + Persistent ID + Timer + Face Status)
+                is_staff = employee_recognizer.is_track_employee(str(obj_id))
+                if is_staff:
+                    emp_id = employee_recognizer.get_employee_id(str(obj_id))
+                    emp_display = employee_names.get(emp_id, emp_id)
+                    main_label = f"STAFF [{emp_display}] #{obj_id} | {timer_str}"
+                    body_color = (0, 215, 255)  # Vivid Golden Yellow for verified showroom staff
+                    cv2.rectangle(frame, (ix1, iy1), (ix2, iy2), body_color, 2)
+                else:
+                    pid_val = identity_manager.get_person_id(obj_id)
+                    pid_desc = f" | {pid_val}" if pid_val else " | PID: Unresolved"
+                    main_label = f"Person #{obj_id}{pid_desc} | {timer_str}"
                 (w_main, _), _ = cv2.getTextSize(main_label, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
 
                 w_face = 0
@@ -1824,14 +2156,14 @@ def main():
     parser.add_argument(
         "--conf",
         type=float,
-        default=float(config.get("confidence", 0.25)),
-        help="YOLO person detection confidence threshold (default: 0.25)",
+        default=float(config.get("confidence", 0.10)),
+        help="YOLO person detection confidence threshold (default: 0.10)",
     )
     parser.add_argument(
         "--imgsz",
         type=int,
-        default=int(config.get("imgsz", 960)),
-        help="YOLO inference input resolution (default: 960)",
+        default=int(config.get("imgsz", 640)),
+        help="YOLO inference input resolution (default: 640)",
     )
     parser.add_argument(
         "--model",
@@ -1854,14 +2186,14 @@ def main():
     parser.add_argument(
         "--face-model",
         type=str,
-        default=config.get("face_model", "models/scrfd_2.5g_bnkps.onnx"),
-        help="Path to SCRFD or YuNet neural face model ONNX file (default: 'models/scrfd_2.5g_bnkps.onnx')",
+        default=config.get("face_model", "models/scrfd_2.5g_bnkps.pt"),
+        help="Path to SCRFD or YuNet neural face model file (default: 'models/scrfd_2.5g_bnkps.pt')",
     )
     parser.add_argument(
         "--face-conf",
         type=float,
-        default=float(config.get("face_confidence", 0.35)),
-        help="Neural face detection confidence threshold (default: 0.35)",
+        default=float(config.get("face_confidence", 0.30)),
+        help="Neural face detection confidence threshold (default: 0.30)",
     )
     parser.add_argument(
         "--standalone-faces",

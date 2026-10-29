@@ -23,6 +23,7 @@ import {
   YESTERDAY_METRICS,
 } from '../data/seedData';
 import { cameraService } from '../services/cameraService';
+import { FASTAPI_BASE_URL } from '../config/env';
 
 interface ShowroomContextType {
   // Visitors
@@ -34,6 +35,7 @@ interface ShowroomContextType {
   // Employees & Attendance
   employees: Employee[];
   attendance: AttendanceRecord[];
+  addEmployee: (employee: Employee, attendance?: AttendanceRecord) => void;
   markAttendance: (recordId: string, status: AttendanceRecord['status'], checkInTime?: string, checkOutTime?: string) => void;
   quickCheckInEmployee: (employeeId: string) => void;
   quickCheckOutEmployee: (employeeId: string) => void;
@@ -117,24 +119,101 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
   });
 
-  const [employees] = useState<Employee[]>(INITIAL_EMPLOYEES);
+  const [employees, setEmployees] = useState<Employee[]>(() => {
+    const saved = localStorage.getItem('capermint_employees') || localStorage.getItem('jms_employees');
+    if (!saved) return INITIAL_EMPLOYEES;
+    try {
+      const parsed: Employee[] = JSON.parse(saved);
+      // Strictly purge hardcoded legacy mock employee records (emp-1 through emp-8)
+      return parsed.filter((e) => !/^emp-[1-8]$/i.test(e.id));
+    } catch {
+      return INITIAL_EMPLOYEES;
+    }
+  });
 
   const [attendance, setAttendance] = useState<AttendanceRecord[]>(() => {
     const saved = localStorage.getItem('capermint_attendance') || localStorage.getItem('jms_attendance');
     if (!saved) return INITIAL_ATTENDANCE;
     try {
       const parsed: AttendanceRecord[] = JSON.parse(saved);
-      // Auto-purge legacy mock attendance with non-zero workHours
-      if (parsed.some((a) => a.workHours > 0 || a.status === 'Present')) {
-        localStorage.removeItem('capermint_attendance');
-        localStorage.removeItem('jms_attendance');
-        return INITIAL_ATTENDANCE;
-      }
-      return parsed;
+      // Strictly purge hardcoded legacy mock attendance (emp-1 through emp-8)
+      return parsed.filter((a) => !/^emp-[1-8]$/i.test(a.employeeId));
     } catch {
       return INITIAL_ATTENDANCE;
     }
   });
+
+  // Synchronize registered employees & attendance from FastAPI backend
+  useEffect(() => {
+    let isMounted = true;
+    const fetchBackendEmployees = async () => {
+      try {
+        const res = await fetch(`${FASTAPI_BASE_URL}/api/v1/employees`);
+        if (res.ok) {
+          const data = await res.json();
+          if (isMounted && Array.isArray(data)) {
+            const mapped: Employee[] = data.map((d: any) => {
+              const photo = d.photo_url
+                ? (d.photo_url.startsWith('http') || d.photo_url.startsWith('data:') ? d.photo_url : `${FASTAPI_BASE_URL}${d.photo_url}`)
+                : 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=120&auto=format&fit=crop&q=80';
+              return {
+                id: d.employee_id,
+                name: d.name,
+                role: d.designation || 'Staff',
+                department: d.department || 'Sales',
+                phone: '+91 98450 12345',
+                email: `${d.employee_id.toLowerCase().replace(/[^a-z0-9]/g, '')}@capermintdealership.com`,
+                avatarUrl: photo,
+              };
+            });
+            setEmployees(mapped);
+          }
+        }
+      } catch (err) {
+        console.warn('Backend employees not reachable:', err);
+      }
+    };
+
+    const fetchBackendAttendance = async () => {
+      try {
+        const res = await fetch(`${FASTAPI_BASE_URL}/api/v1/attendance/daily`);
+        if (res.ok) {
+          const data = await res.json();
+          if (isMounted && data.records && Array.isArray(data.records)) {
+            const todayStr = new Date().toISOString().split('T')[0];
+            const mapped: AttendanceRecord[] = data.records.map((r: any, idx: number) => ({
+              id: `att-${r.employee_id}-${r.date || todayStr}-${idx}`,
+              employeeId: r.employee_id,
+              employeeName: r.name,
+              role: r.designation,
+              department: r.department,
+              avatarUrl: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=120&auto=format&fit=crop&q=80',
+              date: r.date || todayStr,
+              checkInTime: r.first_check_in
+                ? new Date(r.first_check_in).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })
+                : null,
+              checkOutTime: r.last_check_out
+                ? new Date(r.last_check_out).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })
+                : null,
+              status: r.status === 'PRESENT' ? 'Present' : r.status === 'LATE' ? 'Late' : r.status === 'HALF_DAY' ? 'Present' : 'Absent',
+              workHours: r.total_work_hours || 0,
+              method: 'CCTV AI Check-in',
+            }));
+            setAttendance(mapped);
+          }
+        }
+      } catch (err) {
+        console.warn('Backend daily attendance not reachable:', err);
+      }
+    };
+
+    fetchBackendEmployees();
+    fetchBackendAttendance();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   const [storeHours, setStoreHours] = useState<StoreHoursConfig>(() => {
     const saved = localStorage.getItem('capermint_store_hours') || localStorage.getItem('jms_store_hours');
@@ -151,21 +230,58 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const [isLiveSimulationActive, setIsLiveSimulationActive] = useState<boolean>(false);
   const [lastSimulatedEvent, setLastSimulatedEvent] = useState<string | null>(null);
 
-  // Sync state to LocalStorage
+  // Sync state to LocalStorage safely (stripping oversized base64 to avoid browser QuotaExceededError)
   useEffect(() => {
-    localStorage.setItem('capermint_visitors', JSON.stringify(visitors));
+    try {
+      localStorage.setItem('capermint_visitors', JSON.stringify(visitors));
+    } catch (e) {
+      console.warn('LocalStorage save failed for visitors:', e);
+    }
   }, [visitors]);
 
   useEffect(() => {
-    localStorage.setItem('capermint_attendance', JSON.stringify(attendance));
+    try {
+      const lightweightAttendance = attendance.map((a) => ({
+        ...a,
+        avatarUrl: a.avatarUrl && a.avatarUrl.startsWith('data:') && a.avatarUrl.length > 20000
+          ? 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=120&auto=format&fit=crop&q=80'
+          : a.avatarUrl,
+      }));
+      localStorage.setItem('capermint_attendance', JSON.stringify(lightweightAttendance));
+    } catch (e) {
+      console.warn('LocalStorage save failed for attendance:', e);
+    }
   }, [attendance]);
 
   useEffect(() => {
-    localStorage.setItem('capermint_store_hours', JSON.stringify(storeHours));
+    try {
+      const lightweightEmployees = employees.map((e) => ({
+        ...e,
+        photoUrls: undefined,
+        avatarUrl: e.avatarUrl && e.avatarUrl.startsWith('data:') && e.avatarUrl.length > 20000
+          ? 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=120&auto=format&fit=crop&q=80'
+          : e.avatarUrl,
+      }));
+      localStorage.setItem('capermint_employees', JSON.stringify(lightweightEmployees));
+    } catch (e) {
+      console.warn('LocalStorage save failed for employees:', e);
+    }
+  }, [employees]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('capermint_store_hours', JSON.stringify(storeHours));
+    } catch (e) {
+      console.warn('LocalStorage save failed for store hours:', e);
+    }
   }, [storeHours]);
 
   useEffect(() => {
-    localStorage.setItem('capermint_settings', JSON.stringify(showroomSettings));
+    try {
+      localStorage.setItem('capermint_settings', JSON.stringify(showroomSettings));
+    } catch (e) {
+      console.warn('LocalStorage save failed for settings:', e);
+    }
   }, [showroomSettings]);
 
   // Determine if store is currently open based on local IST time
@@ -267,7 +383,40 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     setStoreHours((prev) => ({ ...prev, actualLastExitToday: timeStr }));
   };
 
-  // Attendance management
+  // Attendance & Employee management
+  const addEmployee = (newEmployee: Employee, initialAttendance?: AttendanceRecord) => {
+    setEmployees((prev) => {
+      const filtered = prev.filter((e) => e.id !== newEmployee.id);
+      return [newEmployee, ...filtered];
+    });
+    if (initialAttendance) {
+      setAttendance((prev) => {
+        const filtered = prev.filter((a) => a.employeeId !== newEmployee.id);
+        return [initialAttendance, ...filtered];
+      });
+    } else {
+      const todayStr = new Date().toISOString().split('T')[0];
+      const newAttendanceRecord: AttendanceRecord = {
+        id: `att-${Date.now()}`,
+        employeeId: newEmployee.id,
+        employeeName: newEmployee.name,
+        role: newEmployee.role,
+        department: newEmployee.department,
+        avatarUrl: newEmployee.avatarUrl,
+        date: todayStr,
+        checkInTime: null,
+        checkOutTime: null,
+        status: 'Absent',
+        workHours: 0,
+        method: 'CCTV AI Check-in',
+      };
+      setAttendance((prev) => {
+        const filtered = prev.filter((a) => a.employeeId !== newEmployee.id);
+        return [newAttendanceRecord, ...filtered];
+      });
+    }
+  };
+
   const markAttendance = (
     recordId: string,
     status: AttendanceRecord['status'],
@@ -348,7 +497,7 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       if (action === 'entry') {
         const bikePurposes: VisitPurpose[] = ['Test Ride', 'Vehicle Enquiry', 'Booking', 'Service'];
         const randomPurpose = Math.random() > 0.4 ? bikePurposes[Math.floor(Math.random() * bikePurposes.length)] : null;
-        const salespeople = ['Rajesh Kumar', 'Vikram Singh', 'Priya Sharma', 'Amit Patel'];
+        const salespeople = employees.length > 0 ? employees.map((e) => e.name) : ['Floor Consultant'];
         const randomSalesperson = randomPurpose ? salespeople[Math.floor(Math.random() * salespeople.length)] : null;
         const isReturning = Math.random() > 0.65;
 
@@ -711,6 +860,7 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         checkoutVisitor,
         employees,
         attendance,
+        addEmployee,
         markAttendance,
         quickCheckInEmployee,
         quickCheckOutEmployee,

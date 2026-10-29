@@ -56,6 +56,7 @@ export interface Employee {
   phone: string;
   email: string;
   avatarUrl: string;
+  photoUrls?: string[];
 }
 
 export interface AttendanceRecord {
