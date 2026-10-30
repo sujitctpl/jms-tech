@@ -57,6 +57,7 @@ export interface Employee {
   email: string;
   avatarUrl: string;
   photoUrls?: string[];
+  facePhotosCount?: number;
 }
 
 export interface AttendanceRecord {
@@ -66,6 +67,7 @@ export interface AttendanceRecord {
   role: string;
   department: string;
   avatarUrl?: string;
+  facePhotosCount?: number;
   date: string;
   checkInTime: string | null;
   checkOutTime: string | null;

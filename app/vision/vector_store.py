@@ -11,8 +11,7 @@ from app.db.models.person_identity import PersonIdentity
 class PgVectorStoreManager:
     """
     Unified PostgreSQL pgvector similarity search manager with HNSW index support.
-    Replaces in-memory FAISS indices by persisting and indexing 512-dimensional ArcFace
-    embeddings directly in PostgreSQL.
+    Persists and indexes 512-dimensional ArcFace embeddings directly in PostgreSQL.
 
     Guarantees:
     - Cosine similarity matching: distance d = 1 - sim => sim = 1 - d
@@ -27,12 +26,18 @@ class PgVectorStoreManager:
         self,
         db: Optional[Session] = None,
         similarity_threshold: Optional[float] = None,
+        match_margin: Optional[float] = None,
     ):
         self.db = db
         self.similarity_threshold = (
             similarity_threshold
             if similarity_threshold is not None
             else settings.FACE_SIMILARITY_THRESHOLD
+        )
+        self.match_margin = (
+            match_margin
+            if match_margin is not None
+            else getattr(settings, "FACE_MATCH_MARGIN", 0.035)
         )
         # In-memory vector store for standalone edge/client detector or mock tests (supports multi-angle gallery)
         self._in_memory_vectors: dict[str, list[np.ndarray]] = {}
@@ -65,6 +70,26 @@ class PgVectorStoreManager:
 
     def get_count(self) -> int:
         return self.ntotal
+
+    def __len__(self) -> int:
+        return self.ntotal
+
+    def __bool__(self) -> bool:
+        return True
+
+    def size(self) -> int:
+        return self.ntotal
+
+    def get_embedding(self, entity_id: str) -> Optional[np.ndarray]:
+        vecs = self._in_memory_vectors.get(str(entity_id))
+        if vecs:
+            return vecs[0] if isinstance(vecs, list) else vecs
+        return None
+
+    def rebuild_from_records(self, records: List[Tuple[str, np.ndarray]]) -> None:
+        self.clear()
+        for eid, emb in records:
+            self.add(eid, emb)
 
     def _ensure_normalized(self, embedding: np.ndarray) -> np.ndarray:
         norm = np.linalg.norm(embedding)
@@ -183,10 +208,13 @@ class PgVectorStoreManager:
         embedding: np.ndarray,
         similarity_threshold: Optional[float] = None,
         db: Optional[Session] = None,
+        match_margin: Optional[float] = None,
     ) -> Tuple[Optional[str], float]:
         """
         Queries registered active showroom employees using cosine similarity.
-        Returns (employee_id, similarity) if similarity >= threshold, else (None, best_score).
+        Enforces both calibrated similarity threshold and Top-1 vs Top-2 distinct employee
+        margin to prevent false acceptance on ambiguous lookalikes.
+        Returns (employee_id, similarity) if confirmed, else (None, best_score).
         """
         session = db or self.db
         thresh = (
@@ -194,9 +222,14 @@ class PgVectorStoreManager:
             if similarity_threshold is not None
             else self.similarity_threshold
         )
+        margin_req = (
+            match_margin
+            if match_margin is not None
+            else getattr(self, "match_margin", getattr(settings, "FACE_MATCH_MARGIN", 0.035))
+        )
         emb_norm = self._ensure_normalized(embedding)
 
-        # 1. Check in-memory vectors FIRST if populated (lightning fast in RAM: 0.01ms)
+        # 1. In-memory search (if recognition cache is populated in-memory)
         if self._in_memory_vectors:
             sorted_candidates: list[tuple[str, float]] = []
             for eid, val in self._in_memory_vectors.items():
@@ -210,20 +243,33 @@ class PgVectorStoreManager:
                 if best_eid_sim > 0:
                     sorted_candidates.append((eid, best_eid_sim))
 
-            if sorted_candidates:
-                sorted_candidates.sort(key=lambda x: x[1], reverse=True)
-                top1_id, top1_sim = sorted_candidates[0]
-                if top1_sim >= thresh:
-                    # Enforce Top-1 vs Top-2 Margin Check
-                    if len(sorted_candidates) > 1 and top1_sim < 0.65:
-                        top2_sim = sorted_candidates[1][1]
-                        margin = top1_sim - top2_sim
-                        if margin < 0.05:
-                            return None, round(top1_sim, 4)
-                    return top1_id, round(top1_sim, 4)
+            if not sorted_candidates:
+                return None, 0.0
+
+            sorted_candidates.sort(key=lambda x: x[1], reverse=True)
+            top1_id, top1_sim = sorted_candidates[0]
+            if top1_sim < thresh:
                 return None, round(top1_sim, 4)
 
-        # 2. If no DB session provided, attempt automatic session creation from SessionLocal
+            # Top-1 vs Top-2 margin check on in-memory candidates
+            if len(sorted_candidates) > 1 and margin_req > 0:
+                top2_id, top2_sim = sorted_candidates[1]
+                margin = top1_sim - top2_sim
+                if margin < margin_req:
+                    logger.debug(
+                        "Ambiguous match rejected in-memory: %s (%.3f) vs %s (%.3f) - margin %.3f < %.3f",
+                        top1_id,
+                        top1_sim,
+                        top2_id,
+                        top2_sim,
+                        margin,
+                        margin_req,
+                    )
+                    return None, round(top1_sim, 4)
+
+            return top1_id, round(top1_sim, 4)
+
+        # 2. If DB session provided or available, query database
         should_close_session = False
         if session is None:
             try:
@@ -231,75 +277,31 @@ class PgVectorStoreManager:
                 session = SessionLocal()
                 should_close_session = True
             except Exception as e:
-                logger.warning("Could not create database session for employee match: %s", str(e))
+                logger.debug("Database session not available for employee match: %s", str(e))
                 session = None
 
         if session is None:
-            # Standalone / In-memory fallback
-            if not self._in_memory_vectors:
-                return None, 0.0
-            best_emp_id, best_score = None, -1.0
-            for eid, val in self._in_memory_vectors.items():
-                vecs = val if isinstance(val, list) else [val]
-                for vec in vecs:
-                    sim = float(np.dot(emb_norm, vec))
-                    if sim > best_score:
-                        best_score = sim
-                        if sim >= thresh:
-                            best_emp_id = eid
-            return best_emp_id, max(0.0, round(best_score, 4))
+            return None, 0.0
 
         try:
             dialect_name = session.bind.dialect.name if session.bind else "postgresql"
 
-            # 1. PostgreSQL Native pgvector with HNSW index across multi-angle employee_faces
+            # 3. PostgreSQL Native pgvector with HNSW index across multi-angle employee_faces
             if dialect_name == "postgresql":
                 emb_list = emb_norm.tolist()
 
-                # Query top candidates to enforce both threshold and Top-1 vs Top-2 margin
+                # Gather top candidate vectors from employee_faces
                 ef_dist = EmployeeFace.face_embedding.cosine_distance(emb_list).label("dist")
                 rows = (
                     session.query(Employee.employee_id, ef_dist)
                     .join(Employee, Employee.id == EmployeeFace.employee_id)
                     .filter(Employee.is_active.is_(True))
                     .order_by(ef_dist.asc())
-                    .limit(6)
+                    .limit(30)
                     .all()
                 )
 
-                if rows:
-                    best_by_emp: dict[str, float] = {}
-                    for emp_id, dist_val in rows:
-                        d = float(dist_val)
-                        if emp_id not in best_by_emp or d < best_by_emp[emp_id]:
-                            best_by_emp[emp_id] = d
-
-                    sorted_matches = sorted(best_by_emp.items(), key=lambda x: x[1])
-                    top1_id, top1_dist = sorted_matches[0]
-                    top1_sim = round(max(0.0, min(1.0, 1.0 - top1_dist)), 4)
-
-                    if top1_sim < thresh:
-                        return None, top1_sim
-
-                    # Margin check: reject ambiguous matches when top 2 candidates are too close (< 0.05 margin)
-                    if len(sorted_matches) > 1 and top1_sim < 0.65:
-                        top2_id, top2_dist = sorted_matches[1]
-                        top2_sim = round(max(0.0, min(1.0, 1.0 - top2_dist)), 4)
-                        margin = top1_sim - top2_sim
-                        if margin < 0.05:
-                            logger.debug(
-                                "Ambiguous match: %s (%.3f) vs %s (%.3f) - margin %.3f < 0.05, rejected",
-                                top1_id,
-                                top1_sim,
-                                top2_id,
-                                top2_sim,
-                                margin,
-                            )
-                            return None, top1_sim
-
-                    return top1_id, top1_sim
-
-                # Secondary check on primary face_embedding
+                # Also gather from primary employee.face_embedding for any employees without explicit gallery rows
                 e_dist = Employee.face_embedding.cosine_distance(emb_list).label("dist")
                 fallback_rows = (
                     session.query(Employee.employee_id, e_dist)
@@ -308,45 +310,91 @@ class PgVectorStoreManager:
                         Employee.face_embedding.isnot(None),
                     )
                     .order_by(e_dist.asc())
-                    .limit(2)
+                    .limit(10)
                     .all()
                 )
-                if fallback_rows:
-                    top1_id, dist = fallback_rows[0][0], float(fallback_rows[0][1])
-                    similarity = round(max(0.0, min(1.0, 1.0 - dist)), 4)
-                    if similarity >= thresh:
-                        if len(fallback_rows) > 1 and similarity < 0.65:
-                            top2_sim = round(max(0.0, min(1.0, 1.0 - float(fallback_rows[1][1]))), 4)
-                            if (similarity - top2_sim) < 0.05:
-                                return None, similarity
-                        return top1_id, similarity
-                    return None, similarity
 
-                return None, 0.0
+                combined_rows = list(rows) + list(fallback_rows)
+                if not combined_rows:
+                    return None, 0.0
 
-            # 2. SQLite / Non-PostgreSQL In-Memory Fallback for test runner
+                # Aggregate by distinct employee: minimum distance (highest similarity)
+                best_by_emp: dict[str, float] = {}
+                for emp_id, dist_val in combined_rows:
+                    d = float(dist_val)
+                    if emp_id not in best_by_emp or d < best_by_emp[emp_id]:
+                        best_by_emp[emp_id] = d
+
+                sorted_matches = sorted(best_by_emp.items(), key=lambda x: x[1])
+                top1_id, top1_dist = sorted_matches[0]
+                top1_sim = round(max(0.0, min(1.0, 1.0 - top1_dist)), 4)
+
+                if top1_sim < thresh:
+                    return None, top1_sim
+
+                # Enforce Top-1 vs Top-2 distinct employee margin
+                if len(sorted_matches) > 1 and margin_req > 0:
+                    top2_id, top2_dist = sorted_matches[1]
+                    top2_sim = round(max(0.0, min(1.0, 1.0 - top2_dist)), 4)
+                    margin = top1_sim - top2_sim
+                    if margin < margin_req:
+                        logger.debug(
+                            "Ambiguous match rejected in pgvector: %s (%.3f) vs %s (%.3f) - margin %.3f < %.3f",
+                            top1_id,
+                            top1_sim,
+                            top2_id,
+                            top2_sim,
+                            margin,
+                            margin_req,
+                        )
+                        return None, top1_sim
+
+                return top1_id, top1_sim
+
+            # 4. SQLite / Non-PostgreSQL In-Memory Fallback for test runner
             employees = (
                 session.query(Employee)
                 .filter(Employee.is_active.is_(True))
                 .all()
             )
 
-            best_emp_id = None
-            best_score = -1.0
-
+            sorted_candidates = []
             for emp in employees:
                 gallery = emp.get_gallery_embeddings()
+                best_emp_sim = -1.0
                 for g_vec in gallery:
                     sim = float(np.dot(emb_norm, g_vec))
-                    if sim > best_score:
-                        best_score = sim
-                        if sim >= thresh:
-                            best_emp_id = emp.employee_id
+                    if sim > best_emp_sim:
+                        best_emp_sim = sim
+                if best_emp_sim > 0:
+                    sorted_candidates.append((emp.employee_id, best_emp_sim))
 
-            if best_emp_id is not None:
-                return best_emp_id, max(0.0, round(best_score, 4))
+            if not sorted_candidates:
+                return None, 0.0
 
-            return None, max(0.0, round(best_score, 4))
+            sorted_candidates.sort(key=lambda x: x[1], reverse=True)
+            top1_id, top1_sim = sorted_candidates[0]
+            top1_sim_rnd = round(top1_sim, 4)
+            if top1_sim_rnd < thresh:
+                return None, top1_sim_rnd
+
+            # Margin check on SQLite
+            if len(sorted_candidates) > 1 and top1_sim_rnd < 0.70:
+                top2_id, top2_sim = sorted_candidates[1]
+                margin = top1_sim_rnd - round(top2_sim, 4)
+                if margin < margin_req:
+                    logger.debug(
+                        "Ambiguous match rejected in SQLite: %s (%.3f) vs %s (%.3f) - margin %.3f < %.3f",
+                        top1_id,
+                        top1_sim_rnd,
+                        top2_id,
+                        top2_sim,
+                        margin,
+                        margin_req,
+                    )
+                    return None, top1_sim_rnd
+
+            return top1_id, top1_sim_rnd
 
         except Exception as e:
             logger.warning("Error querying pgvector employee face match: %s", str(e))

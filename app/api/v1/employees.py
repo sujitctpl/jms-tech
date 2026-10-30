@@ -92,6 +92,7 @@ def enroll_employee_face(
         face_image_base64=req.face_image_base64,
         face_images_base64=req.face_images_base64,
         embedding_vector=emb,
+        append=req.append,
     )
 
 
@@ -102,8 +103,10 @@ def enroll_employee_face(
 )
 async def upload_employee_face_image(
     employee_id: str,
-    files: Optional[List[UploadFile]] = File(None, description="One or more employee portrait images (1st kept as profile picture)"),
+    files: Optional[List[UploadFile]] = File(None, description="One or more employee portrait images"),
     file: Optional[UploadFile] = File(None, description="Single employee portrait image (legacy support)"),
+    append: bool = Query(False, description="If True, append photos to existing gallery instead of replacing"),
+    set_as_profile: bool = Query(False, description="Set 1st uploaded photo as primary profile picture"),
     db: Session = Depends(get_db),
 ) -> Any:
     service = EmployeeService(db)
@@ -123,6 +126,41 @@ async def upload_employee_face_image(
     return service.enroll_faces_from_bytes(
         employee_id=employee_id,
         images_bytes=contents_list,
+        append=append,
+        set_as_primary=set_as_profile,
+    )
+
+
+@router.post(
+    "/api/v1/employees/{employee_id}/photos",
+    response_model=EmployeeResponse,
+    summary="Add more photos of an employee after registration to strengthen multi-angle biometric recognition",
+)
+async def add_employee_photos(
+    employee_id: str,
+    files: Optional[List[UploadFile]] = File(None, description="One or more employee portrait images to add"),
+    file: Optional[UploadFile] = File(None, description="Single employee portrait image to add"),
+    set_as_profile: bool = Query(False, description="Set 1st uploaded photo as new primary profile picture"),
+    db: Session = Depends(get_db),
+) -> Any:
+    service = EmployeeService(db)
+    upload_list: List[UploadFile] = []
+    if files:
+        upload_list.extend([f for f in files if f and f.filename])
+    if file and file.filename:
+        upload_list.append(file)
+
+    if not upload_list:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one valid image file must be uploaded.",
+        )
+
+    contents_list = [await f.read() for f in upload_list]
+    return service.add_photos_from_bytes(
+        employee_id=employee_id,
+        images_bytes=contents_list,
+        set_as_primary=set_as_profile,
     )
 
 

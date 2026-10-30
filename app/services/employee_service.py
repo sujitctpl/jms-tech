@@ -54,6 +54,10 @@ class EmployeeService:
             first_b64 = images_b64[0]
             if "," in first_b64:
                 first_b64 = first_b64.split(",", 1)[1]
+            first_b64 = first_b64.strip()
+            missing_padding = len(first_b64) % 4
+            if missing_padding:
+                first_b64 += "=" * (4 - missing_padding)
             try:
                 first_bytes = base64.b64decode(first_b64)
                 photo_url = self._save_profile_picture(data.employee_id, first_bytes)
@@ -146,9 +150,11 @@ class EmployeeService:
         updated = self.repo.update(emp, **data.model_dump(exclude_unset=True))
         if data.is_active is False:
             self.recognizer.remove_employee(emp.employee_id)
-        elif data.is_active is True and emp.face_embedding:
-            arr = np.frombuffer(emp.face_embedding, dtype=np.float32)
-            self.recognizer.register_employee(emp.employee_id, arr)
+        elif data.is_active is True and emp.face_embedding is not None:
+            arr = emp.get_embedding_array()
+            gallery = emp.get_gallery_embeddings()
+            if arr is not None:
+                self.recognizer.register_employee(emp.employee_id, embedding=arr, gallery_embeddings=gallery)
 
         return self._to_response(updated)
 
@@ -158,19 +164,24 @@ class EmployeeService:
         face_image_base64: Optional[str] = None,
         face_images_base64: Optional[List[str]] = None,
         embedding_vector: Optional[List[float]] = None,
+        append: bool = False,
     ) -> EmployeeResponse:
         emp = self._resolve_employee(employee_id)
         photo_url = None
 
         images_b64 = face_images_base64 or ([face_image_base64] if face_image_base64 else [])
         if images_b64:
-            # 1. Keep 1st photo as their profile picture
+            # 1. Keep 1st photo as profile picture if not appending or no photo set yet
             first_b64 = images_b64[0]
             if "," in first_b64:
                 first_b64 = first_b64.split(",", 1)[1]
             try:
                 first_bytes = base64.b64decode(first_b64)
-                photo_url = self._save_profile_picture(emp.employee_id, first_bytes)
+                if not append or not emp.photo_url:
+                    photo_url = self._save_profile_picture(emp.employee_id, first_bytes)
+                else:
+                    ts = int(datetime.utcnow().timestamp())
+                    self._save_profile_picture(emp.employee_id, first_bytes, suffix=f"gallery_{ts}")
             except Exception as e:
                 logger.warning("Failed to save 1st photo as profile picture for %s: %s", emp.employee_id, str(e))
 
@@ -202,6 +213,20 @@ class EmployeeService:
                 detail="Either face images (Base64) or a 512-dimensional embedding_vector must be provided.",
             )
 
+        if append:
+            updated = self.repo.add_face_embeddings(
+                emp,
+                new_embeddings=gallery_embeddings,
+                new_photo_url=photo_url,
+                set_as_primary_profile=False,
+            )
+            self.recognizer.register_employee(
+                updated.employee_id,
+                embedding=updated.get_embedding_array(),
+                gallery_embeddings=updated.get_gallery_embeddings(),
+            )
+            return self._to_response(updated)
+
         updated = self.repo.update_face_embedding(
             emp,
             embedding,
@@ -219,6 +244,8 @@ class EmployeeService:
         self,
         employee_id: Any,
         images_bytes: List[bytes],
+        append: bool = False,
+        set_as_primary: bool = False,
     ) -> EmployeeResponse:
         emp = self._resolve_employee(employee_id)
         if not images_bytes:
@@ -227,13 +254,19 @@ class EmployeeService:
                 detail="At least one image must be provided.",
             )
 
-        # 1. Keep the 1st photo as their profile picture
-        first_photo_bytes = images_bytes[0]
-        photo_url = self._save_profile_picture(emp.employee_id, first_photo_bytes)
+        # 1. Profile picture handling
+        photo_url = None
+        if not append or set_as_primary or not emp.photo_url:
+            first_photo_bytes = images_bytes[0]
+            photo_url = self._save_profile_picture(emp.employee_id, first_photo_bytes)
+        else:
+            ts = int(datetime.utcnow().timestamp())
+            self._save_profile_picture(emp.employee_id, images_bytes[0], suffix=f"gallery_{ts}")
 
-        # 2. Extract embeddings from all uploaded images
+        # 2. Extract embeddings from all uploaded images with quality & duplicate checks
         embeddings: List[np.ndarray] = []
         errors: List[str] = []
+        existing_gallery = emp.get_gallery_embeddings() if append else []
 
         for idx, img_b in enumerate(images_bytes):
             arr = np.frombuffer(img_b, dtype=np.uint8)
@@ -241,8 +274,30 @@ class EmployeeService:
             if img is None:
                 errors.append(f"Photo #{idx + 1}: Could not decode image.")
                 continue
+
+            # Quality validation with graceful fallback to face detection
+            is_valid, q_reason, cropped, crop_lms, full_lms = self.embedder.validate_enrollment_quality(img)
+            if not is_valid:
+                logger.warning("Photo #%d for employee %s failed strict quality check: %s. Attempting fallback face extraction.", idx + 1, emp.employee_id, q_reason)
+                cropped, crop_lms, full_lms = self.embedder.detect_and_crop_face(img)
+                if cropped is None or cropped.size == 0:
+                    errors.append(f"Photo #{idx + 1}: Rejected - {q_reason}")
+                    continue
+
             try:
-                emb = self.embedder.extract_face_embedding_from_image(img)
+                emb = self.embedder.extract_embedding(cropped, crop_lms, full_image=img, raw_landmarks=full_lms)
+
+                # Duplicate enrollment check against existing gallery and current batch
+                is_duplicate = False
+                for ex_vec in existing_gallery + embeddings:
+                    if float(np.dot(emb, ex_vec)) > 0.998:
+                        is_duplicate = True
+                        break
+
+                if is_duplicate:
+                    logger.info("Photo #%d for employee %s skipped as duplicate angle (sim > 0.998)", idx + 1, emp.employee_id)
+                    continue
+
                 embeddings.append(emb)
             except Exception as e:
                 errors.append(f"Photo #{idx + 1}: {e}")
@@ -250,8 +305,22 @@ class EmployeeService:
         if not embeddings:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Face embedding generation failed for all {len(images_bytes)} images: {'; '.join(errors)}",
+                detail=f"Face embedding enrollment failed: {'; '.join(errors) if errors else 'No new valid face angles found.'}",
             )
+
+        if append:
+            updated = self.repo.add_face_embeddings(
+                emp,
+                new_embeddings=embeddings,
+                new_photo_url=photo_url,
+                set_as_primary_profile=set_as_primary,
+            )
+            self.recognizer.register_employee(
+                updated.employee_id,
+                embedding=updated.get_embedding_array(),
+                gallery_embeddings=updated.get_gallery_embeddings(),
+            )
+            return self._to_response(updated)
 
         primary_embedding = embeddings[0]
         gallery_embeddings = embeddings
@@ -268,6 +337,19 @@ class EmployeeService:
             gallery_embeddings=gallery_embeddings,
         )
         return self._to_response(updated)
+
+    def add_photos_from_bytes(
+        self,
+        employee_id: Any,
+        images_bytes: List[bytes],
+        set_as_primary: bool = False,
+    ) -> EmployeeResponse:
+        return self.enroll_faces_from_bytes(
+            employee_id=employee_id,
+            images_bytes=images_bytes,
+            append=True,
+            set_as_primary=set_as_primary,
+        )
 
     def enroll_face_from_bytes(self, employee_id: Any, image_bytes: bytes) -> EmployeeResponse:
         return self.enroll_faces_from_bytes(employee_id=employee_id, images_bytes=[image_bytes])
@@ -369,7 +451,7 @@ class EmployeeService:
             records=items,
         )
 
-    def _save_profile_picture(self, employee_id: str, image_bytes: bytes) -> str:
+    def _save_profile_picture(self, employee_id: str, image_bytes: bytes, suffix: Optional[str] = None) -> str:
         upload_dir = os.path.join("static", "uploads", "employees")
         os.makedirs(upload_dir, exist_ok=True)
         ext = ".jpg"
@@ -379,7 +461,7 @@ class EmployeeService:
             ext = ".webp"
 
         clean_id = str(employee_id).replace("/", "_").replace("\\", "_")
-        filename = f"{clean_id}_profile{ext}"
+        filename = f"{clean_id}_{suffix}{ext}" if suffix else f"{clean_id}_profile{ext}"
         filepath = os.path.join(upload_dir, filename)
         try:
             with open(filepath, "wb") as f:
@@ -408,6 +490,10 @@ class EmployeeService:
         try:
             if "," in b64_str:
                 b64_str = b64_str.split(",", 1)[1]
+            b64_str = b64_str.strip()
+            missing_padding = len(b64_str) % 4
+            if missing_padding:
+                b64_str += "=" * (4 - missing_padding)
             raw_bytes = base64.b64decode(b64_str)
             arr = np.frombuffer(raw_bytes, dtype=np.uint8)
             img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -422,6 +508,8 @@ class EmployeeService:
 
     @staticmethod
     def _to_response(emp: Employee) -> EmployeeResponse:
+        gallery = emp.get_gallery_embeddings()
+        photos_count = len(gallery) if gallery else (1 if emp.face_embedding is not None else 0)
         return EmployeeResponse(
             id=emp.id,
             employee_id=emp.employee_id,
@@ -437,6 +525,7 @@ class EmployeeService:
             photo_url=emp.photo_url,
             is_active=emp.is_active,
             has_face_registered=bool(emp.face_embedding is not None),
+            face_photos_count=photos_count,
             created_at=emp.created_at,
             updated_at=emp.updated_at,
         )

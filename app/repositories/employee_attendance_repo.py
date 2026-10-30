@@ -109,24 +109,34 @@ class EmployeeAttendanceRepository:
         late_cutoff = shift_start_dt + timedelta(minutes=late_grace)
         early_cutoff = shift_end_dt - timedelta(minutes=early_grace)
 
-        if not daily:
+        if not daily or daily.first_check_in is None:
             # First sighting of the day -> Check-In
             is_late = now > late_cutoff
             late_mins = max(0.0, (now - shift_start_dt).total_seconds() / 60.0) if is_late else 0.0
             status = "LATE" if is_late else "PRESENT"
 
-            daily = EmployeeDailyAttendance(
-                employee_id=emp_obj.id,
-                date=today,
-                first_check_in=now,
-                last_check_out=now,
-                total_work_hours=0.0,
-                is_late=is_late,
-                late_minutes=round(late_mins, 1),
-                is_early_departure=False,
-                early_departure_minutes=0.0,
-                status=status,
-            )
+            if not daily:
+                daily = EmployeeDailyAttendance(
+                    employee_id=emp_obj.id,
+                    date=today,
+                    first_check_in=now,
+                    last_check_out=now,
+                    total_work_hours=0.0,
+                    is_late=is_late,
+                    late_minutes=round(late_mins, 1),
+                    is_early_departure=False,
+                    early_departure_minutes=0.0,
+                    status=status,
+                )
+            else:
+                daily.first_check_in = now
+                daily.last_check_out = now
+                daily.is_late = is_late
+                daily.late_minutes = round(late_mins, 1)
+                daily.is_early_departure = False
+                daily.early_departure_minutes = 0.0
+                daily.status = status
+
             self.db.add(daily)
             logger.info(
                 "Recorded first check-in for employee %s (%s) at %s [Status: %s]",
@@ -138,7 +148,7 @@ class EmployeeAttendanceRepository:
         else:
             # Subsequent sighting -> update last_check_out and calculate work duration
             first_in = ensure_tz_aware(daily.first_check_in)
-            if first_in and now > first_in:
+            if first_in and now >= first_in:
                 daily.last_check_out = now
                 work_seconds = (now - first_in).total_seconds()
                 daily.total_work_hours = round(max(0.0, work_seconds / 3600.0), 2)

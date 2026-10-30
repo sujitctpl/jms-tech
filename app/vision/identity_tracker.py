@@ -7,7 +7,6 @@ import numpy as np
 from app.core.config import settings
 from app.core.logging import logger
 from app.vision.face_embedder import FaceEmbedder
-from app.vision.faiss_index import FaissIndexManager
 from app.vision.vector_store import PgVectorStoreManager
 
 
@@ -53,7 +52,12 @@ class IdentityRecoveryManager:
             if similarity_threshold is not None
             else settings.FACE_SIMILARITY_THRESHOLD
         )
-        self.vector_store = vector_store or faiss_index or PgVectorStoreManager(similarity_threshold=self.similarity_threshold)
+        if vector_store is not None:
+            self.vector_store = vector_store
+        elif faiss_index is not None:
+            self.vector_store = faiss_index
+        else:
+            self.vector_store = PgVectorStoreManager(similarity_threshold=self.similarity_threshold)
         # Backward compatibility alias
         self.faiss_index = self.vector_store
         self.max_attempts = (
@@ -109,7 +113,7 @@ class IdentityRecoveryManager:
     ) -> IdentityMatchResult:
         """
         Evaluates a detected face for identity recovery.
-        Executes face embedding generation and FAISS search only when quality criteria are met.
+        Executes face embedding generation and pgvector similarity search only when quality criteria are met.
         Avoids redundant inference if the track is already reliably identified.
         """
         tid = str(tracker_id)
@@ -221,8 +225,9 @@ class IdentityRecoveryManager:
         # 7. No Match Exceeding Threshold
         # Avoid assuming the visitor is definitely a new person immediately on a single frame or border-line score
         # Calibrated logic:
-        # If best_score is in uncertain zone (e.g. 0.38 - threshold), leave unresolved!
-        if best_score >= 0.38:
+        # If best_score is in uncertain zone below threshold, leave unresolved!
+        uncertain_cutoff = max(0.24, self.similarity_threshold - 0.08)
+        if best_score >= uncertain_cutoff:
             return IdentityMatchResult(
                 tracker_id=tid,
                 person_id=None,
@@ -302,7 +307,7 @@ class IdentityRecoveryManager:
     def on_track_lost(self, tracker_id: str) -> None:
         """
         Cleans up per-track frame cache when a track is lost,
-        while maintaining persistent identity mappings and FAISS index.
+        while maintaining persistent identity mappings and vector store index.
         """
         tid = str(tracker_id)
         self.track_attempts.pop(tid, None)

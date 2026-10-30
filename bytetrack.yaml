@@ -2,9 +2,9 @@
 # Reference: https://docs.ultralytics.com/modes/track
 
 tracker_type: bytetrack  # (str) Tracker backend: bytetrack
-track_high_thresh: 0.25  # (float) First-stage match threshold
-track_low_thresh: 0.10   # (float) Second-stage threshold for low-score matches; paired with YOLO conf=0.10
-new_track_thresh: 0.20   # (float) Minimum confidence to initiate a new tracklet (filters out weak noise)
+track_high_thresh: 0.30  # (float) First-stage match threshold
+track_low_thresh: 0.15   # (float) Second-stage threshold for low-score matches
+new_track_thresh: 0.28   # (float) Minimum confidence to initiate a new tracklet (filters out weak noise)
 track_buffer: 60         # (int) Frames to keep lost tracks alive (~2-3s for temporary occlusion recovery)
 match_thresh: 0.75       # (float) Association similarity threshold (IoU/cost)
 fuse_score: True         # (bool) Fuse detection score with motion/IoU for matching

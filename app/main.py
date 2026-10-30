@@ -21,13 +21,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     setup_logging()
     logger.info("Initializing %s...", settings.APP_NAME)
 
-    # Load active registered employee face embeddings into FAISS index
+    # Load active registered employee face embeddings into vector store cache
     try:
         db = SessionLocal()
         emp_repo = EmployeeRepository(db)
         active_embs = emp_repo.get_all_active_embeddings()
         global_employee_recognizer.load_active_employees(active_embs)
-        logger.info("Loaded %d active employee face embeddings into Employee FAISS index.", len(active_embs))
+        logger.info("Loaded %d active employee face embeddings into Employee vector store cache.", len(active_embs))
         db.close()
     except Exception as e:
         logger.warning("Could not pre-load employee face embeddings on startup: %s", str(e))

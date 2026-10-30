@@ -19,6 +19,8 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
+from app.core.config import settings
+
 # Force TCP transport for RTSP streams globally to prevent packet loss & H264 macroblock decode corruption
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
@@ -289,7 +291,7 @@ class TrackSmoother:
         alpha: float = 0.70,
         deadband_px: float = 3.5,
         face_persistence: int = 8,
-        body_persistence: int = 40,
+        body_persistence: int = 15,
         enabled: bool = True,
     ):
         self.alpha = float(alpha)
@@ -484,9 +486,31 @@ class TrackSmoother:
         # 4. Persistence Coasting: Retain momentarily missed detections within the cutoff buffer
         for old_id, miss_count in list(self.disappeared.items()):
             if 0 < miss_count <= self.body_persistence and old_id in self.body_boxes and old_id not in smoothed_dict:
-                smoothed_dict[old_id] = self.body_boxes[old_id]
+                old_box = self.body_boxes[old_id]
+                # Never coast a missing track if an active box already covers the same physical space
+                is_covered = any(
+                    self._compute_iou(old_box, abox) > 0.30 for abox in smoothed_dict.values()
+                )
+                if not is_covered:
+                    smoothed_dict[old_id] = old_box
 
-        return smoothed_dict
+        # 5. Overlap De-duplication (Track NMS): eliminate duplicate / ghost bounding boxes on the same individual
+        deduped_dict: Dict[int, Tuple[float, float, float, float]] = {}
+        # Prioritize actively detected boxes over coasted ones, then lower/established IDs
+        sorted_candidates = sorted(
+            smoothed_dict.items(),
+            key=lambda item: (self.disappeared.get(item[0], 0), item[0]),
+        )
+        for tid, box in sorted_candidates:
+            has_duplicate = False
+            for kept_id, kept_box in deduped_dict.items():
+                if self._compute_iou(box, kept_box) > 0.38:
+                    has_duplicate = True
+                    break
+            if not has_duplicate:
+                deduped_dict[tid] = box
+
+        return deduped_dict
 
     def update_face(
         self,
@@ -1385,9 +1409,10 @@ def run_local_detector(
     box_smoothing: bool = True,
     smoothing_alpha: float = 0.70,
     face_persistence: int = 8,
-    body_persistence: int = 40,
+    body_persistence: int = 15,
     deadband_px: float = 3.5,
     camera_channel: str = "201",
+    similarity_thresh: Optional[float] = None,
     entry_line_cfg: Optional[dict] = None,
     sections_cfg: Optional[list] = None,
 ):
@@ -1400,6 +1425,9 @@ def run_local_detector(
     print(f"[*] Detection Model: {model_path} (imgsz={imgsz})")
     print(f"[*] Face AI Model  : {face_model_path} (threshold: {face_confidence:.2f})")
     print(f"[*] Confidence     : {confidence_thresh:.2f}")
+    from app.core.config import settings
+    effective_sim_thresh = similarity_thresh if similarity_thresh is not None else settings.FACE_SIMILARITY_THRESHOLD
+    print(f"[*] Biometric Sim  : {effective_sim_thresh:.2f} (ceiling calibrated)")
     print(f"[*] Face Box Scale : {face_scale:.2f}x (adjust live with +/-)")
     print(f"[*] Anti-Jitter    : {'ON (EMA alpha=' + str(smoothing_alpha) + ', deadband=' + str(deadband_px) + 'px)' if box_smoothing else 'OFF'}")
     print(f"[*] Face Hysteresis: {'ON (' + str(face_persistence) + ' frames buffer)' if box_smoothing else 'OFF'}")
@@ -1501,26 +1529,28 @@ def run_local_detector(
         min_confidence=min(face_confidence, settings.FACE_MIN_CONFIDENCE),
         blur_threshold=settings.FACE_BLUR_THRESHOLD,
     )
-    sim_thresh = settings.FACE_SIMILARITY_THRESHOLD
-    vector_store = PgVectorStoreManager(db=db_session, similarity_threshold=sim_thresh)
+    sim_thresh = similarity_thresh if similarity_thresh is not None else settings.FACE_SIMILARITY_THRESHOLD
+    visitor_vector_store = PgVectorStoreManager(db=db_session, similarity_threshold=sim_thresh)
+    employee_vector_store = PgVectorStoreManager(db=db_session, similarity_threshold=sim_thresh)
     identity_manager = IdentityRecoveryManager(
         embedder=face_embedder,
-        vector_store=vector_store,
+        vector_store=visitor_vector_store,
         similarity_threshold=sim_thresh,
         max_attempts=5,
         cooldown_frames=6,
     )
     employee_recognizer = EmployeeRecognitionManager(
         embedder=face_embedder,
-        vector_store=vector_store,
+        vector_store=employee_vector_store,
         similarity_threshold=sim_thresh,
-        min_confirm_frames=3,
-        vote_window=5,
+        min_confirm_frames=settings.EMPLOYEE_MIN_CONFIRM_FRAMES,
+        vote_window=settings.EMPLOYEE_VOTE_WINDOW,
     )
 
     # Cooldown buffer for employee check-in punches (punch at most once per 5 mins per staff)
     punched_employee_ids: Dict[str, float] = {}
     track_last_recognition_attempt: Dict[str, float] = {}
+    announced_staff_tracks: Set[int] = set()
 
     # Preload registered employees and names into recognizer
     employee_names: Dict[str, str] = {}
@@ -1597,6 +1627,11 @@ def run_local_detector(
                 if results and len(results) > 0 and results[0].boxes is not None:
                     for box in results[0].boxes:
                         x1, y1, x2, y2 = box.xyxy[0].tolist()
+                        bw = x2 - x1
+                        bh = y2 - y1
+                        # Filter out noise & horizontal non-human objects (e.g. backpacks, bags on chairs, cushions)
+                        if bw < 24 or bh < 32 or (bh / max(1.0, bw)) < 0.65:
+                            continue
                         detections.append((x1, y1, x2, y2))
                         if box.id is not None:
                             try:
@@ -1620,6 +1655,10 @@ def run_local_detector(
                     if results and len(results) > 0 and results[0].boxes is not None:
                         for box in results[0].boxes:
                             x1, y1, x2, y2 = box.xyxy[0].tolist()
+                            bw = x2 - x1
+                            bh = y2 - y1
+                            if bw < 24 or bh < 32 or (bh / max(1.0, bw)) < 0.65:
+                                continue
                             detections.append((x1, y1, x2, y2))
                             unmatched_boxes.append((x1, y1, x2, y2))
                 except Exception:
@@ -1683,13 +1722,15 @@ def run_local_detector(
                     track_start_times[obj_id] = now_ts
                 track_last_seen[obj_id] = now_ts
 
-            # Expire track timers inactive for > 15 seconds
+            # Expire track timers and release employee locks when tracks disappear (> 3s for biometrics, > 15s for full cleanup)
             for old_id in list(track_start_times.keys()):
-                if now_ts - track_last_seen.get(old_id, 0.0) > 15.0:
+                inactive_sec = now_ts - track_last_seen.get(old_id, 0.0)
+                if inactive_sec > 3.0:
+                    employee_recognizer.on_track_lost(str(old_id))
+                if inactive_sec > 15.0:
                     track_start_times.pop(old_id, None)
                     track_last_seen.pop(old_id, None)
                     identity_manager.on_track_lost(str(old_id))
-                    employee_recognizer.on_track_lost(str(old_id))
                     track_last_recognition_attempt.pop(str(old_id), None)
 
             # Evaluate Dynamic Entry Line Crossing & Multi-Zone Section Visits
@@ -1750,7 +1791,9 @@ def run_local_detector(
             )
             if should_detect_faces:
                 if face_detector_type == "scrfd":
-                    all_detected_faces = face_detector.detect(frame, input_size=(640, 640))
+                    det_w = min(w, 960)
+                    det_h = min(h, 960)
+                    all_detected_faces = face_detector.detect(frame, input_size=(det_w, det_h))
                 elif face_detector_type == "yunet":
                     face_detector.setInputSize((w, h))
                     _, raw_faces = face_detector.detect(frame)
@@ -1797,16 +1840,61 @@ def run_local_detector(
                 # 1. Match and process neural face or head fallback FIRST
                 matched_face = None
                 best_face_dist = 999999.0
+                ar = box_h / max(1.0, box_w)
+                # Adaptive vertical search window: standing persons (ar >= 2.0) have heads in top 45%;
+                # seated/desk-occluded persons (ar < 2.0) have faces spanning up to 75% of the visible torso box.
+                max_face_y_ratio = 0.45 if ar >= 2.0 else (0.62 if ar >= 1.4 else 0.75)
+                expected_fcy = iy1 + box_h * (0.18 if ar >= 2.0 else 0.35)
+
                 for face in all_detected_faces:
                     if face["matched"]:
                         continue
                     fcx, fcy = face["center"]
-                    # Face center must strictly be inside or right next to upper portion of person body (top 38%)
-                    if (ix1 - 20 <= fcx <= ix2 + 20) and (iy1 - 20 <= fcy <= iy1 + box_h * 0.38):
-                        dist = math.hypot(fcx - (ix1 + ix2) / 2.0, fcy - (iy1 + box_h * 0.15))
+                    if (ix1 - 25 <= fcx <= ix2 + 25) and (iy1 - 25 <= fcy <= iy1 + box_h * max_face_y_ratio):
+                        dist = math.hypot(fcx - (ix1 + ix2) / 2.0, fcy - expected_fcy)
                         if dist < best_face_dist:
                             best_face_dist = dist
                             matched_face = face
+
+                # Fallback: Targeted upper-body face recovery (disabled by default to prevent hallucinating on back of heads & save 60% GPU latency)
+                if False and matched_face is None and face_detector is not None:
+                    ub_h = max(24, int(box_h * max_face_y_ratio))
+                    uy1 = max(0, iy1 - 8)
+                    uy2 = min(h, iy1 + ub_h)
+                    ux1 = max(0, ix1 - 12)
+                    ux2 = min(w, ix2 + 12)
+                    crop_w, crop_h = ux2 - ux1, uy2 - uy1
+                    if crop_w > 20 and crop_h > 20:
+                        ub_crop = frame[uy1:uy2, ux1:ux2]
+                        crop_faces = []
+                        if face_detector_type == "scrfd":
+                            crop_faces = face_detector.detect(ub_crop, input_size=(320, 320))
+                        elif face_detector_type == "yunet":
+                            face_detector.setInputSize((crop_w, crop_h))
+                            _, cr_raw = face_detector.detect(ub_crop)
+                            if cr_raw is not None and len(cr_raw) > 0:
+                                for f in cr_raw:
+                                    crop_faces.append({
+                                        "box": (float(f[0]), float(f[1]), float(f[2]), float(f[3])),
+                                        "conf": float(f[14]),
+                                        "landmarks": [(int(f[i]), int(f[i+1])) for i in range(4, 14, 2)],
+                                    })
+                        crop_faces = [cf for cf in crop_faces if cf.get("conf", 0.0) >= 0.55]
+                        if crop_faces:
+                            best_crop_face = max(crop_faces, key=lambda f: f["conf"])
+                            cf_box = best_crop_face["box"]
+                            gx = float(cf_box[0] + ux1)
+                            gy = float(cf_box[1] + uy1)
+                            gw = float(cf_box[2])
+                            gh = float(cf_box[3])
+                            g_lms = [(int(lx + ux1), int(ly + uy1)) for (lx, ly) in best_crop_face.get("landmarks", [])]
+                            matched_face = {
+                                "box": (gx, gy, gw, gh),
+                                "conf": best_crop_face["conf"],
+                                "landmarks": g_lms,
+                                "center": (gx + gw / 2.0, gy + gh / 2.0),
+                                "matched": True,
+                            }
 
                 if matched_face is not None:
                     matched_face["matched"] = True
@@ -1842,12 +1930,27 @@ def run_local_detector(
                                 )
                             if emp_match:
                                 emp_id, emp_conf = emp_match
+                                if obj_id not in announced_staff_tracks:
+                                    announced_staff_tracks.add(obj_id)
+                                    emp_label = employee_names.get(emp_id, emp_id)
+                                    print(f"[+] Biometrics: Verified Staff {emp_label} ({emp_id}) on Track #{obj_id} (conf: {emp_conf:.2f})")
                                 last_punch = punched_employee_ids.get(emp_id, 0.0)
                                 if (now_ts - last_punch) > 300.0:
                                     punched_employee_ids[emp_id] = now_ts
                                     sync_client.send_employee_punch_event(emp_id, event_type="CHECK_IN", confidence=emp_conf)
-                                    emp_label = employee_names.get(emp_id, emp_id)
-                                    print(f"[+] Biometrics: Verified Staff {emp_label} ({emp_id}) on Track #{obj_id} (conf: {emp_conf:.2f})")
+                                    if db_session:
+                                        try:
+                                            from app.repositories.employee_attendance_repo import EmployeeAttendanceRepository
+                                            emp_att_repo = EmployeeAttendanceRepository(db_session)
+                                            cam_uuid = uuid.UUID(camera_id) if camera_id and len(camera_id) == 36 else None
+                                            emp_att_repo.record_attendance_event(
+                                                employee_id=emp_id,
+                                                camera_id=cam_uuid,
+                                                event_type="CHECK_IN",
+                                                confidence=emp_conf,
+                                            )
+                                        except Exception as db_ex:
+                                            pass
                             else:
                                 # 2. Otherwise process as customer visitor
                                 match_res = identity_manager.process_track_face(
@@ -1914,8 +2017,16 @@ def run_local_detector(
 
                 # 2. Render Single Unified Header Badge (Person ID + Persistent ID + Timer + Face Status)
                 is_staff = employee_recognizer.is_track_employee(str(obj_id))
-                if is_staff:
-                    emp_id = employee_recognizer.get_employee_id(str(obj_id))
+                emp_id = employee_recognizer.get_employee_id(str(obj_id)) if is_staff else None
+                if is_staff and emp_id:
+                    if emp_id not in employee_names and db_session:
+                        try:
+                            from app.repositories.employee_repo import EmployeeRepository
+                            e_rec = EmployeeRepository(db_session).get_by_employee_id(emp_id)
+                            if e_rec and e_rec.name:
+                                employee_names[emp_id] = e_rec.name
+                        except Exception:
+                            pass
                     emp_display = employee_names.get(emp_id, emp_id)
                     main_label = f"STAFF [{emp_display}] #{obj_id} | {timer_str}"
                     body_color = (0, 215, 255)  # Vivid Golden Yellow for verified showroom staff
@@ -2156,8 +2267,8 @@ def main():
     parser.add_argument(
         "--conf",
         type=float,
-        default=float(config.get("confidence", 0.10)),
-        help="YOLO person detection confidence threshold (default: 0.10)",
+        default=float(config.get("confidence", 0.28)),
+        help="YOLO person detection confidence threshold (default: 0.28)",
     )
     parser.add_argument(
         "--imgsz",
@@ -2196,6 +2307,12 @@ def main():
         help="Neural face detection confidence threshold (default: 0.30)",
     )
     parser.add_argument(
+        "--sim-thresh",
+        type=float,
+        default=float(config.get("face_similarity_threshold", settings.FACE_SIMILARITY_THRESHOLD)),
+        help="Biometric face cosine similarity threshold for staff identification (default: 0.38)",
+    )
+    parser.add_argument(
         "--standalone-faces",
         action="store_true",
         default=config.get("allow_standalone_faces", False),
@@ -2227,7 +2344,7 @@ def main():
     parser.add_argument(
         "--body-persistence",
         type=int,
-        default=int(config.get("body_persistence", 40)),
+        default=int(config.get("body_persistence", 15)),
         help="Number of missing frames before an un-detected person box disappears (default: 40)",
     )
     parser.add_argument(
@@ -2301,6 +2418,7 @@ def main():
         body_persistence=args.body_persistence,
         deadband_px=args.deadband,
         camera_channel=resolved_channel,
+        similarity_thresh=args.sim_thresh,
         entry_line_cfg=entry_line_cfg,
         sections_cfg=sections_cfg,
     )

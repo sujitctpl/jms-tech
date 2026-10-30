@@ -101,7 +101,7 @@ export const AddEmployeeModal: React.FC<AddEmployeeModalProps> = ({
   onClose,
   onEmployeeAdded,
 }) => {
-  const { employees, addEmployee } = useShowroom();
+  const { employees, addEmployee, refreshEmployees } = useShowroom();
 
   const [employeeId, setEmployeeId] = useState('');
   const [name, setName] = useState('');
@@ -301,7 +301,10 @@ export const AddEmployeeModal: React.FC<AddEmployeeModalProps> = ({
     setIsSubmitting(true);
 
     try {
-      // 1. Register employee profile with FastAPI backend
+      // 1. Prepare base64 face images if photos were snapped or uploaded
+      const faceImagesBase64 = photos.map((p) => p.preview).filter(Boolean);
+
+      // 2. Register employee profile with FastAPI backend (including face images so embeddings are created atomically)
       let backendSuccess = false;
       let registeredResponse: any = null;
 
@@ -319,6 +322,7 @@ export const AddEmployeeModal: React.FC<AddEmployeeModalProps> = ({
             shift_end_time: `${shiftEnd}:00`,
             late_grace_minutes: Number(lateGrace) || 15,
             early_departure_grace_minutes: 15,
+            face_images_base64: faceImagesBase64.length > 0 ? faceImagesBase64 : undefined,
           }),
         });
 
@@ -341,11 +345,16 @@ export const AddEmployeeModal: React.FC<AddEmployeeModalProps> = ({
         backendSuccess = false;
       }
 
-      // 2. Upload face images if provided: generates ArcFace embedding and keeps 1st photo as profile picture
-      let faceEnrolled = false;
-      let backendPhotoUrl: string | undefined = undefined;
+      // 3. Check if face embedding was already registered in the creation response
+      let faceEnrolled = registeredResponse?.has_face_registered || false;
+      let backendPhotoUrl: string | undefined = registeredResponse?.photo_url
+        ? (registeredResponse.photo_url.startsWith('http') || registeredResponse.photo_url.startsWith('data:')
+            ? registeredResponse.photo_url
+            : `${FASTAPI_BASE_URL}${registeredResponse.photo_url}`)
+        : undefined;
 
-      if (photos.length > 0 && backendSuccess) {
+      // 4. Fallback: If not enrolled via JSON and photos are present, upload via multipart
+      if (!faceEnrolled && photos.length > 0 && backendSuccess) {
         try {
           const formData = new FormData();
           photos.forEach((p) => {
@@ -370,15 +379,19 @@ export const AddEmployeeModal: React.FC<AddEmployeeModalProps> = ({
           } else {
             const faceErr = await faceRes.json().catch(() => ({}));
             console.warn('Face embedding enrollment response:', faceErr);
-            setErrorMsg(`Employee profile saved, but face vector generation noted: ${faceErr.detail || 'Could not extract face'}`);
+            setErrorMsg(`Employee created, but face vector generation reported: ${faceErr.detail || 'Could not extract face'}.`);
+            setIsSubmitting(false);
+            return;
           }
         } catch (uploadErr: any) {
           console.warn('Could not upload face embedding to backend:', uploadErr);
           setErrorMsg(`Employee created, but face portrait failed to upload: ${uploadErr.message}`);
+          setIsSubmitting(false);
+          return;
         }
       }
 
-      // 3. Update local showroom state: 1st photo is kept as profile picture!
+      // 5. Update local showroom state: 1st photo is kept as profile picture!
       const defaultAvatars = [
         'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80',
         'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&auto=format&fit=crop&q=80',
@@ -398,7 +411,15 @@ export const AddEmployeeModal: React.FC<AddEmployeeModalProps> = ({
         phone: '+91 98765 43210',
         email: `${cleanId.toLowerCase().replace(/[^a-z0-9]/g, '')}@capermintdealership.com`,
         avatarUrl: primaryProfilePic,
+        facePhotosCount: registeredResponse?.face_photos_count || (faceEnrolled ? photos.length : 0),
       });
+
+      // Synchronize context state with backend database
+      try {
+        await refreshEmployees();
+      } catch (e) {
+        console.warn('Failed refreshing employees list:', e);
+      }
 
       // Notify parent to trigger the on-screen popup notification message
       if (onEmployeeAdded) {

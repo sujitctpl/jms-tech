@@ -4,13 +4,13 @@ import glob
 import os
 import threading
 import time
-from typing import List, Optional
+from typing import Any, List, Optional
 from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.logging import logger
 from app.db.session import SessionLocal
 from app.repositories.person_identity_repo import PersonIdentityRepository
-from app.vision.faiss_index import FaissIndexManager
+from app.vision.vector_store import PgVectorStoreManager
 
 
 @dataclass
@@ -27,18 +27,21 @@ class RetentionService:
     """
     Implements a 14-day rolling retention policy for biometric face embeddings.
     Embeddings not reliably matched within 14 days are deleted from the database
-    and FAISS index, while preserving historical footfall and analytics.
+    and vector store, while preserving historical footfall and analytics.
     """
 
     def __init__(
         self,
         db: Optional[Session] = None,
-        faiss_index: Optional[FaissIndexManager] = None,
+        vector_store: Optional[Any] = None,
         retention_days: Optional[int] = None,
         db_session: Optional[Session] = None,
+        faiss_index: Optional[Any] = None,
     ):
         self._db = db or db_session
-        self.faiss_index = faiss_index
+        self.vector_store = vector_store if vector_store is not None else faiss_index
+        # Backward compatibility alias
+        self.faiss_index = self.vector_store
         self.retention_days = (
             retention_days if retention_days is not None else settings.FACE_RETENTION_DAYS
         )
@@ -53,7 +56,7 @@ class RetentionService:
         """
         Executes an idempotent biometric cleanup job.
         Deletes face embeddings older than retention_days (default 14 days from last_seen_at)
-        from both the database and FAISS similarity index.
+        from both the database and vector store.
         """
         start_time = time.time()
         active_db = db or self._db
@@ -90,20 +93,19 @@ class RetentionService:
             expired_person_ids: List[str] = [r.person_id for r in expired_records]
 
             # 1. Remove from vector index if an external in-memory index is attached
-            if self.faiss_index is not None:
-                if hasattr(self.faiss_index, "remove_ids"):
+            if self.vector_store is not None:
+                if hasattr(self.vector_store, "remove_ids"):
                     try:
-                        deleted_from_faiss = self.faiss_index.remove_ids(expired_person_ids)
-                        logger.info("Removed %d expired vectors from vector index.", deleted_from_faiss)
+                        deleted_count = self.vector_store.remove_ids(expired_person_ids)
+                        logger.info("Removed %d expired vectors from vector store.", deleted_count)
                     except Exception as e:
-                        logger.error("Failed to remove expired IDs from index: %s", str(e))
-                elif hasattr(self.faiss_index, "remove"):
+                        logger.error("Failed to remove expired IDs from vector store: %s", str(e))
+                elif hasattr(self.vector_store, "remove"):
                     for pid in expired_person_ids:
                         try:
-                            self.faiss_index.remove(pid)
+                            self.vector_store.remove(pid)
                         except Exception:
                             pass
-                    logger.error("Error removing expired vectors from FAISS: %s", str(e), exc_info=True)
 
             # 2. Purge associated biometric files (face crops / cached embeddings on disk)
             if face_crops_dir and os.path.exists(face_crops_dir):

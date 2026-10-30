@@ -23,6 +23,7 @@ class FaceEnrollmentRequest(BaseModel):
     face_images_base64: Optional[List[str]] = Field(None, description="Optional list of Base64 photos (1st used as profile picture)")
     embedding_vector: Optional[List[float]] = Field(None, description="512-dim ArcFace embedding vector")
     embedding: Optional[List[float]] = Field(None, description="Alias for embedding_vector")
+    append: bool = Field(default=False, description="If True, append to existing biometric gallery instead of replacing")
 
 
 class EmployeeCreate(EmployeeBase):
@@ -62,6 +63,7 @@ class EmployeeResponse(BaseModel):
     photo_url: Optional[str] = None
     is_active: bool = True
     has_face_registered: bool = False
+    face_photos_count: int = 0
     created_at: datetime
     updated_at: datetime
 

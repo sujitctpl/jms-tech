@@ -15,7 +15,7 @@ from app.services.camera_service import CameraService
 from app.services.retention_service import RetentionService
 from app.vision.entry_counter import EntryLineCounter
 from app.vision.face_embedder import FaceEmbedder
-from app.vision.faiss_index import FaissIndexManager
+from app.vision.vector_store import PgVectorStoreManager
 from app.vision.identity_tracker import (
     IdentityMatchResult,
     IdentityMatchStatus,
@@ -107,10 +107,10 @@ def test_face_embedding_normalization_and_similarity():
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: FAISS Similarity Search & Index Management Tests
+# Phase 1: Vector Store Similarity Search & Index Management Tests
 # ---------------------------------------------------------------------------
-def test_faiss_index_lifecycle_add_search_remove_rebuild():
-    index_mgr = FaissIndexManager(similarity_threshold=0.50)
+def test_vector_store_lifecycle_add_search_remove_rebuild():
+    index_mgr = PgVectorStoreManager(similarity_threshold=0.50)
 
     # Generate 3 distinct normalized embeddings
     rng = np.random.RandomState(100)
@@ -163,10 +163,10 @@ def test_identity_recovery_when_bytetrack_id_changes():
     5. Identity Recovery recognizes visitor as PID_VISITOR_1.
     """
     embedder = FaceEmbedder(min_size=36, min_confidence=0.40)
-    faiss_mgr = FaissIndexManager(similarity_threshold=0.50)
+    vector_mgr = PgVectorStoreManager(similarity_threshold=0.50)
     identity_mgr = IdentityRecoveryManager(
         embedder=embedder,
-        faiss_index=faiss_mgr,
+        vector_store=vector_mgr,
         similarity_threshold=0.50,
         max_attempts=5,
         cooldown_frames=0,  # 0 cooldown for fast unit test
@@ -205,10 +205,10 @@ def test_identity_recovery_when_bytetrack_id_changes():
 
 def test_unreliable_face_leaves_identity_unresolved():
     embedder = FaceEmbedder(min_size=36, min_confidence=0.40)
-    faiss_mgr = FaissIndexManager(similarity_threshold=0.50)
+    vector_mgr = PgVectorStoreManager(similarity_threshold=0.50)
     identity_mgr = IdentityRecoveryManager(
         embedder=embedder,
-        faiss_index=faiss_mgr,
+        vector_store=vector_mgr,
         similarity_threshold=0.50,
     )
 
@@ -297,19 +297,19 @@ def test_retention_policy_purges_expired_embeddings_and_preserves_analytics(db_s
     t_20_days_ago = now - timedelta(days=20)
     t_5_days_ago = now - timedelta(days=5)
 
-    faiss_mgr = FaissIndexManager(similarity_threshold=0.50)
+    vector_mgr = PgVectorStoreManager(similarity_threshold=0.50)
     repo = PersonIdentityRepository(db_session)
 
     # 1. Visitor 1: Seen 20 days ago (EXPIRED)
     emb_1 = np.ones(512, dtype=np.float32) / np.sqrt(512)
     p1 = repo.create_or_update("PID_EXPIRED", emb_1, timestamp=t_20_days_ago)
-    faiss_mgr.add("PID_EXPIRED", emb_1)
+    vector_mgr.add("PID_EXPIRED", emb_1)
 
     # 2. Visitor 2: Seen 5 days ago (ACTIVE / UNEXPIRED)
     emb_2 = np.zeros(512, dtype=np.float32)
     emb_2[0] = 1.0
     p2 = repo.create_or_update("PID_ACTIVE", emb_2, timestamp=t_5_days_ago)
-    faiss_mgr.add("PID_ACTIVE", emb_2)
+    vector_mgr.add("PID_ACTIVE", emb_2)
 
     # 3. Create visitor track & footfall event for the expired visitor
     vt = VisitorTrack(
@@ -331,11 +331,11 @@ def test_retention_policy_purges_expired_embeddings_and_preserves_analytics(db_s
     assert initial_total_footfall == 1
 
     # Verify both exist before retention cleanup
-    assert faiss_mgr.size() == 2
+    assert vector_mgr.size() == 2
     assert p1.face_embedding is not None
 
     # Run 14-day retention cleanup
-    retention_svc = RetentionService(db=db_session, faiss_index=faiss_mgr, retention_days=14)
+    retention_svc = RetentionService(db=db_session, vector_store=vector_mgr, retention_days=14)
     report = retention_svc.cleanup_expired_embeddings(db=db_session, now=now)
 
     assert report.success is True
@@ -354,11 +354,11 @@ def test_retention_policy_purges_expired_embeddings_and_preserves_analytics(db_s
     assert p2.face_embedding is not None
     assert p2.is_expired is False
 
-    # FAISS verification: expired vector removed; active vector remains
-    assert faiss_mgr.size() == 1
-    match_expired, _ = faiss_mgr.find_best_match(emb_1)
+    # Vector store verification: expired vector removed; active vector remains
+    assert vector_mgr.size() == 1
+    match_expired, _ = vector_mgr.find_best_match(emb_1)
     assert match_expired != "PID_EXPIRED"
-    match_active, _ = faiss_mgr.find_best_match(emb_2)
+    match_active, _ = vector_mgr.find_best_match(emb_2)
     assert match_active == "PID_ACTIVE"
 
     # Historical Business Analytics & Footfall Events Verification:

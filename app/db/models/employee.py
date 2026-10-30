@@ -98,10 +98,19 @@ class Employee(Base):
     def get_gallery_embeddings(self) -> List[np.ndarray]:
         """
         Returns all normalized embedding vectors across enrolled gallery photos.
-        Falls back to primary face_embedding if no explicit gallery is stored.
+        Combines employee_faces table records, legacy face_gallery JSON, and primary face_embedding.
         """
         gallery: List[np.ndarray] = []
-        if self.face_gallery and isinstance(self.face_gallery, list):
+        # 1. From related employee_faces records
+        if hasattr(self, "faces") and self.faces:
+            for f in self.faces:
+                arr = f.get_embedding_array()
+                if arr is not None and len(arr) == 512:
+                    norm = np.linalg.norm(arr)
+                    gallery.append((arr / norm) if norm > 0 else arr)
+
+        # 2. Fallback to JSON face_gallery column
+        elif self.face_gallery and isinstance(self.face_gallery, list):
             for item in self.face_gallery:
                 arr = np.array(item, dtype=np.float32)
                 norm = np.linalg.norm(arr)
@@ -109,6 +118,8 @@ class Employee(Base):
                     gallery.append(arr / norm)
                 elif len(arr) == 512:
                     gallery.append(arr)
+
+        # 3. Fallback to primary face_embedding
         if not gallery:
             primary = self.get_embedding_array()
             if primary is not None:

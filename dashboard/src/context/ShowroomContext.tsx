@@ -36,6 +36,8 @@ interface ShowroomContextType {
   employees: Employee[];
   attendance: AttendanceRecord[];
   addEmployee: (employee: Employee, attendance?: AttendanceRecord) => void;
+  addEmployeePhotos: (employeeId: string, additionalPhotosCount: number, newAvatarUrl?: string) => void;
+  refreshEmployees: () => Promise<void>;
   markAttendance: (recordId: string, status: AttendanceRecord['status'], checkInTime?: string, checkOutTime?: string) => void;
   quickCheckInEmployee: (employeeId: string) => void;
   quickCheckOutEmployee: (employeeId: string) => void;
@@ -164,6 +166,7 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
                 phone: '+91 98450 12345',
                 email: `${d.employee_id.toLowerCase().replace(/[^a-z0-9]/g, '')}@capermintdealership.com`,
                 avatarUrl: photo,
+                facePhotosCount: d.face_photos_count ?? (d.has_face_registered ? 1 : 0),
               };
             });
             setEmployees(mapped);
@@ -209,9 +212,11 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
     fetchBackendEmployees();
     fetchBackendAttendance();
+    const attInterval = setInterval(fetchBackendAttendance, 5000);
 
     return () => {
       isMounted = false;
+      clearInterval(attInterval);
     };
   }, []);
 
@@ -414,6 +419,64 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         const filtered = prev.filter((a) => a.employeeId !== newEmployee.id);
         return [newAttendanceRecord, ...filtered];
       });
+    }
+  };
+
+  const addEmployeePhotos = (employeeId: string, additionalPhotosCount: number, newAvatarUrl?: string) => {
+    setEmployees((prev) =>
+      prev.map((e) => {
+        if (e.id === employeeId) {
+          const currentCount = e.facePhotosCount || 1;
+          return {
+            ...e,
+            avatarUrl: newAvatarUrl || e.avatarUrl,
+            facePhotosCount: currentCount + additionalPhotosCount,
+          };
+        }
+        return e;
+      })
+    );
+    setAttendance((prev) =>
+      prev.map((a) => {
+        if (a.employeeId === employeeId) {
+          const currentCount = a.facePhotosCount || 1;
+          return {
+            ...a,
+            avatarUrl: newAvatarUrl || a.avatarUrl,
+            facePhotosCount: currentCount + additionalPhotosCount,
+          };
+        }
+        return a;
+      })
+    );
+  };
+
+  const refreshEmployees = async () => {
+    try {
+      const res = await fetch(`${FASTAPI_BASE_URL}/api/v1/employees`);
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          const mapped: Employee[] = data.map((d: any) => {
+            const photo = d.photo_url
+              ? (d.photo_url.startsWith('http') || d.photo_url.startsWith('data:') ? d.photo_url : `${FASTAPI_BASE_URL}${d.photo_url}`)
+              : 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=120&auto=format&fit=crop&q=80';
+            return {
+              id: d.employee_id,
+              name: d.name,
+              role: d.designation || 'Staff',
+              department: d.department || 'Sales',
+              phone: '+91 98450 12345',
+              email: `${d.employee_id.toLowerCase().replace(/[^a-z0-9]/g, '')}@capermintdealership.com`,
+              avatarUrl: photo,
+              facePhotosCount: d.face_photos_count ?? (d.has_face_registered ? 1 : 0),
+            };
+          });
+          setEmployees(mapped);
+        }
+      }
+    } catch (err) {
+      console.warn('Backend refreshEmployees failed:', err);
     }
   };
 
@@ -861,6 +924,8 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         employees,
         attendance,
         addEmployee,
+        addEmployeePhotos,
+        refreshEmployees,
         markAttendance,
         quickCheckInEmployee,
         quickCheckOutEmployee,

@@ -116,6 +116,7 @@ class EmployeeRepository:
                 setattr(employee, k, v)
         self.db.add(employee)
         self.db.commit()
+        self.db.expire(employee, ["faces"])
         self.db.refresh(employee)
         return employee
 
@@ -147,6 +148,7 @@ class EmployeeRepository:
             self.db.add(ef)
 
         self.db.commit()
+        self.db.expire(employee, ["faces"])
         self.db.refresh(employee)
         logger.info(
             "Updated biometric face embedding (gallery size: %d) for employee %s",
@@ -155,10 +157,63 @@ class EmployeeRepository:
         )
         return employee
 
+    def add_face_embeddings(
+        self,
+        employee: Employee,
+        new_embeddings: List[np.ndarray],
+        new_photo_url: Optional[str] = None,
+        set_as_primary_profile: bool = False,
+    ) -> Employee:
+        if not new_embeddings:
+            return employee
+
+        existing_gallery = employee.get_gallery_embeddings()
+        combined_gallery = list(existing_gallery) + [e.astype(np.float32) for e in new_embeddings]
+
+        # Primary embedding
+        if set_as_primary_profile or employee.face_embedding is None:
+            primary_embedding = new_embeddings[0].astype(np.float32)
+        else:
+            primary_embedding = employee.get_embedding_array()
+            if primary_embedding is None:
+                primary_embedding = combined_gallery[0]
+
+        employee.face_embedding = primary_embedding.tolist()
+        employee.face_gallery = [g.tolist() for g in combined_gallery]
+
+        if (set_as_primary_profile or not employee.photo_url) and new_photo_url is not None:
+            employee.photo_url = new_photo_url
+
+        self.db.add(employee)
+
+        # Sync to pgvector employee_faces table for multi-angle HNSW search
+        self.db.query(EmployeeFace).filter(EmployeeFace.employee_id == employee.id).delete()
+        for idx, ang_emb in enumerate(combined_gallery):
+            label = "front" if idx == 0 else f"angle_{idx}"
+            ef = EmployeeFace(
+                employee_id=employee.id,
+                angle_label=label,
+                face_embedding=ang_emb.tolist(),
+                photo_url=employee.photo_url if idx == 0 else None,
+            )
+            self.db.add(ef)
+
+        self.db.commit()
+        self.db.expire(employee, ["faces"])
+        self.db.refresh(employee)
+        logger.info(
+            "Appended %d biometric face embedding(s) (total gallery size: %d) for employee %s",
+            len(new_embeddings),
+            len(combined_gallery),
+            employee.employee_id,
+        )
+        return employee
+
     def set_active_status(self, employee: Employee, is_active: bool) -> Employee:
         employee.is_active = is_active
         self.db.add(employee)
         self.db.commit()
+        self.db.expire(employee, ["faces"])
         self.db.refresh(employee)
         logger.info("Set employee %s active status: %s", employee.employee_id, is_active)
         return employee

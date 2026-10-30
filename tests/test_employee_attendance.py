@@ -10,7 +10,7 @@ from app.repositories.employee_attendance_repo import EmployeeAttendanceReposito
 from app.repositories.person_identity_repo import PersonIdentityRepository
 from app.services.retention_service import RetentionService
 from app.vision.employee_recognizer import EmployeeRecognitionManager
-from app.vision.faiss_index import FaissIndexManager
+from app.vision.vector_store import PgVectorStoreManager
 
 
 def make_random_embedding(seed: int = 42) -> np.ndarray:
@@ -84,12 +84,12 @@ def test_employee_biometric_face_registration(db_session):
 
 
 # -------------------------------------------------------------------------
-# 2. Dedicated Employee Recognition Engine (ArcFace + FAISS)
+# 2. Dedicated Employee Recognition Engine (ArcFace + pgvector)
 # -------------------------------------------------------------------------
 
 def test_employee_recognition_manager_matching():
-    faiss_mgr = FaissIndexManager(similarity_threshold=0.55)
-    recog_mgr = EmployeeRecognitionManager(faiss_index=faiss_mgr, similarity_threshold=0.55)
+    vector_mgr = PgVectorStoreManager(similarity_threshold=0.55)
+    recog_mgr = EmployeeRecognitionManager(vector_store=vector_mgr, similarity_threshold=0.55)
 
     emp1_emb = make_random_embedding(seed=201)
     emp2_emb = make_random_embedding(seed=202)
@@ -134,8 +134,8 @@ def test_employee_recognition_manager_matching():
 
 
 def test_employee_recognition_manager_unknown_visitor():
-    faiss_mgr = FaissIndexManager(similarity_threshold=0.60)
-    recog_mgr = EmployeeRecognitionManager(faiss_index=faiss_mgr, similarity_threshold=0.60)
+    vector_mgr = PgVectorStoreManager(similarity_threshold=0.60)
+    recog_mgr = EmployeeRecognitionManager(vector_store=vector_mgr, similarity_threshold=0.60)
 
     emp_emb = make_random_embedding(seed=301)
     recog_mgr.register_employee("EMP-ADMIN", emp_emb)
@@ -292,7 +292,7 @@ def test_attendance_mark_absences(db_session):
 def test_employee_biometric_data_retention_exemption(db_session):
     emp_repo = EmployeeRepository(db_session)
     ident_repo = PersonIdentityRepository(db_session)
-    visitor_faiss = FaissIndexManager(similarity_threshold=0.50)
+    visitor_vector_store = PgVectorStoreManager(similarity_threshold=0.50)
 
     # 1. Register employee with face embedding
     emp = emp_repo.create(employee_id="EMP-PERMANENT", name="Staff Member")
@@ -301,7 +301,7 @@ def test_employee_biometric_data_retention_exemption(db_session):
 
     # 2. Register visitor with face embedding created 20 days ago
     vis_emb = make_random_embedding(seed=888)
-    visitor_faiss.add("VISITOR-EXPIRED", vis_emb)
+    visitor_vector_store.add("VISITOR-EXPIRED", vis_emb)
     old_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=20)
     ident_repo.create_or_update("VISITOR-EXPIRED", vis_emb, old_time)
 
@@ -313,14 +313,14 @@ def test_employee_biometric_data_retention_exemption(db_session):
     # 3. Run visitor 14-day rolling retention policy
     retention_svc = RetentionService(
         db_session=db_session,
-        faiss_index=visitor_faiss,
+        vector_store=visitor_vector_store,
         retention_days=14,
     )
     result = retention_svc.cleanup_expired_embeddings()
     assert result.expired_count == 1
 
     # Visitor embedding must be removed
-    assert visitor_faiss.get_count() == 0
+    assert visitor_vector_store.get_count() == 0
     expired_vis = ident_repo.get_by_person_id("VISITOR-EXPIRED")
     assert expired_vis.face_embedding is None
 
@@ -455,6 +455,7 @@ def test_employee_multi_image_base64_enrollment_api(client):
     assert res.status_code == 201
     data = res.json()
     assert data["has_face_registered"] is True
+    assert data["face_photos_count"] >= 1
     assert data["photo_url"] is not None
     assert "EMP-MULTI-B64_profile" in data["photo_url"]
 
@@ -530,4 +531,103 @@ def test_pgvector_multi_angle_gallery_matching(db_session):
     best_id_r, score_r = store.find_best_employee_match(right_angle, db=db_session)
     assert best_id_r == "EMP-GALLERY-01"
     assert score_r >= 0.99
+
+
+def test_check_in_after_auto_mark_absent(db_session, client):
+    """Verifies that an employee pre-marked ABSENT (first_check_in=None) correctly updates to PRESENT on check-in punch."""
+    from app.repositories.employee_repo import EmployeeRepository
+    from app.repositories.employee_attendance_repo import EmployeeAttendanceRepository
+    from datetime import date, datetime, time, timezone
+
+    emp_repo = EmployeeRepository(db_session)
+    att_repo = EmployeeAttendanceRepository(db_session)
+
+    emp = emp_repo.create(
+        employee_id="EMP-PREABSENT-01",
+        name="Aarav Sharma",
+        department="Floor",
+        shift_start_time=time(9, 0),
+        late_grace_minutes=30,
+    )
+
+    # 1. Simulate auto-marking absences (e.g. daily report generation before arrival)
+    today = date.today()
+    absent_count = att_repo.mark_absences(today)
+    assert absent_count >= 1
+
+    daily_records = att_repo.get_employee_history(emp.id, start_date=today, end_date=today)
+    assert len(daily_records) == 1
+    daily_before = daily_records[0]
+    assert daily_before.status == "ABSENT"
+    assert daily_before.first_check_in is None
+
+    # 2. Employee arrives and is recognized by camera at 09:15 (within grace period)
+    punch_time = datetime.combine(today, datetime.strptime("09:15:00", "%H:%M:%S").time()).replace(tzinfo=timezone.utc)
+    log, daily_after = att_repo.record_attendance_event(
+        employee=emp,
+        timestamp=punch_time,
+        confidence=0.98,
+    )
+
+    # 3. Employee must now be marked PRESENT with valid first_check_in
+    assert daily_after.status == "PRESENT"
+    assert daily_after.first_check_in is not None
+    assert daily_after.is_late is False
+
+
+def test_add_more_photos_after_registration_api(client):
+    import cv2
+    # 1. Register employee
+    res_create = client.post("/api/v1/employees", json={
+        "employee_id": "EMP-ADDPHOTO-01",
+        "name": "Pooja Hegde",
+        "department": "Sales",
+    })
+    assert res_create.status_code == 201
+
+    # 2. Upload initial batch of 2 photos
+    img1 = np.full((100, 100, 3), 100, dtype=np.uint8)
+    img2 = np.full((100, 100, 3), 120, dtype=np.uint8)
+    _, buf1 = cv2.imencode(".jpg", img1)
+    _, buf2 = cv2.imencode(".jpg", img2)
+
+    files_initial = [
+        ("files", ("photo1.jpg", buf1.tobytes(), "image/jpeg")),
+        ("files", ("photo2.jpg", buf2.tobytes(), "image/jpeg")),
+    ]
+    res_init = client.post("/api/v1/employees/EMP-ADDPHOTO-01/face/upload", files=files_initial)
+    assert res_init.status_code == 200
+    data_init = res_init.json()
+    assert data_init["has_face_registered"] is True
+    assert data_init["face_photos_count"] == 2
+    initial_avatar = data_init["photo_url"]
+    assert initial_avatar is not None
+
+    # 3. Add 2 more photos via POST /api/v1/employees/{employee_id}/photos
+    img3 = np.full((100, 100, 3), 150, dtype=np.uint8)
+    img4 = np.full((100, 100, 3), 180, dtype=np.uint8)
+    _, buf3 = cv2.imencode(".jpg", img3)
+    _, buf4 = cv2.imencode(".jpg", img4)
+
+    files_more = [
+        ("files", ("photo3.jpg", buf3.tobytes(), "image/jpeg")),
+        ("files", ("photo4.jpg", buf4.tobytes(), "image/jpeg")),
+    ]
+    res_more = client.post("/api/v1/employees/EMP-ADDPHOTO-01/photos", files=files_more)
+    assert res_more.status_code == 200
+    data_more = res_more.json()
+    assert data_more["has_face_registered"] is True
+    # Gallery now contains total of 4 photos!
+    assert data_more["face_photos_count"] == 4
+    # Existing avatar preserved by default
+    assert data_more["photo_url"] == initial_avatar
+
+    # 4. Verify employee list returns updated face_photos_count
+    res_list = client.get("/api/v1/employees")
+    assert res_list.status_code == 200
+    matched = [e for e in res_list.json() if e["employee_id"] == "EMP-ADDPHOTO-01"]
+    assert len(matched) == 1
+    assert matched[0]["face_photos_count"] == 4
+
+
 

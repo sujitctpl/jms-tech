@@ -76,7 +76,7 @@ class VideoWorker(threading.Thread):
         entry_counter = EntryLineCounter(self.entry_line_config)
         persistent_tracker = PersistentCameraTracker(ttl_seconds=5.0)
 
-        # Persistent Identity Recovery & FAISS Similarity Search (14-Day Retention)
+        # Persistent Identity Recovery & pgvector Similarity Search (14-Day Retention)
         from datetime import datetime, timezone
         import numpy as np
         from app.repositories.employee_attendance_repo import EmployeeAttendanceRepository
@@ -91,13 +91,16 @@ class VideoWorker(threading.Thread):
         emp_repo = EmployeeRepository(db)
         emp_attendance_repo = EmployeeAttendanceRepository(db)
         face_embedder = FaceEmbedder()
-        vector_store = PgVectorStoreManager(db=db, similarity_threshold=settings.FACE_SIMILARITY_THRESHOLD)
+        visitor_vector_store = PgVectorStoreManager(db=db, similarity_threshold=settings.FACE_SIMILARITY_THRESHOLD)
+        employee_vector_store = PgVectorStoreManager(db=db, similarity_threshold=settings.FACE_SIMILARITY_THRESHOLD)
 
         # Dedicated Employee Recognition Engine backed by pgvector
         employee_recognizer = EmployeeRecognitionManager(
             embedder=face_embedder,
-            vector_store=vector_store,
+            vector_store=employee_vector_store,
             similarity_threshold=settings.FACE_SIMILARITY_THRESHOLD,
+            min_confirm_frames=settings.EMPLOYEE_MIN_CONFIRM_FRAMES,
+            vote_window=settings.EMPLOYEE_VOTE_WINDOW,
         )
 
         def handle_matched(pid: str, ts: float):
@@ -116,7 +119,7 @@ class VideoWorker(threading.Thread):
 
         identity_manager = IdentityRecoveryManager(
             embedder=face_embedder,
-            vector_store=vector_store,
+            vector_store=visitor_vector_store,
             similarity_threshold=settings.FACE_SIMILARITY_THRESHOLD,
             on_matched_callback=handle_matched,
             on_created_callback=handle_created,

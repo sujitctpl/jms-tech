@@ -16,8 +16,11 @@ import {
   Shield,
   Edit,
   X,
+  Camera,
+  Sparkles,
 } from 'lucide-react';
 import { AddEmployeeModal } from '../modals/AddEmployeeModal';
+import { AddEmployeePhotosModal } from '../modals/AddEmployeePhotosModal';
 
 export const AttendanceView: React.FC = () => {
   const { user } = useAuth();
@@ -35,6 +38,9 @@ export const AttendanceView: React.FC = () => {
   const [statusFilter, setStatusFilter] = useState('all');
   const [isAddEmployeeModalOpen, setIsAddEmployeeModalOpen] = useState(false);
   const [addedEmployeeNotification, setAddedEmployeeNotification] = useState<string | null>(null);
+  const [isAddPhotosModalOpen, setIsAddPhotosModalOpen] = useState(false);
+  const [selectedEmployeeForPhotos, setSelectedEmployeeForPhotos] = useState<string | null>(null);
+  const [photosAddedNotification, setPhotosAddedNotification] = useState<{ name: string; count: number } | null>(null);
 
   // Edit attendance modal
   const [editingRecord, setEditingRecord] = useState<AttendanceRecord | null>(null);
@@ -63,6 +69,18 @@ export const AttendanceView: React.FC = () => {
     setAddedEmployeeNotification(name);
     setTimeout(() => {
       setAddedEmployeeNotification(null);
+    }, 5000);
+  };
+
+  const handleOpenAddPhotos = (employeeId?: string) => {
+    setSelectedEmployeeForPhotos(employeeId || null);
+    setIsAddPhotosModalOpen(true);
+  };
+
+  const handlePhotosAdded = (name: string, count: number) => {
+    setPhotosAddedNotification({ name, count });
+    setTimeout(() => {
+      setPhotosAddedNotification(null);
     }, 5000);
   };
 
@@ -99,10 +117,51 @@ export const AttendanceView: React.FC = () => {
               <p className="text-[11px] text-emerald-100 mt-0.5">
                 Profile and biometric face photos enrolled. Active on showroom attendance.
               </p>
+              <button
+                type="button"
+                onClick={() => {
+                  setAddedEmployeeNotification(null);
+                  handleOpenAddPhotos();
+                }}
+                className="mt-2 px-2.5 py-1 bg-white/20 hover:bg-white/30 text-white rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 transition active:scale-95 border border-white/30"
+              >
+                <Camera className="w-3.5 h-3.5" />
+                <span>Add More Photos</span>
+              </button>
             </div>
           </div>
           <button
             onClick={() => setAddedEmployeeNotification(null)}
+            className="p-1.5 text-white/80 hover:text-white rounded-xl hover:bg-white/10 transition shrink-0"
+            title="Dismiss popup"
+            type="button"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {/* Photos Added Toast / Popup Message */}
+      {photosAddedNotification && (
+        <div className="fixed top-6 right-6 z-50 animate-bounce-short max-w-md w-[92vw] sm:w-auto p-4 bg-gradient-to-r from-indigo-600 to-indigo-700 text-white rounded-2xl shadow-2xl shadow-indigo-600/40 border border-indigo-400 flex items-center justify-between gap-3.5">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-white/20 flex items-center justify-center shrink-0">
+              <Camera className="w-6 h-6 text-white" />
+            </div>
+            <div>
+              <span className="text-[10px] font-extrabold uppercase tracking-wider text-indigo-200 flex items-center gap-1">
+                <Sparkles className="w-3 h-3 text-indigo-300" /> Biometrics Updated
+              </span>
+              <h4 className="text-sm font-extrabold font-['Outfit'] leading-tight">
+                {photosAddedNotification.count} Photo{photosAddedNotification.count > 1 ? 's' : ''} Added!
+              </h4>
+              <p className="text-[11px] text-indigo-100 mt-0.5">
+                Gallery updated for <span className="font-semibold underline decoration-white/70">{photosAddedNotification.name}</span>.
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => setPhotosAddedNotification(null)}
             className="p-1.5 text-white/80 hover:text-white rounded-xl hover:bg-white/10 transition shrink-0"
             title="Dismiss popup"
             type="button"
@@ -126,10 +185,19 @@ export const AttendanceView: React.FC = () => {
           </p>
         </div>
 
-        <div className="flex items-center gap-2.5 self-start sm:self-auto">
+        <div className="flex items-center gap-2.5 self-start sm:self-auto flex-wrap sm:flex-nowrap">
+          <button
+            onClick={() => handleOpenAddPhotos()}
+            className="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-semibold shadow-xs flex items-center gap-1.5 transition active:scale-95"
+            title="Add more photos of registered employees"
+          >
+            <Camera className="w-4 h-4 text-indigo-400" />
+            <span>Add Photos</span>
+          </button>
+
           <button
             onClick={() => setIsAddEmployeeModalOpen(true)}
-            className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-semibold shadow-xs flex items-center gap-1.5 transition"
+            className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-semibold shadow-xs flex items-center gap-1.5 transition active:scale-95"
           >
             <UserPlus className="w-4 h-4" />
             <span>Add Employee</span>
@@ -290,7 +358,18 @@ export const AttendanceView: React.FC = () => {
                           />
                         </div>
                         <div>
-                          <span className="font-bold text-slate-900 font-['Outfit'] block text-xs sm:text-sm">{rec.employeeName}</span>
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="font-bold text-slate-900 font-['Outfit'] block text-xs sm:text-sm">{rec.employeeName}</span>
+                            {rec.facePhotosCount && rec.facePhotosCount > 0 ? (
+                              <span
+                                className="px-1.5 py-0.5 rounded-md text-[9px] font-bold bg-indigo-50 text-indigo-700 border border-indigo-200 inline-flex items-center gap-0.5"
+                                title={`${rec.facePhotosCount} biometric photo angle(s) enrolled`}
+                              >
+                                <Camera className="w-2.5 h-2.5 text-indigo-500" />
+                                {rec.facePhotosCount} {rec.facePhotosCount === 1 ? 'photo' : 'photos'}
+                              </span>
+                            ) : null}
+                          </div>
                           <span className="text-[10px] text-slate-400 font-mono">ID: {rec.employeeId.toUpperCase()}</span>
                         </div>
                       </div>
@@ -346,6 +425,15 @@ export const AttendanceView: React.FC = () => {
                             Check Out
                           </button>
                         ) : null}
+
+                        <button
+                          onClick={() => handleOpenAddPhotos(rec.employeeId)}
+                          title={`Add more photos for ${rec.employeeName}`}
+                          className="px-2 py-1.5 bg-slate-100 hover:bg-indigo-50 text-slate-700 hover:text-indigo-700 rounded-xl text-xs font-semibold border border-slate-200 hover:border-indigo-200 transition active:scale-95 flex items-center gap-1"
+                        >
+                          <Camera className="w-3.5 h-3.5 text-indigo-600" />
+                          <span className="hidden xl:inline">Add Photos</span>
+                        </button>
 
                         {isOwner && (
                           <button
@@ -441,6 +529,14 @@ export const AttendanceView: React.FC = () => {
         isOpen={isAddEmployeeModalOpen}
         onClose={() => setIsAddEmployeeModalOpen(false)}
         onEmployeeAdded={handleEmployeeAdded}
+      />
+
+      {/* Add Employee Face Photos Modal */}
+      <AddEmployeePhotosModal
+        isOpen={isAddPhotosModalOpen}
+        onClose={() => setIsAddPhotosModalOpen(false)}
+        initialEmployeeId={selectedEmployeeForPhotos}
+        onPhotosAdded={handlePhotosAdded}
       />
     </div>
   );

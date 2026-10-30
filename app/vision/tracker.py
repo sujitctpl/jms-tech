@@ -121,6 +121,11 @@ class PersonTracker:
 
                     track_id = str(int(box.id[0].item()))
                     coords = box.xyxy[0].tolist()
+                    bw = coords[2] - coords[0]
+                    bh = coords[3] - coords[1]
+                    # Filter out non-human horizontal shapes (e.g. backpacks, luggage, cushions)
+                    if bw < 24 or bh < 32 or (bh / max(1.0, bw)) < 0.65:
+                        continue
 
                     tracked_persons.append(
                         TrackedPerson(
