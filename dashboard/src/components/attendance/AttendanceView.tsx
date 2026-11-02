@@ -36,6 +36,7 @@ export const AttendanceView: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState('');
   const [departmentFilter, setDepartmentFilter] = useState('all');
   const [statusFilter, setStatusFilter] = useState('all');
+  const [dateFilter, setDateFilter] = useState('');
   const [isAddEmployeeModalOpen, setIsAddEmployeeModalOpen] = useState(false);
   const [addedEmployeeNotification, setAddedEmployeeNotification] = useState<string | null>(null);
   const [isAddPhotosModalOpen, setIsAddPhotosModalOpen] = useState(false);
@@ -62,6 +63,7 @@ export const AttendanceView: React.FC = () => {
     if (!matchSearch) return false;
     if (departmentFilter !== 'all' && a.department !== departmentFilter) return false;
     if (statusFilter !== 'all' && a.status !== statusFilter) return false;
+    if (dateFilter && (!a.date || !a.date.startsWith(dateFilter))) return false;
     return true;
   });
 
@@ -187,15 +189,6 @@ export const AttendanceView: React.FC = () => {
 
         <div className="flex items-center gap-2.5 self-start sm:self-auto flex-wrap sm:flex-nowrap">
           <button
-            onClick={() => handleOpenAddPhotos()}
-            className="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-semibold shadow-xs flex items-center gap-1.5 transition active:scale-95"
-            title="Add more photos of registered employees"
-          >
-            <Camera className="w-4 h-4 text-indigo-400" />
-            <span>Add Photos</span>
-          </button>
-
-          <button
             onClick={() => setIsAddEmployeeModalOpen(true)}
             className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-semibold shadow-xs flex items-center gap-1.5 transition active:scale-95"
           >
@@ -291,11 +284,33 @@ export const AttendanceView: React.FC = () => {
           />
         </div>
 
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Calendar Date Filter */}
+          <div className="flex items-center gap-1.5 px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-xl focus-within:border-blue-600 focus-within:ring-2 focus-within:ring-blue-100 font-semibold text-slate-700 shadow-2xs transition">
+            <Calendar className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+            <input
+              type="date"
+              value={dateFilter}
+              onChange={(e) => setDateFilter(e.target.value)}
+              className="bg-transparent text-xs font-semibold text-slate-700 outline-none cursor-pointer"
+              title="Filter attendance by date"
+            />
+            {dateFilter && (
+              <button
+                type="button"
+                onClick={() => setDateFilter('')}
+                className="p-0.5 text-slate-400 hover:text-slate-600 rounded-full hover:bg-slate-200 transition"
+                title="Clear date filter"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            )}
+          </div>
+
           <select
             value={departmentFilter}
             onChange={(e) => setDepartmentFilter(e.target.value)}
-            className="px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:border-blue-600 outline-none font-semibold text-slate-700 shadow-2xs"
+            className="px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:border-blue-600 outline-none font-semibold text-slate-700 shadow-2xs cursor-pointer"
           >
             {departments.map((d) => (
               <option key={d} value={d}>
@@ -307,7 +322,7 @@ export const AttendanceView: React.FC = () => {
           <select
             value={statusFilter}
             onChange={(e) => setStatusFilter(e.target.value)}
-            className="px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:border-blue-600 outline-none font-semibold text-slate-700 shadow-2xs"
+            className="px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:border-blue-600 outline-none font-semibold text-slate-700 shadow-2xs cursor-pointer"
           >
             <option value="all">All Statuses</option>
             <option value="Present">Present Only</option>
@@ -335,7 +350,16 @@ export const AttendanceView: React.FC = () => {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 bg-white">
-              {filteredAttendance.map((rec) => {
+              {filteredAttendance.length === 0 ? (
+                <tr>
+                  <td colSpan={8} className="py-12 text-center text-slate-400">
+                    <Calendar className="w-8 h-8 text-slate-300 mx-auto mb-2" />
+                    <p className="text-sm font-semibold text-slate-600">No attendance records found</p>
+                    <p className="text-xs text-slate-400 mt-0.5">Try clearing or adjusting your search, date, or filter criteria.</p>
+                  </td>
+                </tr>
+              ) : (
+                filteredAttendance.map((rec) => {
                 const isPresent = rec.status === 'Present';
                 const isLate = rec.status === 'Late';
                 const isOnLeave = rec.status === 'On Leave';
@@ -448,7 +472,7 @@ export const AttendanceView: React.FC = () => {
                     </td>
                   </tr>
                 );
-              })}
+              }))}
             </tbody>
           </table>
         </div>

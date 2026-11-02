@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import numpy as np
@@ -58,13 +59,20 @@ class PersonTracker:
             if person_class_id is not None
             else settings.PERSON_CLASS_ID
         )
-        self.tracker_type = tracker_type or settings.TRACKER_TYPE
+        raw_tracker = tracker_type or settings.TRACKER_TYPE
+        if not raw_tracker.endswith(".yaml"):
+            raw_tracker = f"{raw_tracker}.yaml"
+        if os.path.exists(raw_tracker):
+            self.tracker_type = os.path.abspath(raw_tracker)
+        else:
+            self.tracker_type = raw_tracker
         self.device = device or settings.DEVICE
         self._model = None
 
         # Fallback tracker state for unit testing with synthetic detections
         self._next_synthetic_id = 1
         self._prev_tracks: Dict[str, Tuple[float, float, float, float]] = {}
+        self._velocities: Dict[str, Tuple[float, float]] = {}
 
     def _get_model(self):
         if self._model is None and YOLO is not None:
@@ -153,7 +161,9 @@ class PersonTracker:
             best_iou = 0.10  # minimum IoU threshold to match
 
             for trk_id, prev_box in self._prev_tracks.items():
-                iou = self._calculate_iou(det.box, prev_box)
+                vx, vy = self._velocities.get(trk_id, (0.0, 0.0))
+                pred_box = (prev_box[0] + vx, prev_box[1] + vy, prev_box[2] + vx, prev_box[3] + vy)
+                iou = max(self._calculate_iou(det.box, prev_box), self._calculate_iou(det.box, pred_box))
                 if iou > best_iou:
                     best_iou = iou
                     best_id = trk_id
@@ -161,6 +171,10 @@ class PersonTracker:
             if best_id is None:
                 best_id = str(self._next_synthetic_id)
                 self._next_synthetic_id += 1
+                self._velocities[best_id] = (0.0, 0.0)
+            else:
+                prev_b = self._prev_tracks[best_id]
+                self._velocities[best_id] = (det.box[0] - prev_b[0], det.box[1] - prev_b[1])
 
             new_tracks[best_id] = det.box
             matched.append(

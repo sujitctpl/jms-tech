@@ -6,6 +6,21 @@ import numpy as np
 from app.core.config import settings
 from app.core.logging import logger
 
+def _ensure_cuda_dlls() -> None:
+    """Ensures PyTorch CUDA/cuDNN DLLs are discoverable by ONNX Runtime on Windows."""
+    if os.name == "nt":
+        try:
+            import torch
+            torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+            if os.path.exists(torch_lib):
+                if hasattr(os, "add_dll_directory"):
+                    os.add_dll_directory(torch_lib)
+                os.environ["PATH"] = torch_lib + os.pathsep + os.environ.get("PATH", "")
+        except Exception:
+            pass
+
+_ensure_cuda_dlls()
+
 try:
     import onnxruntime as ort
 except ImportError:

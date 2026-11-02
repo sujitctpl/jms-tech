@@ -2,7 +2,6 @@ import React, { useState } from 'react';
 import {
   Menu,
   Bell,
-  Calendar,
   Clock,
   PlusCircle,
   ChevronDown,
@@ -12,8 +11,6 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { useShowroom } from '../../context/ShowroomContext';
-import { DateFilterOption } from '../../types';
-import { APP_ENV, IS_LOCAL } from '../../config/env';
 
 interface NavbarProps {
   onToggleMobileSidebar: () => void;
@@ -25,22 +22,12 @@ export const Navbar: React.FC<NavbarProps> = ({ onToggleMobileSidebar, onOpenQui
   const {
     storeHours,
     isStoreCurrentlyOpen,
-    dateFilter,
-    setDateFilter,
     metrics,
     lastSimulatedEvent,
   } = useShowroom();
 
   const [showProfileMenu, setShowProfileMenu] = useState(false);
   const [showNotificationMenu, setShowNotificationMenu] = useState(false);
-
-  const dateFilterLabels: Record<DateFilterOption, string> = {
-    today: 'Today',
-    yesterday: 'Yesterday',
-    last7: 'Last 7 Days',
-    last30: 'Last 30 Days',
-    custom: 'Custom Range',
-  };
 
   return (
     <header className="sticky top-0 z-30 bg-white/90 backdrop-blur-xl border-b border-slate-200/80 px-4 sm:px-6 lg:px-8 py-3.5 shadow-xs">
@@ -80,44 +67,11 @@ export const Navbar: React.FC<NavbarProps> = ({ onToggleMobileSidebar, onOpenQui
                 Operating Hours: <span className="font-bold text-slate-700">{storeHours.openingTime} - {storeHours.closingTime}</span>
               </span>
             </div>
-
-            {/* Single Variable Environment Badge */}
-            <div
-              className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-extrabold uppercase tracking-wider border shadow-2xs ${
-                IS_LOCAL
-                  ? 'bg-emerald-50 text-emerald-700 border-emerald-300'
-                  : 'bg-amber-50 text-amber-700 border-amber-300'
-              }`}
-              title={`Switch between LOCAL and PROD via VITE_APP_ENV in dashboard/.env`}
-            >
-              <span className={`w-1.5 h-1.5 rounded-full ${IS_LOCAL ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`} />
-              <span>ENV: {APP_ENV}</span>
-            </div>
           </div>
         </div>
 
-        {/* Right Section: Date Filter, Quick Entry, Notifications, Profile */}
+        {/* Right Section: Quick Entry, Notifications, Profile */}
         <div className="flex items-center gap-2 sm:gap-3">
-          {/* Date Range Selector */}
-          <div className="relative hidden md:block">
-            <div className="flex items-center bg-slate-100/90 rounded-xl p-1 border border-slate-200 shadow-2xs">
-              <Calendar className="w-3.5 h-3.5 text-slate-500 ml-2 mr-1 shrink-0" />
-              {(['today', 'yesterday', 'last7', 'last30'] as DateFilterOption[]).map((opt) => (
-                <button
-                  key={opt}
-                  onClick={() => setDateFilter(opt)}
-                  className={`px-2.5 py-1 text-xs font-semibold rounded-lg border transition-all ${
-                    dateFilter === opt
-                      ? 'bg-white text-blue-700 border-slate-300/80 shadow-xs'
-                      : 'border-transparent text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  {dateFilterLabels[opt]}
-                </button>
-              ))}
-            </div>
-          </div>
-
           {/* Quick Record Walk-in / Entry */}
           <button
             onClick={onOpenQuickAddVisitor}

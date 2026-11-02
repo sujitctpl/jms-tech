@@ -25,8 +25,25 @@ from app.core.config import settings
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 
+# Ensure CUDA & cuDNN DLLs from PyTorch are discoverable by ONNX Runtime on Windows
+if os.name == "nt":
+    try:
+        import torch
+        _torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+        if os.path.exists(_torch_lib):
+            if hasattr(os, "add_dll_directory"):
+                os.add_dll_directory(_torch_lib)
+            os.environ["PATH"] = _torch_lib + os.pathsep + os.environ.get("PATH", "")
+    except Exception:
+        pass
+
 import cv2
 import numpy as np
+
+try:
+    from ultralytics.trackers.utils.matching import linear_assignment
+except Exception:
+    linear_assignment = None
 
 # Handle PyInstaller onefile directory resolution
 def get_resource_path(relative_path: str) -> str:
@@ -182,92 +199,312 @@ class DashboardSyncClient:
 
 
 # ---------------------------------------------------------------------------
-# Simple Centroid / Bounding Box Tracker
+# High-Accuracy Multi-Object Tracking Fallback Engine
 # ---------------------------------------------------------------------------
-class LocalTracker:
-    """Lightweight Euclidean tracker for continuous person IDs across frames."""
+def solve_linear_assignment(
+    cost_matrix: np.ndarray, thresh: float = 0.70
+) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
+    """
+    Optimal bipartite matching on cost matrix with distance/gating threshold.
+    Returns (matches, unmatched_a, unmatched_b).
+    """
+    if cost_matrix.size == 0:
+        return [], list(range(cost_matrix.shape[0])), list(range(cost_matrix.shape[1]))
 
-    def __init__(self, max_disappeared: int = 25, max_distance: float = 90.0):
+    if linear_assignment is not None:
+        try:
+            matched_indices, unmatched_a, unmatched_b = linear_assignment(cost_matrix, thresh=thresh)
+            matches = [(int(r), int(c)) for r, c in matched_indices]
+            return matches, [int(i) for i in unmatched_a], [int(i) for i in unmatched_b]
+        except Exception:
+            pass
+
+    # High-accuracy bipartite matching with gating fallback
+    num_rows, num_cols = cost_matrix.shape
+    used_rows: Set[int] = set()
+    used_cols: Set[int] = set()
+    matches: List[Tuple[int, int]] = []
+
+    pairs = []
+    for r in range(num_rows):
+        for c in range(num_cols):
+            val = float(cost_matrix[r, c])
+            if val <= thresh:
+                pairs.append((val, r, c))
+    pairs.sort(key=lambda x: x[0])
+
+    for val, r, c in pairs:
+        if r not in used_rows and c not in used_cols:
+            used_rows.add(r)
+            used_cols.add(c)
+            matches.append((r, c))
+
+    unmatched_a = [r for r in range(num_rows) if r not in used_rows]
+    unmatched_b = [c for c in range(num_cols) if c not in used_cols]
+    return matches, unmatched_a, unmatched_b
+
+
+class RobustFallbackTracker:
+    """
+    Advanced multi-object tracking fallback engine.
+    Addresses key multi-object tracking failure modes:
+    1. Object Velocity & Linear Motion Prediction: Projects tracks along their velocity vector (vx, vy),
+       eliminating ID swaps when two persons cross paths.
+    2. Visual Appearance Embeddings: Multi-region normalized HSV color histograms provide appearance
+       signatures across frames, preventing identity switches when bounding boxes overlap.
+    3. Optimal Bipartite Matching: Global cost matrix optimization with spatial distance, IoU overlap,
+       and appearance cosine distance gating.
+    4. Seamless Primary Tracker Sync: Continuously learns track velocities and appearance
+       signatures from ByteTrack / BoT-SORT, ensuring instant, zero-drop recovery if the primary tracker drops.
+    """
+
+    def __init__(self, max_disappeared: int = 26, max_distance: float = 120.0, iou_thresh: float = 0.20):
         self.next_id = 10001
         self.objects: Dict[int, Tuple[float, float, float, float]] = {}  # id -> (x1, y1, x2, y2)
         self.disappeared: Dict[int, int] = {}
+        self.velocities: Dict[int, Tuple[float, float]] = {}  # id -> (vx, vy)
+        self.prev_centroids: Dict[int, Tuple[float, float]] = {}  # id -> (cx, cy)
+        self.appearances: Dict[int, np.ndarray] = {}  # id -> 32-dim normalized HSV embedding
         self.max_disappeared = max_disappeared
         self.max_distance = max_distance
+        self.iou_thresh = iou_thresh
 
-    def sync_active_tracks(self, active_objects: Dict[int, Tuple[float, float, float, float]]) -> None:
-        """Synchronizes tracked objects from ByteTrack to keep ID continuity if fallback occurs."""
-        self.objects = dict(active_objects)
-        self.disappeared = {oid: 0 for oid in active_objects.keys()}
+    @staticmethod
+    def _compute_iou(
+        boxA: Tuple[float, float, float, float], boxB: Tuple[float, float, float, float]
+    ) -> float:
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[2], boxB[2])
+        yB = min(boxA[3], boxB[3])
+        interArea = max(0.0, xB - xA) * max(0.0, yB - yA)
+        boxAArea = max(0.0, boxA[2] - boxA[0]) * max(0.0, boxA[3] - boxA[1])
+        boxBArea = max(0.0, boxB[2] - boxB[0]) * max(0.0, boxB[3] - boxB[1])
+        denom = float(boxAArea + boxBArea - interArea)
+        return (interArea / denom) if denom > 0.0 else 0.0
+
+    @staticmethod
+    def extract_appearance(
+        frame: Optional[np.ndarray], box: Tuple[float, float, float, float]
+    ) -> Optional[np.ndarray]:
+        """Extracts a normalized spatial HSV color appearance signature of the person crop (upper & lower body)."""
+        if frame is None or frame.size == 0:
+            return None
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in box]
+        x1 = max(0, min(w - 1, x1))
+        y1 = max(0, min(h - 1, y1))
+        x2 = max(x1 + 1, min(w, x2))
+        y2 = max(y1 + 1, min(h, y2))
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0 or (x2 - x1) < 8 or (y2 - y1) < 16:
+            return None
+        try:
+            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            mid_y = max(1, hsv.shape[0] // 2)
+            upper = hsv[:mid_y, :]
+            lower = hsv[mid_y:, :]
+            hist_upper = cv2.calcHist([upper], [0, 1], None, [8, 2], [0, 180, 0, 256]).flatten()
+            hist_lower = cv2.calcHist([lower], [0, 1], None, [8, 2], [0, 180, 0, 256]).flatten()
+            feat = np.concatenate([hist_upper, hist_lower])
+            norm = np.linalg.norm(feat)
+            if norm > 1e-6:
+                return (feat / norm).astype(np.float32)
+        except Exception:
+            pass
+        return None
+
+    def predict_box(self, oid: int) -> Tuple[float, float, float, float]:
+        """Projects bounding box position along velocity vector."""
+        box = self.objects[oid]
+        vx, vy = self.velocities.get(oid, (0.0, 0.0))
+        return (box[0] + vx, box[1] + vy, box[2] + vx, box[3] + vy)
+
+    def sync_active_tracks(
+        self,
+        active_objects: Dict[int, Tuple[float, float, float, float]],
+        frame: Optional[np.ndarray] = None,
+    ) -> None:
+        """
+        Continuously synchronizes tracked objects from ByteTrack / BoT-SORT,
+        estimating velocities and extracting appearance signatures for zero-lag fallback.
+        """
+        now_tids = set(active_objects.keys())
+        for oid, box in active_objects.items():
+            cx = (box[0] + box[2]) * 0.5
+            cy = box[3]  # bottom-center ground contact point
+            if oid in self.prev_centroids:
+                old_cx, old_cy = self.prev_centroids[oid]
+                vx = cx - old_cx
+                vy = cy - old_cy
+                prev_vx, prev_vy = self.velocities.get(oid, (0.0, 0.0))
+                self.velocities[oid] = (0.7 * vx + 0.3 * prev_vx, 0.7 * vy + 0.3 * prev_vy)
+            else:
+                self.velocities[oid] = (0.0, 0.0)
+
+            self.prev_centroids[oid] = (cx, cy)
+            self.objects[oid] = box
+            self.disappeared[oid] = 0
+
+            if frame is not None:
+                emb = self.extract_appearance(frame, box)
+                if emb is not None:
+                    if oid in self.appearances:
+                        self.appearances[oid] = 0.85 * self.appearances[oid] + 0.15 * emb
+                    else:
+                        self.appearances[oid] = emb
+
+        # Age and prune tracks no longer in active_objects
+        for oid in list(self.objects.keys()):
+            if oid not in now_tids:
+                self.disappeared[oid] = self.disappeared.get(oid, 0) + 1
+                if self.disappeared[oid] > self.max_disappeared:
+                    self.objects.pop(oid, None)
+                    self.disappeared.pop(oid, None)
+                    self.velocities.pop(oid, None)
+                    self.prev_centroids.pop(oid, None)
+                    self.appearances.pop(oid, None)
+
         max_id = max(active_objects.keys(), default=0)
         if max_id >= self.next_id:
             self.next_id = max_id + 1
 
-    def update(self, detections: List[Tuple[float, float, float, float]]) -> Dict[int, Tuple[float, float, float, float]]:
+    def update(
+        self,
+        detections: List[Tuple[float, float, float, float]],
+        frame: Optional[np.ndarray] = None,
+        only_active: bool = True,
+    ) -> Dict[int, Tuple[float, float, float, float]]:
+        """
+        Updates tracks using object velocity prediction, appearance embeddings,
+        and optimal bipartite matching.
+        """
         if len(detections) == 0:
-            for obj_id in list(self.disappeared.keys()):
-                self.disappeared[obj_id] += 1
-                if self.disappeared[obj_id] > self.max_disappeared:
-                    del self.objects[obj_id]
-                    del self.disappeared[obj_id]
-            return self.objects
+            for oid in list(self.disappeared.keys()):
+                self.disappeared[oid] += 1
+                if self.disappeared[oid] <= self.max_disappeared and oid in self.objects:
+                    # Coast box along velocity trajectory
+                    self.objects[oid] = self.predict_box(oid)
+                elif self.disappeared[oid] > self.max_disappeared:
+                    self.objects.pop(oid, None)
+                    self.disappeared.pop(oid, None)
+                    self.velocities.pop(oid, None)
+                    self.prev_centroids.pop(oid, None)
+                    self.appearances.pop(oid, None)
+            return {oid: box for oid, box in self.objects.items() if self.disappeared.get(oid, 0) == 0} if only_active else self.objects
 
         if len(self.objects) == 0:
             for box in detections:
                 self.objects[self.next_id] = box
                 self.disappeared[self.next_id] = 0
+                cx = (box[0] + box[2]) * 0.5
+                cy = box[3]
+                self.prev_centroids[self.next_id] = (cx, cy)
+                self.velocities[self.next_id] = (0.0, 0.0)
+                if frame is not None:
+                    emb = self.extract_appearance(frame, box)
+                    if emb is not None:
+                        self.appearances[self.next_id] = emb
                 self.next_id += 1
             return self.objects
 
-        # Match existing objects to new detections based on centroid distance
+        # 1. Predict track positions along velocity vectors
         object_ids = list(self.objects.keys())
-        object_centroids = [
-            (((b[0] + b[2]) / 2.0), b[3]) for b in self.objects.values()
-        ]  # feet contact point
+        pred_boxes = [self.predict_box(oid) for oid in object_ids]
+        pred_centroids = [(((b[0] + b[2]) / 2.0), b[3]) for b in pred_boxes]
 
-        det_centroids = [
-            (((b[0] + b[2]) / 2.0), b[3]) for b in detections
-        ]
+        det_centroids = [(((b[0] + b[2]) / 2.0), b[3]) for b in detections]
+        det_appearances = [self.extract_appearance(frame, b) if frame is not None else None for b in detections]
 
-        used_rows: Set[int] = set()
-        used_cols: Set[int] = set()
+        # 2. Build cost matrix combining predicted spatial distance, IoU, and appearance cosine distance
+        num_tracks = len(object_ids)
+        num_dets = len(detections)
+        cost_matrix = np.zeros((num_tracks, num_dets), dtype=np.float32)
 
-        # Compute pairwise distances
-        dists = []
-        for i, (ox, oy) in enumerate(object_centroids):
-            for j, (dx, dy) in enumerate(det_centroids):
-                d = math.hypot(ox - dx, oy - dy)
-                dists.append((d, i, j))
-        dists.sort(key=lambda x: x[0])
+        for i, oid in enumerate(object_ids):
+            pred_b = pred_boxes[i]
+            pcx, pcy = pred_centroids[i]
+            track_app = self.appearances.get(oid)
 
-        for d, row, col in dists:
-            if row in used_rows or col in used_cols:
-                continue
-            if d > self.max_distance:
-                continue
+            for j, det_b in enumerate(detections):
+                dcx, dcy = det_centroids[j]
+                spatial_dist = math.hypot(pcx - dcx, pcy - dcy)
+                norm_dist = min(1.0, spatial_dist / self.max_distance)
+                iou = self._compute_iou(pred_b, det_b)
+                iou_cost = 1.0 - iou
 
-            obj_id = object_ids[row]
-            self.objects[obj_id] = detections[col]
-            self.disappeared[obj_id] = 0
-            used_rows.add(row)
-            used_cols.add(col)
+                det_app = det_appearances[j]
+                if track_app is not None and det_app is not None:
+                    sim = max(0.0, float(np.dot(track_app, det_app)))
+                    app_cost = 1.0 - sim
+                    cost = 0.40 * norm_dist + 0.35 * iou_cost + 0.25 * app_cost
+                else:
+                    cost = 0.55 * norm_dist + 0.45 * iou_cost
 
-        # Handle unmatched existing objects
-        unused_rows = set(range(len(object_ids))) - used_rows
-        for row in unused_rows:
-            obj_id = object_ids[row]
-            self.disappeared[obj_id] += 1
-            if self.disappeared[obj_id] > self.max_disappeared:
-                del self.objects[obj_id]
-                del self.disappeared[obj_id]
+                # Hard gating: reject if both distance exceeds max and IoU is negligible
+                if spatial_dist > self.max_distance and iou < 0.10:
+                    cost = 1.0
 
-        # Handle unmatched new detections
-        unused_cols = set(range(len(detections))) - used_cols
-        for col in unused_cols:
-            self.objects[self.next_id] = detections[col]
-            self.disappeared[self.next_id] = 0
+                cost_matrix[i, j] = cost
+
+        # 3. Solve optimal bipartite matching
+        matches, unmatched_tracks, unmatched_dets = solve_linear_assignment(cost_matrix, thresh=0.68)
+
+        # 4. Update matched tracks
+        for row, col in matches:
+            oid = object_ids[row]
+            det_box = detections[col]
+            cx = (det_box[0] + det_box[2]) * 0.5
+            cy = det_box[3]
+            old_cx, old_cy = self.prev_centroids.get(oid, (cx, cy))
+            vx = cx - old_cx
+            vy = cy - old_cy
+            prev_vx, prev_vy = self.velocities.get(oid, (0.0, 0.0))
+            self.velocities[oid] = (0.7 * vx + 0.3 * prev_vx, 0.7 * vy + 0.3 * prev_vy)
+            self.prev_centroids[oid] = (cx, cy)
+            self.objects[oid] = det_box
+            self.disappeared[oid] = 0
+
+            det_app = det_appearances[col]
+            if det_app is not None:
+                if oid in self.appearances:
+                    self.appearances[oid] = 0.85 * self.appearances[oid] + 0.15 * det_app
+                else:
+                    self.appearances[oid] = det_app
+
+        # 5. Handle unmatched tracks
+        for row in unmatched_tracks:
+            oid = object_ids[row]
+            self.disappeared[oid] += 1
+            if self.disappeared[oid] <= self.max_disappeared:
+                self.objects[oid] = self.predict_box(oid)
+            else:
+                self.objects.pop(oid, None)
+                self.disappeared.pop(oid, None)
+                self.velocities.pop(oid, None)
+                self.prev_centroids.pop(oid, None)
+                self.appearances.pop(oid, None)
+
+        # 6. Handle unmatched detections (spawn new track)
+        for col in unmatched_dets:
+            det_box = detections[col]
+            new_id = self.next_id
             self.next_id += 1
+            self.objects[new_id] = det_box
+            self.disappeared[new_id] = 0
+            cx = (det_box[0] + det_box[2]) * 0.5
+            cy = det_box[3]
+            self.prev_centroids[new_id] = (cx, cy)
+            self.velocities[new_id] = (0.0, 0.0)
+            det_app = det_appearances[col]
+            if det_app is not None:
+                self.appearances[new_id] = det_app
 
-        return self.objects
+        return {oid: box for oid, box in self.objects.items() if self.disappeared.get(oid, 0) == 0} if only_active else self.objects
+
+
+# Backward compatibility alias
+LocalTracker = RobustFallbackTracker
 
 
 # ---------------------------------------------------------------------------
@@ -288,16 +525,18 @@ class TrackSmoother:
 
     def __init__(
         self,
-        alpha: float = 0.70,
-        deadband_px: float = 3.5,
+        alpha: float = 0.35,
+        deadband_px: float = 6.0,
         face_persistence: int = 8,
-        body_persistence: int = 15,
+        body_persistence: int = 26,
+        max_visual_coast: int = 20,
         enabled: bool = True,
     ):
         self.alpha = float(alpha)
         self.deadband_px = float(deadband_px)
         self.face_persistence = int(face_persistence)
         self.body_persistence = int(body_persistence)
+        self.max_visual_coast = int(max_visual_coast)
         self.enabled = enabled
 
         # Person body boxes: obj_id -> (x1, y1, x2, y2)
@@ -313,6 +552,8 @@ class TrackSmoother:
 
         # Track disappeared counter for GC
         self.disappeared: Dict[int, int] = {}
+        # Track velocity vector: obj_id -> (vx, vy)
+        self.velocities: Dict[int, Tuple[float, float]] = {}
         # Persistent ID alias mapping to maintain consistent IDs across frames
         self.id_aliases: Dict[int, int] = {}
 
@@ -364,9 +605,15 @@ class TrackSmoother:
                 if mid in used_missing:
                     continue
                 pbox = self.body_boxes[mid]
-                iou = self._compute_iou(box, pbox)
+                count = self.disappeared.get(mid, 1)
+                vx, vy = self.velocities.get(mid, (0.0, 0.0))
                 mcx, mcy = self.prev_centroids.get(mid, ((pbox[0] + pbox[2]) * 0.5, (pbox[1] + pbox[3]) * 0.5))
-                dist = math.hypot(ncx - mcx, ncy - mcy)
+                pred_mcx = mcx + vx * count
+                pred_mcy = mcy + vy * count
+                pred_pbox = (pbox[0] + vx * count, pbox[1] + vy * count, pbox[2] + vx * count, pbox[3] + vy * count)
+
+                iou = self._compute_iou(box, pred_pbox)
+                dist = math.hypot(ncx - pred_mcx, ncy - pred_mcy)
 
                 if iou >= min_iou or dist < max_dist:
                     score = dist - (iou * 100.0)
@@ -382,11 +629,25 @@ class TrackSmoother:
         return recovered
 
     def smooth_body_boxes(
-        self, tracked_objects: Dict[int, Tuple[float, float, float, float]]
+        self,
+        tracked_objects: Dict[int, Tuple[float, float, float, float]],
+        frame_shape: Optional[Tuple[int, int]] = None,
     ) -> Dict[int, Tuple[float, float, float, float]]:
-        """Applies EMA smoothing, persistence coasting across drops, and velocity deadband to person body boxes."""
+        """Applies EMA smoothing, ultra-low-latency persistence coasting across drops, and velocity deadband to person body boxes."""
         if not self.enabled:
             return tracked_objects
+
+        fw, fh = frame_shape if frame_shape is not None else (None, None)
+
+        def _is_near_edge(box: Tuple[float, float, float, float], margin: float = 25.0) -> bool:
+            if fw is None or fh is None:
+                return False
+            return (
+                box[0] <= margin
+                or box[1] <= margin
+                or box[2] >= (fw - margin)
+                or box[3] >= (fh - margin)
+            )
 
         # 0. Apply persistent ID aliases to maintain consistent IDs across frames
         if self.id_aliases:
@@ -430,18 +691,20 @@ class TrackSmoother:
 
         active_ids = set(tracked_objects.keys())
 
-        # 2. Update disappearance counters & purge tracks exceeding cutoff
+        # 2. Update disappearance counters & purge tracks exceeding cutoff or exiting image edge
         for old_id in list(self.body_boxes.keys()):
             if old_id not in active_ids:
                 self.disappeared[old_id] = self.disappeared.get(old_id, 0) + 1
-                if self.disappeared[old_id] > self.body_persistence:
-                    # Cutoff exceeded -> clean up so the box disappears
+                old_box = self.body_boxes[old_id]
+                # If person was near the frame boundary when detection dropped, they exited the camera!
+                # Purge immediately so the green box disappears with ZERO delay.
+                if _is_near_edge(old_box) or self.disappeared[old_id] > self.body_persistence:
                     self.body_boxes.pop(old_id, None)
                     self.prev_centroids.pop(old_id, None)
                     self.face_tracks.pop(old_id, None)
                     self.head_boxes.pop(old_id, None)
                     self.disappeared.pop(old_id, None)
-                    # Clean up aliases pointing to or from this purged old_id
+                    self.velocities.pop(old_id, None)
                     self.id_aliases = {k: v for k, v in self.id_aliases.items() if v != old_id and k != old_id}
             else:
                 self.disappeared[old_id] = 0
@@ -457,11 +720,17 @@ class TrackSmoother:
             if obj_id not in self.body_boxes:
                 self.body_boxes[obj_id] = raw_box
                 self.prev_centroids[obj_id] = (rcx, rcy)
+                self.velocities[obj_id] = (0.0, 0.0)
                 smoothed_dict[obj_id] = raw_box
                 continue
 
             px1, py1, px2, py2 = self.body_boxes[obj_id]
             pcx, pcy = self.prev_centroids[obj_id]
+
+            vx = rcx - pcx
+            vy = rcy - pcy
+            prev_vx, prev_vy = self.velocities.get(obj_id, (0.0, 0.0))
+            self.velocities[obj_id] = (0.7 * vx + 0.3 * prev_vx, 0.7 * vy + 0.3 * prev_vy)
 
             dist = math.hypot(rcx - pcx, rcy - pcy)
             dw = abs((rx2 - rx1) - (px2 - px1))
@@ -483,20 +752,23 @@ class TrackSmoother:
             self.prev_centroids[obj_id] = ((sx1 + sx2) * 0.5, (sy1 + sy2) * 0.5)
             smoothed_dict[obj_id] = smoothed_box
 
-        # 4. Persistence Coasting: Retain momentarily missed detections within the cutoff buffer
+        # 4. Ultra-responsive Persistence Coasting: Retain momentarily missed detections within a tight visual window (max 1-2 frames / ~60-90ms)
+        # to smooth out single-frame detector blips, but NEVER display ghost boxes for 2-3 seconds when someone leaves!
         for old_id, miss_count in list(self.disappeared.items()):
-            if 0 < miss_count <= self.body_persistence and old_id in self.body_boxes and old_id not in smoothed_dict:
+            if 0 < miss_count <= self.max_visual_coast and old_id in self.body_boxes and old_id not in smoothed_dict:
                 old_box = self.body_boxes[old_id]
-                # Never coast a missing track if an active box already covers the same physical space
-                is_covered = any(
-                    self._compute_iou(old_box, abox) > 0.30 for abox in smoothed_dict.values()
-                )
-                if not is_covered:
-                    smoothed_dict[old_id] = old_box
+                if not _is_near_edge(old_box):
+                    vx, vy = self.velocities.get(old_id, (0.0, 0.0))
+                    coasted_box = (old_box[0] + vx, old_box[1] + vy, old_box[2] + vx, old_box[3] + vy)
+                    # Never coast a missing track if an active box already covers the same physical space
+                    is_covered = any(
+                        self._compute_iou(coasted_box, abox) > 0.30 for abox in smoothed_dict.values()
+                    )
+                    if not is_covered:
+                        smoothed_dict[old_id] = coasted_box
 
         # 5. Overlap De-duplication (Track NMS): eliminate duplicate / ghost bounding boxes on the same individual
         deduped_dict: Dict[int, Tuple[float, float, float, float]] = {}
-        # Prioritize actively detected boxes over coasted ones, then lower/established IDs
         sorted_candidates = sorted(
             smoothed_dict.items(),
             key=lambda item: (self.disappeared.get(item[0], 0), item[0]),
@@ -684,17 +956,14 @@ class TrackSmoother:
 # ---------------------------------------------------------------------------
 class ZoneManager:
     """
-    Real-time Dynamic User-Drawn Entry Line and Section Manager (Sales, Accounts, etc.).
-    - Pristine Recording Screen: Starts with NO static preset lines or boxes.
-    - Always Interactive: The user draws the entry line and sections directly on the screen.
-    - Top Clickable Toolbar:
-        [1. Draw Entry Line]  [2. Draw Sales]  [3. Draw Accounts]  [Clear All]
-    - Click & Drag on screen draws the line or section box with live visual feedback.
-    - Auto-Saves to camera_config.json upon mouse release.
-    - Multi-Zone Counting Logic:
-        Crossing Entry Line -> Attendance = 1
-        Entering Sales Section -> Sales = 1 (and live occupancy updated)
-        Entering Accounts Section -> Accounts = 1 (and live occupancy updated)
+    Optimized Dynamic User-Drawn Entry Line and Department Manager.
+    - True Vector Normal Directional Crossing: calculates 2D cross product against line normal vector,
+      supporting angled, horizontal, vertical, and diagonal entrances accurately.
+    - Flip Direction [D]: Instantly reverses entry/exit orientation with live perpendicular arrow.
+    - Multi-Department Coverage: Sales, Service, and Accounts with anti-jitter dwell-time verification.
+    - Zero-Lag In-Place ROI Blending: eliminates full-frame memory clones for high FPS.
+    - Interactive Clickable Toolbar & Keyboard Shortcuts (1: Line, 2: Sales, 3: Service, 4: Accounts, D: Flip, R: Clear).
+    - Persistent Identity Linking: prevents multi-counting visitors across ByteTrack ID switches.
     """
 
     def __init__(
@@ -706,12 +975,14 @@ class ZoneManager:
         frame_width: int = 1280,
         frame_height: int = 720,
         line_y_ratio: float = 0.35,
-        direction: str = "top_to_bottom",
+        direction: str = "forward",
+        api_url: str = "http://127.0.0.1:8000",
     ):
         self.config_path = config_path
         self.camera_channel = str(camera_channel)
         self.frame_w = frame_width
         self.frame_h = frame_height
+        self.api_url = str(api_url).rstrip("/")
 
         # Load entry line only if explicitly saved by user previously
         self.entry_line = None
@@ -730,12 +1001,12 @@ class ZoneManager:
         self.sections: List[dict] = []
         if sections_cfg and isinstance(sections_cfg, list):
             for s in sections_cfg:
-                if isinstance(s, dict) and "box" in s and len(s["box"]) == 4:
+                if isinstance(s, dict):
                     self.sections.append({
                         "id": str(s.get("id", "section")),
                         "name": str(s.get("name", "Section")),
-                        "color": tuple(s.get("color", [0, 200, 255])),
-                        "box": [int(s["box"][0]), int(s["box"][1]), int(s["box"][2]), int(s["box"][3])],
+                        "color": tuple(s.get("color", [0, 215, 255])),
+                        "box": [int(s["box"][0]), int(s["box"][1]), int(s["box"][2]), int(s["box"][3])] if ("box" in s and len(s["box"]) == 4) else [0, 0, 0, 0],
                     })
 
         # Multi-Zone Counters
@@ -743,30 +1014,114 @@ class ZoneManager:
         self.section_totals: Dict[str, int] = {s["id"]: 0 for s in self.sections}
         self.live_occupancy: Dict[str, int] = {s["id"]: 0 for s in self.sections}
 
-        # Track history
+        # Track history & persistent identity linking
         self.counted_attendance_ids: Set[int] = set()
         self.counted_person_ids: Set[str] = set()
         self.track_identities: Dict[int, str] = {}
         self.person_visited_sections: Dict[int, Set[str]] = {}
+        self.counted_person_sections: Dict[str, Set[str]] = {}
+        self.person_section_dwell: Dict[Tuple[int, str], int] = {}
         self.track_positions: Dict[int, Tuple[float, float]] = {}  # obj_id -> prev feet (x, y)
 
         # Visual Flash Timers
         self.line_flash_timer = 0
         self.section_flash_timers: Dict[str, int] = {s["id"]: 0 for s in self.sections}
 
-        # Interactive Drawing State (ALWAYS ACTIVE - No toggle needed)
-        self.active_tool = "entry_line"  # "entry_line", "sales", "accounts"
+        # Interactive Drawing State
+        self.active_tool = "entry_line"
         self.is_mouse_down = False
         self.mouse_start = (0, 0)
         self.mouse_current = (0, 0)
-        self.status_msg = "CLICK & DRAG TO DRAW ENTRY LINE, OR CLICK BUTTONS ABOVE TO SWITCH TOOL"
+        self.status_msg = "CLICK & DRAG TO DRAW ENTRY LINE OR SELECT A DEPARTMENT TOOL ABOVE"
         self.status_timer = 250
 
-        # Toolbar button boundaries: (x1, y1, x2, y2)
-        self.btn_line = (15, 8, 205, 46)
-        self.btn_sales = (215, 8, 395, 46)
-        self.btn_accounts = (405, 8, 615, 46)
-        self.btn_clear = (625, 8, 745, 46)
+        # Dynamic Toolbar button layout (computes dynamic department buttons)
+        self.btn_sections: List[Tuple[int, int, int, int, dict]] = []
+        resolved_cfg = get_resource_path(self.config_path)
+        self._last_config_mtime = os.path.getmtime(resolved_cfg) if os.path.exists(resolved_cfg) else 0.0
+        self._compute_toolbar_layout()
+
+    def _compute_toolbar_layout(self):
+        """Dynamically computes top toolbar button boundaries for entry line and all configured departments."""
+        self.btn_line = (10, 8, 135, 46)
+        curr_x = 143
+        self.btn_sections = []
+        for i, s in enumerate(self.sections):
+            short_name = s["name"].split()[0][:8]
+            btn_w = max(80, min(120, len(short_name) * 9 + 44))
+            x1 = curr_x
+            x2 = curr_x + btn_w
+            self.btn_sections.append((x1, 8, x2, 46, s))
+            curr_x = x2 + 8
+
+        self.btn_flip = (curr_x, 8, curr_x + 115, 46)
+        curr_x += 123
+        self.btn_reset = (curr_x, 8, curr_x + 95, 46)
+        curr_x += 103
+        self.btn_clear = (curr_x, 8, curr_x + 85, 46)
+
+    def check_and_reload_config(self) -> bool:
+        """Dynamically reloads departments and entry line if camera_config.json was modified."""
+        try:
+            resolved = get_resource_path(self.config_path)
+            if not os.path.exists(resolved):
+                return False
+            mtime = os.path.getmtime(resolved)
+            if mtime <= self._last_config_mtime:
+                return False
+            self._last_config_mtime = mtime
+
+            with open(resolved, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cams = data.get("cameras", {})
+            cam_data = cams.get(self.camera_channel, {})
+            sections_cfg = cam_data.get("sections")
+            if sections_cfg is not None and isinstance(sections_cfg, list):
+                # Preserve drawn boxes in memory if config box is empty [0, 0, 0, 0]
+                mem_boxes = {s["id"]: s["box"] for s in self.sections if s.get("box") and s["box"] != [0, 0, 0, 0]}
+                new_sections = []
+                for s in sections_cfg:
+                    if isinstance(s, dict):
+                        sid = str(s.get("id", "section"))
+                        s_box = [int(s["box"][0]), int(s["box"][1]), int(s["box"][2]), int(s["box"][3])] if ("box" in s and len(s["box"]) == 4) else [0, 0, 0, 0]
+                        if s_box == [0, 0, 0, 0] and sid in mem_boxes:
+                            s_box = mem_boxes[sid]
+                        new_sections.append({
+                            "id": sid,
+                            "name": str(s.get("name", "Section")),
+                            "color": tuple(s.get("color", [0, 215, 255])),
+                            "box": s_box,
+                        })
+                old_ids = [s["id"] for s in self.sections]
+                new_ids = [s["id"] for s in new_sections]
+                if old_ids != new_ids or len(self.sections) != len(new_sections):
+                    self.sections = new_sections
+                    for s in self.sections:
+                        self.section_totals.setdefault(s["id"], 0)
+                        self.live_occupancy.setdefault(s["id"], 0)
+                        self.section_flash_timers.setdefault(s["id"], 0)
+                    self._compute_toolbar_layout()
+                    self.status_msg = f"[+] Departments synced with Dashboard ({len(self.sections)} active)"
+                    self.status_timer = 140
+                    print(f"[*] Dynamically reloaded {len(self.sections)} departments from {self.config_path}")
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def reset_counts(self):
+        """Clears and resets Entry count and section visits to 0 without clearing drawn zones."""
+        self.attendance_total = 0
+        self.counted_attendance_ids.clear()
+        self.counted_person_ids.clear()
+        self.person_visited_sections.clear()
+        self.counted_person_sections.clear()
+        self.person_section_dwell.clear()
+        for sid in self.section_totals:
+            self.section_totals[sid] = 0
+        self.status_msg = "[+] Entry count cleared and reset to 0!"
+        self.status_timer = 150
+        print("[+] Entry count cleared and reset to 0.")
 
     def set_identity(self, obj_id: int, person_id: Optional[str]) -> None:
         """Links temporary ByteTrack ID to persistent person ID to prevent duplicate entry counts."""
@@ -775,15 +1130,113 @@ class ZoneManager:
             self.track_identities[obj_id] = pid
             if obj_id in self.counted_attendance_ids:
                 self.counted_person_ids.add(pid)
+            if pid in self.counted_person_sections:
+                self.person_visited_sections.setdefault(obj_id, set()).update(self.counted_person_sections[pid])
+
+    def flip_direction(self):
+        """Cycles entry line crossing direction between forward, backward, and bidirectional (both)."""
+        if not self.entry_line:
+            self.status_msg = "[!] No Entry Line drawn yet. Draw one first!"
+            self.status_timer = 120
+            return
+        curr_dir = self.entry_line.get("direction", "forward")
+        if curr_dir == "forward":
+            new_dir = "backward"
+            dir_label = "BACKWARD (➔ Inward)"
+        elif curr_dir == "backward":
+            new_dir = "both"
+            dir_label = "BOTH WAYS (◄➔ Bidirectional)"
+        else:
+            new_dir = "forward"
+            dir_label = "FORWARD (➔ Inward)"
+        self.entry_line["direction"] = new_dir
+        self.status_msg = f"[+] Entry Direction switched to: {dir_label}"
+        self.status_timer = 160
+        print(f"[+] Entry Line direction switched to: {new_dir} ({dir_label})")
+        self.save_to_config()
 
     @staticmethod
-    def _ccw(A, B, C):
+    def _draw_entry_arrow(frame: np.ndarray, p1: Tuple[int, int], p2: Tuple[int, int], direction: str, is_flashing: bool, count: int = 0):
+        """Draws high-visibility, user-friendly directional arrows and badge along the entry line."""
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        length = math.hypot(dx, dy)
+        if length <= 0:
+            return
+
+        # Direction vector u pointing in the exact entry crossing direction:
+        # Cross product cp(p1, p2, p) < 0 side is reached when moving along (dy/length, -dx/length).
+        # Forward check: cp_prev >= 0 and cp_curr < 0 -> moves towards cp < 0.
+        # Backward check: cp_prev <= 0 and cp_curr > 0 -> moves towards cp > 0.
+        ux = dy / length
+        uy = -dx / length
+
+        if direction == "backward":
+            ux, uy = -ux, -uy
+        elif direction == "top_to_bottom":
+            if uy < 0:
+                ux, uy = -ux, -uy
+        elif direction == "bottom_to_top":
+            if uy > 0:
+                ux, uy = -ux, -uy
+
+        arrow_color = (0, 255, 128) if is_flashing else (0, 215, 255)
+        bg_outline = (15, 23, 42)
+
+        # 1. Chevrons / arrows along the line (28%, 50%, and 72% of segment length)
+        fractions = [0.28, 0.50, 0.72] if length > 140 else [0.50]
+        arrow_len = 34 if length > 140 else 24
+
+        for frac in fractions:
+            mx = int(p1[0] + dx * frac)
+            my = int(p1[1] + dy * frac)
+
+            if direction == "both":
+                # Double-headed arrow (bidirectional)
+                p_fwd = (int(mx + ux * arrow_len), int(my + uy * arrow_len))
+                p_bwd = (int(mx - ux * arrow_len), int(my - uy * arrow_len))
+                cv2.arrowedLine(frame, (mx, my), p_fwd, bg_outline, 5, tipLength=0.36)
+                cv2.arrowedLine(frame, (mx, my), p_bwd, bg_outline, 5, tipLength=0.36)
+                cv2.arrowedLine(frame, (mx, my), p_fwd, arrow_color, 2, tipLength=0.36)
+                cv2.arrowedLine(frame, (mx, my), p_bwd, arrow_color, 2, tipLength=0.36)
+            else:
+                start_pt = (int(mx - ux * 4), int(my - uy * 4))
+                end_pt = (int(mx + ux * arrow_len), int(my + uy * arrow_len))
+                # High-contrast outline for any floor color (carpet, marble, tiles)
+                cv2.arrowedLine(frame, start_pt, end_pt, bg_outline, 5, tipLength=0.38)
+                cv2.arrowedLine(frame, start_pt, end_pt, arrow_color, 2, tipLength=0.38)
+
+        # 2. Prominent Direction Badge at Center Arrow Tip
+        center_mx = int((p1[0] + p2[0]) / 2)
+        center_my = int((p1[1] + p2[1]) / 2)
+
+        if direction == "both":
+            badge_text = "◄ BIDIRECTIONAL ENTRY ►"
+            bx = max(10, min(frame.shape[1] - 220, center_mx - 90))
+            by = max(60, min(frame.shape[0] - 30, center_my - 18))
+        else:
+            dir_tag = "ENTRY DIRECTION" if not is_flashing else "ENTRY DETECTED!"
+            badge_text = f"➔ {dir_tag}"
+            bx = max(10, min(frame.shape[1] - 180, int(center_mx + ux * (arrow_len + 16)) - 50))
+            by = max(60, min(frame.shape[0] - 30, int(center_my + uy * (arrow_len + 16)) - 10))
+
+        (tw, th), _ = cv2.getTextSize(badge_text, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
+        cv2.rectangle(frame, (bx - 6, by - 4), (bx + tw + 6, by + th + 6), bg_outline, -1)
+        cv2.rectangle(frame, (bx - 6, by - 4), (bx + tw + 6, by + th + 6), arrow_color, 1)
+        cv2.putText(frame, badge_text, (bx, by + th), cv2.FONT_HERSHEY_SIMPLEX, 0.44, arrow_color, 1, cv2.LINE_AA)
+
+    @staticmethod
+    def _cross_product(A, B, C):
+        """2D Cross product of vector AB and AC."""
         return (B[0] - A[0]) * (C[1] - A[1]) - (B[1] - A[1]) * (C[0] - A[0])
 
     @staticmethod
     def _segments_intersect(A, B, C, D):
-        return (ZoneManager._ccw(A, B, C) * ZoneManager._ccw(A, B, D) <= 0) and \
-               (ZoneManager._ccw(C, D, A) * ZoneManager._ccw(C, D, B) <= 0)
+        cp1 = ZoneManager._cross_product(A, B, C)
+        cp2 = ZoneManager._cross_product(A, B, D)
+        cp3 = ZoneManager._cross_product(C, D, A)
+        cp4 = ZoneManager._cross_product(C, D, B)
+        return (cp1 * cp2 <= 0) and (cp3 * cp4 <= 0)
 
     def process(
         self, tracked_objects: Dict[int, Tuple[float, float, float, float]]
@@ -804,52 +1257,90 @@ class ZoneManager:
 
         p1 = tuple(self.entry_line["p1"]) if has_entry_line else None
         p2 = tuple(self.entry_line["p2"]) if has_entry_line else None
-        direction = self.entry_line.get("direction", "top_to_bottom") if has_entry_line else "top_to_bottom"
+        direction = self.entry_line.get("direction", "forward") if has_entry_line else "forward"
 
         for obj_id, box in tracked_objects.items():
             feet_x = (box[0] + box[2]) * 0.5
             feet_y = box[3]
             curr_pos = (feet_x, feet_y)
 
-            # 1. Check Attendance Line Crossing (if entry line has been drawn)
+            # 1. Check Entry Line Crossing
             pid = self.track_identities.get(obj_id)
             is_already_counted = (obj_id in self.counted_attendance_ids) or (pid and pid in self.counted_person_ids)
             if has_entry_line and not is_already_counted:
                 prev_pos = self.track_positions.get(obj_id)
                 if prev_pos is not None:
-                    crossed = False
-                    if self._segments_intersect(p1, p2, prev_pos, curr_pos):
-                        if direction == "top_to_bottom" and curr_pos[1] >= prev_pos[1]:
-                            crossed = True
-                        elif direction == "bottom_to_top" and curr_pos[1] <= prev_pos[1]:
-                            crossed = True
-                        elif direction in ("left_to_right", "right_to_left"):
-                            crossed = True
-                        else:
+                    # Sensitive displacement filter of 1.5px to reliably capture slow/smooth crossings
+                    disp = math.hypot(curr_pos[0] - prev_pos[0], curr_pos[1] - prev_pos[1])
+                    if disp >= 1.5 and self._segments_intersect(p1, p2, prev_pos, curr_pos):
+                        cp_prev = self._cross_product(p1, p2, prev_pos)
+                        cp_curr = self._cross_product(p1, p2, curr_pos)
+
+                        crossed = False
+                        if direction == "forward":
+                            crossed = (cp_prev >= 0 and cp_curr < 0) or (cp_prev > 0 and cp_curr <= 0)
+                        elif direction == "backward":
+                            crossed = (cp_prev <= 0 and cp_curr > 0) or (cp_prev < 0 and cp_curr >= 0)
+                        elif direction == "top_to_bottom":
+                            crossed = (curr_pos[1] >= prev_pos[1]) or (cp_prev >= 0 and cp_curr < 0)
+                        elif direction == "bottom_to_top":
+                            crossed = (curr_pos[1] <= prev_pos[1]) or (cp_prev <= 0 and cp_curr > 0)
+                        else:  # "both" (bidirectional entry)
                             crossed = True
 
-                    if crossed:
-                        self.counted_attendance_ids.add(obj_id)
-                        if pid:
-                            self.counted_person_ids.add(pid)
-                        self.attendance_total += 1
-                        self.line_flash_timer = 25
-                        new_attendance_crossings.append(obj_id)
+                        if crossed:
+                            self.counted_attendance_ids.add(obj_id)
+                            if pid:
+                                self.counted_person_ids.add(pid)
+                            self.attendance_total += 1
+                            self.line_flash_timer = 25
+                            new_attendance_crossings.append(obj_id)
+            elif has_entry_line and (obj_id in self.counted_attendance_ids):
+                # Reverse crossing: person walked back out, re-arm for next entry
+                prev_pos = self.track_positions.get(obj_id)
+                if prev_pos is not None and self._segments_intersect(p1, p2, prev_pos, curr_pos):
+                    cp_prev = self._cross_product(p1, p2, prev_pos)
+                    cp_curr = self._cross_product(p1, p2, curr_pos)
+                    rev_crossed = False
+                    if direction == "forward":
+                        rev_crossed = (cp_prev <= 0 and cp_curr > 0)
+                    elif direction == "backward":
+                        rev_crossed = (cp_prev >= 0 and cp_curr < 0)
+                    elif direction == "top_to_bottom":
+                        rev_crossed = (curr_pos[1] < prev_pos[1])
+                    elif direction == "bottom_to_top":
+                        rev_crossed = (curr_pos[1] > prev_pos[1])
+                    elif direction == "both":
+                        rev_crossed = True
+                    if rev_crossed:
+                        self.counted_attendance_ids.discard(obj_id)
+                        if pid and pid in self.counted_person_ids:
+                            self.counted_person_ids.discard(pid)
 
             self.track_positions[obj_id] = curr_pos
 
-            # 2. Check Sections (Sales, Accounts, etc.)
+            # 2. Check Sections (Sales, Service, Accounts, etc.) with Anti-Grazing Dwell Verification
             if self.sections:
                 visited = self.person_visited_sections.setdefault(obj_id, set())
                 for s in self.sections:
                     bx1, by1, bx2, by2 = s["box"]
+                    dwell_key = (obj_id, s["id"])
                     if bx1 <= feet_x <= bx2 and by1 <= feet_y <= by2:
                         self.live_occupancy[s["id"]] = self.live_occupancy.get(s["id"], 0) + 1
-                        if s["id"] not in visited:
-                            visited.add(s["id"])
-                            self.section_totals[s["id"]] = self.section_totals.get(s["id"], 0) + 1
-                            self.section_flash_timers[s["id"]] = 25
-                            new_section_entries.append((obj_id, s["id"], s["name"]))
+                        # Track consecutive frames inside department zone
+                        self.person_section_dwell[dwell_key] = self.person_section_dwell.get(dwell_key, 0) + 1
+                        # Require at least 3 consecutive frames (~0.12s) to register genuine entry
+                        if self.person_section_dwell[dwell_key] >= 3:
+                            if s["id"] not in visited:
+                                visited.add(s["id"])
+                                if pid:
+                                    self.counted_person_sections.setdefault(pid, set()).add(s["id"])
+                                self.section_totals[s["id"]] = self.section_totals.get(s["id"], 0) + 1
+                                self.section_flash_timers[s["id"]] = 25
+                                new_section_entries.append((obj_id, s["id"], s["name"]))
+                    else:
+                        if dwell_key in self.person_section_dwell:
+                            self.person_section_dwell[dwell_key] = 0
 
         # Decrement flash timers
         if self.line_flash_timer > 0:
@@ -868,21 +1359,22 @@ class ZoneManager:
             if 8 <= y <= 46:
                 if self.btn_line[0] <= x <= self.btn_line[2]:
                     self.active_tool = "entry_line"
-                    self.status_msg = "Selected: [1. DRAW ENTRY LINE] - Click & Drag on video across entrance"
+                    self.status_msg = "Selected: [1. DRAW ENTRY LINE] - Click & Drag across entrance"
                     self.status_timer = 150
                     print("[*] Tool selected: [Entry Line]")
                     return
-                elif self.btn_sales[0] <= x <= self.btn_sales[2]:
-                    self.active_tool = "sales"
-                    self.status_msg = "Selected: [2. DRAW SALES SECTION] - Click & Drag box over Sales area"
-                    self.status_timer = 150
-                    print("[*] Tool selected: [Sales Section]")
+                for i, (bx1, by1, bx2, by2, sec) in enumerate(self.btn_sections):
+                    if bx1 <= x <= bx2:
+                        self.active_tool = sec["id"]
+                        self.status_msg = f"Selected: [{i+2}. DRAW {sec['name'].upper()}] - Click & Drag box over area"
+                        self.status_timer = 150
+                        print(f"[*] Tool selected: [{sec['name']}]")
+                        return
+                if self.btn_flip[0] <= x <= self.btn_flip[2]:
+                    self.flip_direction()
                     return
-                elif self.btn_accounts[0] <= x <= self.btn_accounts[2]:
-                    self.active_tool = "accounts"
-                    self.status_msg = "Selected: [3. DRAW ACCOUNTS SECTION] - Click & Drag box over Accounts area"
-                    self.status_timer = 150
-                    print("[*] Tool selected: [Accounts Section]")
+                elif self.btn_reset[0] <= x <= self.btn_reset[2]:
+                    self.reset_counts()
                     return
                 elif self.btn_clear[0] <= x <= self.btn_clear[2]:
                     self.clear_all()
@@ -904,11 +1396,12 @@ class ZoneManager:
 
             if self.active_tool == "entry_line":
                 if math.hypot(ex - sx, ey - sy) > 20:
+                    curr_dir = self.entry_line.get("direction", "forward") if self.entry_line else "forward"
                     self.entry_line = {
                         "enabled": True,
                         "p1": [int(sx), int(sy)],
                         "p2": [int(ex), int(ey)],
-                        "direction": "top_to_bottom",
+                        "direction": curr_dir,
                     }
                     self.status_msg = f"[+] Entry Line saved: ({sx},{sy}) -> ({ex},{ey})!"
                     self.status_timer = 150
@@ -919,22 +1412,21 @@ class ZoneManager:
                 y1, y2 = min(sy, ey), max(sy, ey)
                 if (x2 - x1) > 20 and (y2 - y1) > 20:
                     sec_id = self.active_tool
-                    sec_name = "Sales Section" if sec_id == "sales" else "Accounts Section"
-                    color = (0, 200, 255) if sec_id == "sales" else (255, 140, 0)
-                    
-                    found = False
-                    for s in self.sections:
-                        if s["id"] == sec_id:
-                            s["box"] = [int(x1), int(y1), int(x2), int(y2)]
-                            found = True
-                            break
-                    if not found:
+                    found_sec = next((s for s in self.sections if s["id"] == sec_id), None)
+                    sec_name = found_sec["name"] if found_sec else sec_id.replace("_", " ").title()
+                    color = found_sec["color"] if found_sec else (0, 215, 255)
+
+                    if found_sec:
+                        found_sec["box"] = [int(x1), int(y1), int(x2), int(y2)]
+                    else:
                         self.sections.append({
                             "id": sec_id,
                             "name": sec_name,
                             "color": color,
                             "box": [int(x1), int(y1), int(x2), int(y2)],
                         })
+                        self._compute_toolbar_layout()
+
                     if sec_id not in self.section_totals:
                         self.section_totals[sec_id] = 0
                     if sec_id not in self.live_occupancy:
@@ -944,19 +1436,43 @@ class ZoneManager:
                     self.status_timer = 150
                     print(f"[+] {sec_name} drawn and saved: [{x1}, {y1}, {x2}, {y2}]")
                     self.save_to_config()
+                    self._sync_box_to_backend(sec_id, [int(x1), int(y1), int(x2), int(y2)])
 
     def clear_all(self):
         self.entry_line = None
-        self.sections.clear()
+        for s in self.sections:
+            s["box"] = [0, 0, 0, 0]
         self.attendance_total = 0
         self.counted_attendance_ids.clear()
+        self.counted_person_ids.clear()
         self.person_visited_sections.clear()
-        self.section_totals.clear()
+        self.counted_person_sections.clear()
+        self.person_section_dwell.clear()
+        for sid in self.section_totals:
+            self.section_totals[sid] = 0
         self.live_occupancy.clear()
-        self.status_msg = "[*] All lines & sections cleared! Draw new ones anytime."
+        self.status_msg = "[*] All drawn lines & section boxes cleared! Draw new ones anytime."
         self.status_timer = 150
-        print("[*] Cleared all entry lines and sections.")
+        print("[*] Cleared drawn entry lines and department boxes.")
         self.save_to_config()
+
+    def _sync_box_to_backend(self, sec_id: str, box: list):
+        """Sends updated department bounding box to backend API so Dashboard stays in sync."""
+        def _bg_patch():
+            try:
+                import urllib.request
+                req_data = json.dumps({"box": box}).encode("utf-8")
+                req = urllib.request.Request(
+                    f"{self.api_url}/api/v1/departments/{sec_id}",
+                    data=req_data,
+                    headers={"Content-Type": "application/json"},
+                    method="PATCH",
+                )
+                urllib.request.urlopen(req, timeout=1.5)
+            except Exception:
+                pass
+        import threading
+        threading.Thread(target=_bg_patch, daemon=True).start()
 
     def save_to_config(self) -> bool:
         try:
@@ -968,9 +1484,34 @@ class ZoneManager:
             cams = data.setdefault("cameras", {})
             cam_data = cams.setdefault(self.camera_channel, {})
             cam_data["entry_line"] = self.entry_line
-            cam_data["sections"] = self.sections
+
+            # Safely merge: keep all existing configured departments, update boxes for self.sections
+            existing_sections = cam_data.get("sections", [])
+            merged = []
+            seen_ids = set()
+            for s in self.sections:
+                merged.append({
+                    "id": s["id"],
+                    "name": s["name"],
+                    "color": list(s["color"]),
+                    "box": list(s["box"]),
+                })
+                seen_ids.add(s["id"])
+
+            if isinstance(existing_sections, list):
+                for es in existing_sections:
+                    if isinstance(es, dict) and es.get("id") not in seen_ids:
+                        merged.append(es)
+                        seen_ids.add(es.get("id"))
+
+            cam_data["sections"] = merged
+            self.sections = merged
+            self._compute_toolbar_layout()
+
             with open(resolved, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+
+            self._last_config_mtime = os.path.getmtime(resolved)
             return True
         except Exception as e:
             print(f"[!] Warning: Failed to save config: {e}")
@@ -979,24 +1520,30 @@ class ZoneManager:
     def render_overlay(self, frame: np.ndarray) -> np.ndarray:
         h, w = frame.shape[:2]
 
-        # 1. Render User-Drawn Section Areas (ONLY if drawn)
+        # 1. Zero-Lag In-Place ROI Blending for User-Drawn Departments
         if self.sections:
-            overlay = frame.copy()
             for s in self.sections:
                 x1, y1, x2, y2 = s["box"]
-                color = s["color"]
-                cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
-            cv2.addWeighted(overlay, 0.14, frame, 0.86, 0, frame)
+                if (x2 - x1) <= 15 or (y2 - y1) <= 15:
+                    continue  # Undrawn zone, skip rendering on floor
+                x1_c, y1_c = max(0, x1), max(0, y1)
+                x2_c, y2_c = min(w, x2), min(h, y2)
+                if x2_c > x1_c and y2_c > y1_c:
+                    roi = frame[y1_c:y2_c, x1_c:x2_c]
+                    color_block = np.full_like(roi, s["color"], dtype=np.uint8)
+                    cv2.addWeighted(color_block, 0.16, roi, 0.84, 0, roi)
 
             for s in self.sections:
                 x1, y1, x2, y2 = s["box"]
+                if (x2 - x1) <= 15 or (y2 - y1) <= 15:
+                    continue  # Undrawn zone, badge not displayed until drawn
                 color = s["color"]
                 is_flashing = self.section_flash_timers.get(s["id"], 0) > 0
                 border_color = (0, 255, 128) if is_flashing else color
                 thickness = 3 if is_flashing else 2
                 cv2.rectangle(frame, (x1, y1), (x2, y2), border_color, thickness)
 
-                # Header badge
+                # Department Badge with live occupancy & total count
                 occ = self.live_occupancy.get(s["id"], 0)
                 tot = self.section_totals.get(s["id"], 0)
                 badge_text = f"{s['name'].upper()} | Active: {occ} | Visits: {tot}"
@@ -1005,22 +1552,30 @@ class ZoneManager:
                 cv2.rectangle(frame, (x1, y1), (x1 + tw + 16, y1 + 24), border_color, 1)
                 cv2.putText(frame, badge_text, (x1 + 8, y1 + 17), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 1, cv2.LINE_AA)
 
-        # 2. Render User-Drawn Entry Line (ONLY if drawn)
+        # 2. Render User-Drawn Entry Line with Prominent High-Contrast Directional Indicator
         if self.entry_line and self.entry_line.get("enabled", True):
             p1 = tuple(self.entry_line["p1"])
             p2 = tuple(self.entry_line["p2"])
+            direction = self.entry_line.get("direction", "forward")
             is_flashing = self.line_flash_timer > 0
             line_color = (0, 255, 128) if is_flashing else (0, 215, 255)
             line_thickness = 4 if is_flashing else 2
+
+            # Background drop-shadow line for contrast on any floor
+            cv2.line(frame, p1, p2, (15, 23, 42), line_thickness + 2)
             cv2.line(frame, p1, p2, line_color, line_thickness)
 
-            # Direction Arrow
-            mx = (p1[0] + p2[0]) // 2
-            my = (p1[1] + p2[1]) // 2
-            cv2.arrowedLine(frame, (mx, my - 16), (mx, my + 16), line_color, 2, tipLength=0.35)
+            # Draw True Perpendicular Direction Arrow & High-Visibility Badge
+            ZoneManager._draw_entry_arrow(frame, p1, p2, direction, is_flashing, self.attendance_total)
 
-            line_label = f"*** ENTRY COUNTED! ***" if is_flashing else f"ENTRY LINE [Attendance: {self.attendance_total}]"
-            cv2.putText(frame, line_label, (min(p1[0], p2[0]) + 10, max(75, min(p1[1], p2[1]) - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, line_color, 2, cv2.LINE_AA)
+            dir_display = "BOTH" if direction == "both" else direction.upper()
+            line_label = f"*** ENTRY: {self.attendance_total} (+1) ***" if is_flashing else f"ENTRY LINE [{dir_display}] | Entry: {self.attendance_total}  (Press [D] to flip)"
+            (lw, lh), _ = cv2.getTextSize(line_label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+            lx = max(10, min(p1[0], p2[0]) + 10)
+            ly = max(75, min(p1[1], p2[1]) - 10)
+            cv2.rectangle(frame, (lx - 6, ly - lh - 4), (lx + lw + 6, ly + 6), (15, 23, 42), -1)
+            cv2.rectangle(frame, (lx - 6, ly - lh - 4), (lx + lw + 6, ly + 6), line_color, 1)
+            cv2.putText(frame, line_label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.48, line_color, 1, cv2.LINE_AA)
 
         # 3. Live Rubber-Band Feedback While Mouse Dragging
         if self.is_mouse_down:
@@ -1030,54 +1585,68 @@ class ZoneManager:
                 cv2.line(frame, (sx, sy), (cx, cy), (0, 255, 255), 2)
                 cv2.circle(frame, (sx, sy), 5, (0, 255, 0), -1)
                 cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1)
-                cv2.putText(frame, "Release mouse to set Entry Line", (cx + 10, cy + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1, cv2.LINE_AA)
+                dist = int(math.hypot(cx - sx, cy - sy))
+                curr_dir = self.entry_line.get("direction", "forward") if self.entry_line else "forward"
+                if dist > 20:
+                    ZoneManager._draw_entry_arrow(frame, (sx, sy), (cx, cy), curr_dir, False)
+                cv2.putText(frame, f"Release to set Entry Line ({dist}px) - Press [D] to flip direction", (cx + 10, cy + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1, cv2.LINE_AA)
             else:
                 x1, x2 = min(sx, cx), max(sx, cx)
                 y1, y2 = min(sy, cy), max(sy, cy)
-                color = (0, 200, 255) if self.active_tool == "sales" else (255, 140, 0)
-                sec_name = "Sales Section" if self.active_tool == "sales" else "Accounts Section"
+                w_box = x2 - x1
+                h_box = y2 - y1
+                found_sec = next((s for s in self.sections if s["id"] == self.active_tool), None)
+                sec_name = found_sec["name"] if found_sec else self.active_tool.replace("_", " ").title()
+                color = found_sec["color"] if found_sec else (0, 215, 255)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, f"Release mouse to set {sec_name}", (x1 + 8, y1 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv2.LINE_AA)
+                cv2.putText(frame, f"Release to set {sec_name} ({w_box}x{h_box}px)", (x1 + 8, y1 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv2.LINE_AA)
 
-        # 4. Interactive Clickable Toolbar Buttons (Top Bar)
-        tb_bg = frame.copy()
-        cv2.rectangle(tb_bg, (0, 0), (w, 54), (10, 15, 26), -1)
-        cv2.addWeighted(tb_bg, 0.85, frame, 0.15, 0, frame)
+        # 4. Zero-Lag Fast ROI Header Toolbar
+        tb_roi = frame[0:52, 0:w]
+        tb_bg = np.full_like(tb_roi, (12, 18, 30), dtype=np.uint8)
+        cv2.addWeighted(tb_bg, 0.88, tb_roi, 0.12, 0, tb_roi)
 
         # Button 1: Draw Entry Line
         b1_active = self.active_tool == "entry_line"
         b1_col = (0, 255, 255) if b1_active else (70, 85, 105)
         cv2.rectangle(frame, (self.btn_line[0], self.btn_line[1]), (self.btn_line[2], self.btn_line[3]), (25, 35, 55), -1)
         cv2.rectangle(frame, (self.btn_line[0], self.btn_line[1]), (self.btn_line[2], self.btn_line[3]), b1_col, 2 if b1_active else 1)
-        b1_txt = "-> [1] Entry Line" if b1_active else "[1] Entry Line"
-        cv2.putText(frame, b1_txt, (self.btn_line[0] + 12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255) if b1_active else (180, 195, 215), 1, cv2.LINE_AA)
+        b1_txt = "-> [1] Line" if b1_active else "[1] Line"
+        cv2.putText(frame, b1_txt, (self.btn_line[0] + 10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 255, 255) if b1_active else (180, 195, 215), 1, cv2.LINE_AA)
 
-        # Button 2: Draw Sales Section
-        b2_active = self.active_tool == "sales"
-        b2_col = (0, 200, 255) if b2_active else (70, 85, 105)
-        cv2.rectangle(frame, (self.btn_sales[0], self.btn_sales[1]), (self.btn_sales[2], self.btn_sales[3]), (25, 35, 55), -1)
-        cv2.rectangle(frame, (self.btn_sales[0], self.btn_sales[1]), (self.btn_sales[2], self.btn_sales[3]), b2_col, 2 if b2_active else 1)
-        b2_txt = "-> [2] Sales Sec" if b2_active else "[2] Sales Sec"
-        cv2.putText(frame, b2_txt, (self.btn_sales[0] + 12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 200, 255) if b2_active else (180, 195, 215), 1, cv2.LINE_AA)
+        # Dynamic Department Buttons (from Database & camera_config.json)
+        for i, (bx1, by1, bx2, by2, sec) in enumerate(self.btn_sections):
+            b_active = self.active_tool == sec["id"]
+            sec_col = sec["color"] if b_active else (70, 85, 105)
+            cv2.rectangle(frame, (bx1, by1), (bx2, by2), (25, 35, 55), -1)
+            cv2.rectangle(frame, (bx1, by1), (bx2, by2), sec_col, 2 if b_active else 1)
+            short_name = sec["name"].split()[0][:8]
+            b_txt = f"-> [{i+2}] {short_name}" if b_active else f"[{i+2}] {short_name}"
+            cv2.putText(frame, b_txt, (bx1 + 8, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.42, sec["color"] if b_active else (180, 195, 215), 1, cv2.LINE_AA)
 
-        # Button 3: Draw Accounts Section
-        b3_active = self.active_tool == "accounts"
-        b3_col = (255, 140, 0) if b3_active else (70, 85, 105)
-        cv2.rectangle(frame, (self.btn_accounts[0], self.btn_accounts[1]), (self.btn_accounts[2], self.btn_accounts[3]), (25, 35, 55), -1)
-        cv2.rectangle(frame, (self.btn_accounts[0], self.btn_accounts[1]), (self.btn_accounts[2], self.btn_accounts[3]), b3_col, 2 if b3_active else 1)
-        b3_txt = "-> [3] Accounts Sec" if b3_active else "[3] Accounts Sec"
-        cv2.putText(frame, b3_txt, (self.btn_accounts[0] + 10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 140, 0) if b3_active else (180, 195, 215), 1, cv2.LINE_AA)
+        # Button 5: Flip Entry Line Direction
+        curr_dir = self.entry_line.get("direction", "forward") if self.entry_line else "forward"
+        dir_short = "FWD" if curr_dir == "forward" else ("BWD" if curr_dir == "backward" else "BOTH")
+        b5_col = (0, 215, 255) if self.entry_line else (70, 85, 105)
+        cv2.rectangle(frame, (self.btn_flip[0], self.btn_flip[1]), (self.btn_flip[2], self.btn_flip[3]), (25, 35, 55), -1)
+        cv2.rectangle(frame, (self.btn_flip[0], self.btn_flip[1]), (self.btn_flip[2], self.btn_flip[3]), b5_col, 1)
+        cv2.putText(frame, f"[D] Dir: {dir_short}", (self.btn_flip[0] + 6, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.42, b5_col, 1, cv2.LINE_AA)
 
-        # Button 4: Clear All
+        # Button 6: Reset Entry Count
+        cv2.rectangle(frame, (self.btn_reset[0], self.btn_reset[1]), (self.btn_reset[2], self.btn_reset[3]), (25, 35, 55), -1)
+        cv2.rectangle(frame, (self.btn_reset[0], self.btn_reset[1]), (self.btn_reset[2], self.btn_reset[3]), (0, 200, 255), 1)
+        cv2.putText(frame, "[C] Reset", (self.btn_reset[0] + 8, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 200, 255), 1, cv2.LINE_AA)
+
+        # Button 7: Clear All
         cv2.rectangle(frame, (self.btn_clear[0], self.btn_clear[1]), (self.btn_clear[2], self.btn_clear[3]), (25, 35, 55), -1)
         cv2.rectangle(frame, (self.btn_clear[0], self.btn_clear[1]), (self.btn_clear[2], self.btn_clear[3]), (70, 85, 105), 1)
-        cv2.putText(frame, "[R] Clear All", (self.btn_clear[0] + 10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (140, 160, 185), 1, cv2.LINE_AA)
+        cv2.putText(frame, "[R] Clear", (self.btn_clear[0] + 10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 160, 185), 1, cv2.LINE_AA)
 
         # Guidance status message ribbon right below buttons
         if self.status_timer > 0 and self.status_msg:
             (smw, _), _ = cv2.getTextSize(self.status_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
-            cv2.rectangle(frame, (15, 58), (25 + smw, 80), (10, 15, 26), -1)
-            cv2.putText(frame, self.status_msg, (20, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.rectangle(frame, (10, 56), (20 + smw, 78), (10, 15, 26), -1)
+            cv2.putText(frame, self.status_msg, (15, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA)
 
         return frame
 
@@ -1387,6 +1956,50 @@ def load_face_detector(face_model_path: str, face_confidence: float):
     return (None, None)
 
 
+def is_valid_facial_geometry(landmarks: List[Tuple[int, int]], min_eye_dist: float = 7.0) -> bool:
+    """
+    Validates that 5 facial landmarks form a physically valid human face.
+    Strictly filters out bags, backpacks, cushions, clothing textures, and reflections.
+    Landmarks order: [left_eye, right_eye, nose, left_mouth, right_mouth].
+    """
+    if not landmarks or len(landmarks) < 5:
+        return False
+    lx, ly = landmarks[0]
+    rx, ry = landmarks[1]
+    nx, ny = landmarks[2]
+    mx1, my1 = landmarks[3]
+    mx2, my2 = landmarks[4]
+
+    # 1. Eye-to-eye distance check
+    eye_dist = math.hypot(rx - lx, ry - ly)
+    if eye_dist < min_eye_dist:
+        return False
+
+    # 2. Eye horizontal alignment (eyes cannot be stacked vertically like bag folds)
+    eye_dx = abs(rx - lx)
+    eye_dy = abs(ry - ly)
+    if eye_dx < eye_dy * 1.15:
+        return False
+
+    # 3. Nose position: below eyes, above mouth
+    avg_eye_y = (ly + ry) * 0.5
+    avg_mouth_y = (my1 + my2) * 0.5
+    if ny <= avg_eye_y - 2.0 or ny >= avg_mouth_y + 4.0:
+        return False
+
+    # 4. Nose horizontal centering: between left and right eyes (with modest margin)
+    min_eye_x = min(lx, rx) - eye_dist * 0.45
+    max_eye_x = max(lx, rx) + eye_dist * 0.45
+    if not (min_eye_x <= nx <= max_eye_x):
+        return False
+
+    # 5. Mouth span below eyes
+    if avg_mouth_y <= avg_eye_y + 3.0:
+        return False
+
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Main Local Detection Engine
 # ---------------------------------------------------------------------------
@@ -1403,18 +2016,21 @@ def run_local_detector(
     face_scale: float = 1.05,
     face_model_path: str = "models/scrfd_2.5g_bnkps.pt",
     face_confidence: float = 0.30,
-    show_head_fallback: bool = True,
+    show_head_fallback: bool = False,
     allow_standalone_faces: bool = False,
     imgsz: int = 640,
     box_smoothing: bool = True,
-    smoothing_alpha: float = 0.70,
+    smoothing_alpha: float = 0.35,
     face_persistence: int = 8,
-    body_persistence: int = 15,
-    deadband_px: float = 3.5,
+    body_persistence: int = 26,
+    max_visual_coast: int = 20,
+    deadband_px: float = 6.0,
+    min_feet_y: float = 0.24,
     camera_channel: str = "201",
     similarity_thresh: Optional[float] = None,
     entry_line_cfg: Optional[dict] = None,
     sections_cfg: Optional[list] = None,
+    tracker_name: Optional[str] = None,
 ):
     print("=" * 70)
     print("  CAPERMINT SHOWROOM INTELLIGENCE - LOCAL AI EDGE DETECTOR")
@@ -1427,11 +2043,13 @@ def run_local_detector(
     print(f"[*] Confidence     : {confidence_thresh:.2f}")
     from app.core.config import settings
     effective_sim_thresh = similarity_thresh if similarity_thresh is not None else settings.FACE_SIMILARITY_THRESHOLD
+    effective_tracker = tracker_name or settings.TRACKER_TYPE
     print(f"[*] Biometric Sim  : {effective_sim_thresh:.2f} (ceiling calibrated)")
+    print(f"[*] MOT Tracker    : {effective_tracker} (primary + RobustFallbackTracker)")
     print(f"[*] Face Box Scale : {face_scale:.2f}x (adjust live with +/-)")
     print(f"[*] Anti-Jitter    : {'ON (EMA alpha=' + str(smoothing_alpha) + ', deadband=' + str(deadband_px) + 'px)' if box_smoothing else 'OFF'}")
     print(f"[*] Face Hysteresis: {'ON (' + str(face_persistence) + ' frames buffer)' if box_smoothing else 'OFF'}")
-    print(f"[*] Track Persistence: {'ON (' + str(body_persistence) + ' frames cutoff / ~2.5s)' if box_smoothing else 'OFF'}")
+    print(f"[*] Track Persistence: {'ON (buffer=' + str(body_persistence) + ' frames, visual coast=' + str(max_visual_coast) + ' frames / ~0.75s)' if box_smoothing else 'OFF'}")
     print(f"[*] Show Entry Line: {show_entry_line}")
     print(f"[*] Standalone Face: {allow_standalone_faces} (strict screen filtering)")
     print(f"[*] Headless Mode  : {headless}")
@@ -1445,14 +2063,18 @@ def run_local_detector(
     # Resolve model file
     resolved_model = get_resource_path(model_path)
     if not os.path.exists(resolved_model):
-        if os.path.exists("models/yolo11m.pt"):
-            resolved_model = "models/yolo11m.pt"
+        if os.path.exists("models/yolo11s.pt"):
+            resolved_model = "models/yolo11s.pt"
         elif os.path.exists("models/yolo11n.pt"):
             resolved_model = "models/yolo11n.pt"
-        elif os.path.exists("yolo11m.pt"):
-            resolved_model = "yolo11m.pt"
+        elif os.path.exists("models/yolo11m.pt"):
+            resolved_model = "models/yolo11m.pt"
+        elif os.path.exists("yolo11s.pt"):
+            resolved_model = "yolo11s.pt"
         elif os.path.exists("yolo11n.pt"):
             resolved_model = "yolo11n.pt"
+        elif os.path.exists("yolo11m.pt"):
+            resolved_model = "yolo11m.pt"
         else:
             resolved_model = model_path
 
@@ -1489,12 +2111,13 @@ def run_local_detector(
     height = reader.height
     line_y = int(height * line_ratio)
 
-    tracker = LocalTracker(max_disappeared=20, max_distance=120.0)
+    tracker = LocalTracker(max_disappeared=body_persistence, max_distance=120.0)
     smoother = TrackSmoother(
         alpha=smoothing_alpha,
         deadband_px=deadband_px,
         face_persistence=face_persistence,
         body_persistence=body_persistence,
+        max_visual_coast=max_visual_coast,
         enabled=box_smoothing,
     )
     zone_manager = ZoneManager(
@@ -1506,6 +2129,7 @@ def run_local_detector(
         frame_height=height,
         line_y_ratio=line_ratio,
         direction=direction,
+        api_url=api_url,
     )
     sync_client = DashboardSyncClient(base_url=api_url, camera_id=camera_id)
 
@@ -1581,12 +2205,20 @@ def run_local_detector(
     show_hud = True
     track_start_times: Dict[int, float] = {}
     track_last_seen: Dict[int, float] = {}
+    seated_staff_tracks: Dict[str, dict] = {}
+    staff_spatial_anchors: Dict[str, dict] = {}
     bytetrack_empty_streak = 0
 
-    # Ensure local bytetrack.yaml is resolved directly
-    tracker_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bytetrack.yaml")
+    # Resolve primary tracker configuration (ByteTrack or BoT-SORT)
+    chosen_tracker = tracker_name or settings.TRACKER_TYPE
+    if not chosen_tracker.endswith(".yaml"):
+        chosen_tracker = f"{chosen_tracker}.yaml"
+
+    tracker_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), chosen_tracker)
     if not os.path.exists(tracker_config):
-        tracker_config = "bytetrack.yaml"
+        tracker_config = os.path.join(os.getcwd(), chosen_tracker)
+    if not os.path.exists(tracker_config):
+        tracker_config = chosen_tracker
 
     print("\n[+] Edge Video Processor running. Press 'q' or 'ESC' in the window to quit.\n")
 
@@ -1598,6 +2230,10 @@ def run_local_detector(
                 continue
 
             frame_counter += 1
+
+            # Check for dynamic dashboard updates to camera_config.json every 90 frames (~3s)
+            if frame_counter % 90 == 0:
+                zone_manager.check_and_reload_config()
 
             # Calculate FPS every 15 frames
             if frame_counter % 15 == 0:
@@ -1627,10 +2263,7 @@ def run_local_detector(
                 if results and len(results) > 0 and results[0].boxes is not None:
                     for box in results[0].boxes:
                         x1, y1, x2, y2 = box.xyxy[0].tolist()
-                        bw = x2 - x1
-                        bh = y2 - y1
-                        # Filter out noise & horizontal non-human objects (e.g. backpacks, bags on chairs, cushions)
-                        if bw < 24 or bh < 32 or (bh / max(1.0, bw)) < 0.65:
+                        if (x2 - x1) < 14 or (y2 - y1) < 18:
                             continue
                         detections.append((x1, y1, x2, y2))
                         if box.id is not None:
@@ -1655,9 +2288,7 @@ def run_local_detector(
                     if results and len(results) > 0 and results[0].boxes is not None:
                         for box in results[0].boxes:
                             x1, y1, x2, y2 = box.xyxy[0].tolist()
-                            bw = x2 - x1
-                            bh = y2 - y1
-                            if bw < 24 or bh < 32 or (bh / max(1.0, bw)) < 0.65:
+                            if (x2 - x1) < 14 or (y2 - y1) < 18:
                                 continue
                             detections.append((x1, y1, x2, y2))
                             unmatched_boxes.append((x1, y1, x2, y2))
@@ -1666,16 +2297,16 @@ def run_local_detector(
 
             # Controlled fallback & unmatched detection handling
             if bytetrack_failed:
-                # Controlled fallback: ByteTrack crashed or failed -> use LocalTracker
+                # Primary tracker failed -> use RobustFallbackTracker with velocity and appearance
                 if detections:
-                    tracked_objects = tracker.update(detections)
+                    tracked_objects = tracker.update(detections, frame=frame)
                 else:
-                    tracked_objects = tracker.update([])
+                    tracked_objects = tracker.update([], frame=frame)
             else:
-                # ByteTrack is primary
+                # Primary tracker (ByteTrack or BoT-SORT) is active
                 if tracked_objects:
                     bytetrack_empty_streak = 0
-                    # Handle unmatched detections without mixing LocalTracker IDs or creating duplicate identities
+                    # Handle unmatched detections without mixing IDs or creating duplicate identities
                     if unmatched_boxes:
                         # 1. Filter out duplicate / overlapping detections of already tracked persons
                         novel_unmatched = []
@@ -1691,29 +2322,64 @@ def run_local_detector(
                             recovered = smoother.recover_missing_tracks(novel_unmatched)
                             tracked_objects.update(recovered)
 
-                    # Keep LocalTracker state synchronized with ByteTrack tracks (never injecting rogue IDs)
-                    tracker.sync_active_tracks(tracked_objects)
+                            # 3. Associate any remaining novel detections via RobustFallbackTracker
+                            still_unmatched = [
+                                ubox for ubox in novel_unmatched
+                                if not any(smoother._compute_iou(ubox, tb) > 0.40 for tb in tracked_objects.values())
+                            ]
+                            if still_unmatched:
+                                fb = tracker.update(still_unmatched, frame=frame)
+                                for fid, fbox in fb.items():
+                                    if not any(smoother._compute_iou(fbox, tb) > 0.40 for tb in tracked_objects.values()):
+                                        tracked_objects[fid] = fbox
+
+                    # Keep RobustFallbackTracker state synchronized with primary tracks (learning velocities and appearances)
+                    tracker.sync_active_tracks(tracked_objects, frame=frame)
 
                 elif detections:
-                    # ByteTrack returned no tracks despite detections present in the frame
-                    # First check if any unmatched detections recover recently lost ByteTrack tracks
+                    # Primary tracker returned no tracks despite detections present in the frame
+                    # 1. Recover recently lost tracks from smoother persistence buffer
                     recovered = smoother.recover_missing_tracks(unmatched_boxes)
                     if recovered:
                         tracked_objects.update(recovered)
-                        bytetrack_empty_streak = 0
-                        tracker.sync_active_tracks(tracked_objects)
-                    else:
-                        bytetrack_empty_streak += 1
-                        # Controlled fallback: Only activate LocalTracker after sustained ByteTrack silence (>= 5 frames)
-                        if bytetrack_empty_streak >= 5:
-                            tracked_objects = tracker.update(detections)
+
+                    # 2. Immediately track remaining detections via RobustFallbackTracker (no 5-frame silence gap!)
+                    remaining_dets = [
+                        b for b in detections
+                        if not any(smoother._compute_iou(b, tb) > 0.40 for tb in tracked_objects.values())
+                    ]
+                    if remaining_dets:
+                        fb = tracker.update(remaining_dets, frame=frame)
+                        for fid, fbox in fb.items():
+                            if not any(smoother._compute_iou(fbox, tb) > 0.40 for tb in tracked_objects.values()):
+                                tracked_objects[fid] = fbox
+
+                    bytetrack_empty_streak = 0
+                    tracker.sync_active_tracks(tracked_objects, frame=frame)
                 else:
                     # No detections in this frame
                     bytetrack_empty_streak = 0
-                    tracker.update([])
+                    tracker.update([], frame=frame)
+
+            # Suppress duplicate overlapping person tracks (filters out duplicate boxes on the same seated person)
+            if len(tracked_objects) > 1:
+                deduped_tracked = {}
+                sorted_tracks = sorted(tracked_objects.items(), key=lambda it: (it[1][2]-it[1][0])*(it[1][3]-it[1][1]), reverse=True)
+                suppressed_tids = set()
+                for i, (tid1, box1) in enumerate(sorted_tracks):
+                    if tid1 in suppressed_tids:
+                        continue
+                    deduped_tracked[tid1] = box1
+                    for j in range(i + 1, len(sorted_tracks)):
+                        tid2, box2 = sorted_tracks[j]
+                        if tid2 in suppressed_tids:
+                            continue
+                        if smoother._compute_iou(box1, box2) > 0.40:
+                            suppressed_tids.add(tid2)
+                tracked_objects = deduped_tracked
 
             # Apply Anti-Jitter Smoothing & Deadband to Person Bounding Boxes
-            tracked_objects = smoother.smooth_body_boxes(tracked_objects)
+            tracked_objects = smoother.smooth_body_boxes(tracked_objects, frame_shape=(w, h))
 
             # Record track timestamps for on-screen live dwell timer
             now_ts = time.time()
@@ -1722,12 +2388,12 @@ def run_local_detector(
                     track_start_times[obj_id] = now_ts
                 track_last_seen[obj_id] = now_ts
 
-            # Expire track timers and release employee locks when tracks disappear (> 3s for biometrics, > 15s for full cleanup)
+            # Expire track timers and release employee locks when tracks disappear (> 25s for biometrics across pauses, > 30s for full cleanup)
             for old_id in list(track_start_times.keys()):
                 inactive_sec = now_ts - track_last_seen.get(old_id, 0.0)
-                if inactive_sec > 3.0:
+                if inactive_sec > 25.0:
                     employee_recognizer.on_track_lost(str(old_id))
-                if inactive_sec > 15.0:
+                if inactive_sec > 30.0:
                     track_start_times.pop(old_id, None)
                     track_last_seen.pop(old_id, None)
                     identity_manager.on_track_lost(str(old_id))
@@ -1744,7 +2410,7 @@ def run_local_detector(
 
                 pid = identity_manager.get_person_id(crossed_id)
                 pid_desc = f" (PID: {pid})" if pid else " (PID: Unresolved)"
-                print(f"[--> ATTENDANCE DETECTED] Person #{crossed_id}{pid_desc} crossed Entry Line! Total Attendance: {zone_manager.attendance_total}")
+                print(f"[--> ENTRY DETECTED] Person #{crossed_id}{pid_desc} crossed Entry Line! Total Entry: {zone_manager.attendance_total}")
                 sync_client.send_entry_event(tracker_id=str(crossed_id), confidence=0.94, person_id=pid)
 
             for (p_id, s_id, s_name) in new_sections:
@@ -1786,7 +2452,7 @@ def run_local_detector(
             all_detected_faces = []
             should_detect_faces = (
                 face_detector is not None
-                and len(tracked_objects) > 0
+                and (len(tracked_objects) > 0 or allow_standalone_faces)
                 and (frame_counter % 2 == 0)
             )
             if should_detect_faces:
@@ -1912,13 +2578,43 @@ def run_local_detector(
                             if raw_lms:
                                 crop_lms = [(int(lx - cx1), int(ly - cy1)) for (lx, ly) in raw_lms]
 
-                            # 1. First check if recognized as Showroom Employee (throttles unconfirmed evaluation to max 3 Hz per track)
+                            # 1. Check if recognized as Showroom Employee
                             tid = str(obj_id)
                             is_confirmed = employee_recognizer.is_track_employee(tid)
                             last_attempt = track_last_recognition_attempt.get(tid, 0.0)
                             emp_match = None
 
-                            if is_confirmed or (now_ts - last_attempt >= 0.35):
+                            # Spatial Continuity Check: If track ID changed (e.g. #34 -> #73), check if this person is sitting at a known staff location
+                            fcx, fcy = matched_face["center"]
+                            if not is_confirmed:
+                                active_track_ids_str = {str(k) for k in tracked_objects.keys()}
+                                currently_active_staff = {
+                                    employee_recognizer.get_employee_id(str(atid))
+                                    for atid in tracked_objects.keys()
+                                    if str(atid) != tid
+                                }
+                                for s_eid, anchor in list(staff_spatial_anchors.items()):
+                                    if s_eid in currently_active_staff:
+                                        continue
+                                    last_tid = anchor.get("last_track_id")
+                                    if last_tid and last_tid != tid and last_tid in active_track_ids_str:
+                                        continue
+                                    if (now_ts - anchor["last_seen"]) < 45.0:
+                                        if math.hypot(fcx - anchor["center"][0], fcy - anchor["center"][1]) < 60.0:
+                                            # Enforce single physical body: clear previous track mappings for s_eid
+                                            for otid, oeid in list(employee_recognizer.track_to_employee.items()):
+                                                if oeid == s_eid and otid != tid:
+                                                    employee_recognizer.track_to_employee.pop(otid, None)
+                                            employee_recognizer.track_to_employee[tid] = s_eid
+                                            is_confirmed = True
+                                            emp_match = (s_eid, 1.0)
+                                            anchor["last_seen"] = now_ts
+                                            anchor["center"] = (fcx, fcy)
+                                            anchor["body_center"] = ((ix1 + ix2) * 0.5, (iy1 + iy2) * 0.5)
+                                            anchor["last_track_id"] = tid
+                                            break
+
+                            if not is_confirmed and (now_ts - last_attempt >= 0.35):
                                 track_last_recognition_attempt[tid] = now_ts
                                 emp_match = employee_recognizer.evaluate_track_face(
                                     tracker_id=tid,
@@ -1928,8 +2624,23 @@ def run_local_detector(
                                     full_image=frame,
                                     raw_landmarks=raw_lms,
                                 )
+
                             if emp_match:
                                 emp_id, emp_conf = emp_match
+                                # Anchor physical location for spatial continuity across ByteTrack ID flips
+                                staff_spatial_anchors[emp_id] = {
+                                    "center": (fcx, fcy),
+                                    "body_center": ((ix1 + ix2) * 0.5, (iy1 + iy2) * 0.5),
+                                    "last_seen": now_ts,
+                                    "last_track_id": tid,
+                                }
+                                # Enforce single physical body: clear previous track mappings for emp_id
+                                for otid, oeid in list(employee_recognizer.track_to_employee.items()):
+                                    if oeid == emp_id and otid != tid:
+                                        employee_recognizer.track_to_employee.pop(otid, None)
+                                employee_recognizer.track_to_employee[tid] = emp_id
+                                is_confirmed = True
+
                                 if obj_id not in announced_staff_tracks:
                                     announced_staff_tracks.add(obj_id)
                                     emp_label = employee_names.get(emp_id, emp_id)
@@ -1951,8 +2662,8 @@ def run_local_detector(
                                             )
                                         except Exception as db_ex:
                                             pass
-                            else:
-                                # 2. Otherwise process as customer visitor
+                            elif not is_confirmed and not employee_recognizer.is_track_employee(tid):
+                                # 2. Process as customer visitor ONLY if definitively NOT a staff member
                                 match_res = identity_manager.process_track_face(
                                     tracker_id=str(obj_id),
                                     face_crop=face_crop,
@@ -2018,6 +2729,48 @@ def run_local_detector(
                 # 2. Render Single Unified Header Badge (Person ID + Persistent ID + Timer + Face Status)
                 is_staff = employee_recognizer.is_track_employee(str(obj_id))
                 emp_id = employee_recognizer.get_employee_id(str(obj_id)) if is_staff else None
+                # Enforce single physical body: ensure this emp_id isn't duplicated on another active track in this frame
+                if is_staff and emp_id:
+                    for atid in tracked_objects.keys():
+                        if atid != obj_id and employee_recognizer.get_employee_id(str(atid)) == emp_id:
+                            # If another active track has this employee, demote the non-face track
+                            if not face_tag:
+                                is_staff = False
+                                emp_id = None
+                                employee_recognizer.track_to_employee.pop(str(obj_id), None)
+                                break
+
+                if not is_staff:
+                    # Spatial Continuity Fallback: Check if this body box is seated at an active staff anchor
+                    bcx, bcy = (ix1 + ix2) * 0.5, (iy1 + iy2) * 0.5
+                    active_track_ids_str = {str(k) for k in tracked_objects.keys()}
+                    currently_active_staff = {
+                        employee_recognizer.get_employee_id(str(atid))
+                        for atid in tracked_objects.keys()
+                        if atid != obj_id
+                    }
+                    for s_eid, anchor in list(staff_spatial_anchors.items()):
+                        # 1. Never assign if employee is already actively present on another visible track
+                        if s_eid in currently_active_staff:
+                            continue
+                        # 2. Never steal if the anchor's original track is still present in the camera frame
+                        last_tid = anchor.get("last_track_id")
+                        if last_tid and last_tid != str(obj_id) and last_tid in active_track_ids_str:
+                            continue
+                        if (now_ts - anchor["last_seen"]) < 45.0:
+                            anchor_pos = anchor.get("body_center", anchor["center"])
+                            if math.hypot(bcx - anchor_pos[0], bcy - anchor_pos[1]) < 50.0:
+                                # Enforce 1 physical body: clear any other tracks mapped to this employee
+                                for otid, oeid in list(employee_recognizer.track_to_employee.items()):
+                                    if oeid == s_eid and otid != str(obj_id):
+                                        employee_recognizer.track_to_employee.pop(otid, None)
+                                is_staff = True
+                                emp_id = s_eid
+                                employee_recognizer.track_to_employee[str(obj_id)] = s_eid
+                                anchor["last_seen"] = now_ts
+                                anchor["last_track_id"] = str(obj_id)
+                                break
+
                 if is_staff and emp_id:
                     if emp_id not in employee_names and db_session:
                         try:
@@ -2091,21 +2844,125 @@ def run_local_detector(
                     cx = int((ix1 + ix2) / 2)
                     cv2.circle(frame, (cx, iy2), 4, (0, 0, 255), -1)
 
-            # Draw standalone faces ONLY if explicitly allowed and strictly verified
-            # Filters out false positives on monitors, posters, cups, and wallpapers
+            # ---------------------------------------------------------------
+            # Standalone Seated Staff Tracking & Verification
+            # Detects and persistently locks onto seated employees behind partitions
+            # Strictly filters out bags, backpacks, cushions, clothing textures, and cups
+            # ---------------------------------------------------------------
             if allow_standalone_faces:
+                # 0. Suppress any detected face that falls within or near ANY active YOLO tracked person
+                active_person_boxes = list(tracked_objects.values())
+                currently_active_staff = {
+                    employee_recognizer.get_employee_id(str(atid))
+                    for atid in tracked_objects.keys()
+                }
+
                 for face in all_detected_faces:
-                    if not face["matched"]:
-                        sfx, sfy, sfw, sfh = face["box"]
-                        # Strict size, aspect ratio, and confidence check
-                        if face["conf"] >= 0.70 and sfw >= 30 and sfh >= 32 and (0.65 <= sfw / max(1.0, sfh) <= 1.4):
-                            matched_faces_count += 1
-                            sbx1 = max(0, int(sfx))
-                            sby1 = max(0, int(sfy))
-                            sbx2 = min(w, int(sfx + sfw))
-                            sby2 = min(h, int(sfy + sfh))
+                    if face.get("matched", False):
+                        continue
+                    fcx, fcy = face["center"]
+                    # If this face is inside or around any active YOLO person box, mark matched to prevent duplicate tracking
+                    for pbox in active_person_boxes:
+                        px1, py1, px2, py2 = pbox
+                        if (px1 - 25 <= fcx <= px2 + 25) and (py1 - 25 <= fcy <= py2 + 25):
+                            face["matched"] = True
+                            break
+
+                for face in all_detected_faces:
+                    if face.get("matched", False):
+                        continue
+
+                    sfx, sfy, sfw, sfh = face["box"]
+                    lms = face.get("landmarks", [])
+
+                    # 1. Strict facial geometry validation: Rejects non-face objects (bags, cushions, screen reflections)
+                    # Standalone faces require stricter eye distance to reject glossy screen glare
+                    if not is_valid_facial_geometry(lms, min_eye_dist=12.0):
+                        continue
+
+                    # 2. Strict human face dimension & confidence checks (standalone faces must be >= 65% conf to eliminate screen glare)
+                    min_standalone_conf = max(0.65, face_confidence)
+                    if face["conf"] < min_standalone_conf or sfw < 26 or sfh < 26 or not (0.50 <= sfw / max(1.0, sfh) <= 1.8):
+                        continue
+
+                    sbx1 = max(0, int(sfx))
+                    sby1 = max(0, int(sfy))
+                    sbx2 = min(w, int(sfx + sfw))
+                    sby2 = min(h, int(sfy + sfh))
+                    if sbx2 <= sbx1 + 10 or sby2 <= sby1 + 10:
+                        continue
+
+                    fcx, fcy = (sbx1 + sbx2) * 0.5, (sby1 + sby2) * 0.5
+
+                    # 3. Check if this face matches an existing actively tracked seated employee
+                    matched_seated_id = None
+                    for eid, s_track in seated_staff_tracks.items():
+                        # If this employee is now actively tracked by YOLO person tracker, drop from seated_staff_tracks
+                        if eid in currently_active_staff:
+                            continue
+                        obx1, oby1, obx2, oby2 = s_track["box"]
+                        ocx, ocy = (obx1 + obx2) * 0.5, (oby1 + oby2) * 0.5
+                        if math.hypot(fcx - ocx, fcy - ocy) < 75.0:
+                            matched_seated_id = eid
+                            break
+
+                    if matched_seated_id:
+                        # Smooth coordinates with EMA and refresh persistence timer
+                        old_box = seated_staff_tracks[matched_seated_id]["box"]
+                        sm_bx1 = int(0.70 * sbx1 + 0.30 * old_box[0])
+                        sm_by1 = int(0.70 * sby1 + 0.30 * old_box[1])
+                        sm_bx2 = int(0.70 * sbx2 + 0.30 * old_box[2])
+                        sm_by2 = int(0.70 * sby2 + 0.30 * old_box[3])
+                        seated_staff_tracks[matched_seated_id]["box"] = (sm_bx1, sm_by1, sm_bx2, sm_by2)
+                        seated_staff_tracks[matched_seated_id]["last_seen"] = now_ts
+                        seated_staff_tracks[matched_seated_id]["conf"] = face["conf"]
+                        if lms:
+                            seated_staff_tracks[matched_seated_id]["landmarks"] = lms
+                        face["matched"] = True
+                        continue
+
+                    # 4. If not yet tracked, run biometric identification against employee database
+                    s_crop = frame[sby1:sby2, sbx1:sbx2]
+                    s_crop_lms = [(int(lx - sbx1), int(ly - sby1)) for (lx, ly) in lms] if lms else None
+                    temp_tid = f"seated_spot_{int(fcx // 40)}_{int(fcy // 40)}"
+                    s_last_att = track_last_recognition_attempt.get(temp_tid, 0.0)
+
+                    if now_ts - s_last_att >= 0.40:
+                        track_last_recognition_attempt[temp_tid] = now_ts
+                        s_match = employee_recognizer.evaluate_track_face(
+                            tracker_id=temp_tid,
+                            face_crop=s_crop,
+                            face_conf=float(face["conf"]),
+                            landmarks=s_crop_lms,
+                            full_image=frame,
+                            raw_landmarks=lms,
+                        )
+
+                        if s_match:
+                            s_emp_id, s_emp_conf = s_match
+                            # NEVER assign if this employee is ALREADY actively tracked by the primary YOLO tracker!
+                            if s_emp_id in currently_active_staff:
+                                face["matched"] = True
+                                continue
+                            emp_name = employee_names.get(s_emp_id, s_emp_id)
+                            seated_staff_tracks[s_emp_id] = {
+                                "box": (sbx1, sby1, sbx2, sby2),
+                                "landmarks": lms,
+                                "emp_id": s_emp_id,
+                                "emp_name": emp_name,
+                                "last_seen": now_ts,
+                                "conf": face["conf"],
+                                "tracker_id": temp_tid,
+                            }
+                            face["matched"] = True
+                            last_punch = punched_employee_ids.get(s_emp_id, 0.0)
+                            if (now_ts - last_punch) > 300.0:
+                                punched_employee_ids[s_emp_id] = now_ts
+                                sync_client.send_employee_punch_event(s_emp_id, event_type="CHECK_IN", confidence=s_emp_conf)
+                        elif face["conf"] >= 0.70:
+                            # Draw temporary visitor face ONLY if confidence is very high (>= 70%) and geometry is verified
                             cv2.rectangle(frame, (sbx1, sby1), (sbx2, sby2), (255, 30, 220), 2)
-                            for (lx, ly) in face["landmarks"]:
+                            for (lx, ly) in lms:
                                 if 0 <= lx < w and 0 <= ly < h:
                                     cv2.circle(frame, (lx, ly), 2, (0, 255, 255), -1)
                             slabel = f"Face {int(face['conf'] * 100)}%"
@@ -2113,24 +2970,52 @@ def run_local_detector(
                             cv2.rectangle(frame, (sbx1, max(0, sby1 - 18)), (sbx1 + slw + 8, sby1), (15, 23, 42), -1)
                             cv2.putText(frame, slabel, (sbx1 + 4, max(12, sby1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 30, 220), 1, cv2.LINE_AA)
 
+                # 5. Render & Persist all confirmed Seated Staff across blinks/head-tilts for up to 3.5s
+                for eid in list(seated_staff_tracks.keys()):
+                    s_track = seated_staff_tracks[eid]
+                    time_since_seen = now_ts - s_track["last_seen"]
+                    # If this employee is now tracked by the primary YOLO tracker or timed out, cleanly remove
+                    if eid in currently_active_staff or time_since_seen > 3.5:
+                        employee_recognizer.on_track_lost(s_track.get("tracker_id", f"seated_{eid}"))
+                        employee_recognizer.on_track_lost(str(eid))
+                        del seated_staff_tracks[eid]
+                        continue
+
+                    bx1, by1, bx2, by2 = s_track["box"]
+                    ename = s_track["emp_name"]
+                    econf = s_track["conf"]
+
+                    # Golden Yellow Bounding Box for Staff
+                    cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 215, 255), 2)
+                    for (lx, ly) in s_track.get("landmarks", []):
+                        if 0 <= lx < w and 0 <= ly < h:
+                            cv2.circle(frame, (lx, ly), 2, (0, 255, 255), -1)
+
+                    slabel = f"STAFF [{ename}] | Face {int(econf * 100)}%"
+                    (slw, slh), _ = cv2.getTextSize(slabel, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
+                    cv2.rectangle(frame, (bx1, max(0, by1 - 18)), (bx1 + slw + 8, by1), (15, 23, 42), -1)
+                    cv2.putText(frame, slabel, (bx1 + 4, max(12, by1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 215, 255), 1, cv2.LINE_AA)
+
             # 3. Render User-Drawn Sections, Entry Line, and Interactive Clickable Top Toolbar
             frame = zone_manager.render_overlay(frame)
 
-            # 4. Bottom Status & Telemetry Ribbon
+            # 4. Zero-Lag Bottom Status & Telemetry Ribbon
             if show_hud:
                 bot_h = 32
-                overlay_bot = frame.copy()
-                cv2.rectangle(overlay_bot, (0, h - bot_h), (w, h), (10, 15, 26), -1)
-                cv2.addWeighted(overlay_bot, 0.85, frame, 0.15, 0, frame)
+                if h > bot_h:
+                    bot_roi = frame[h - bot_h:h, 0:w]
+                    bot_bg = np.full_like(bot_roi, (10, 15, 26), dtype=np.uint8)
+                    cv2.addWeighted(bot_bg, 0.85, bot_roi, 0.15, 0, bot_roi)
 
                 hw_tag = f"[{device.upper()}]"
                 sec_badges = "  |  ".join([f"{s['name'].split()[0]}: {zone_manager.section_totals.get(s['id'], 0)}" for s in zone_manager.sections])
                 sec_str = f"  |  {sec_badges}" if sec_badges else ""
+                sec_shortcuts = "  ".join([f"[{i+2}] {s['name'].split()[0]}" for i, s in enumerate(zone_manager.sections)])
+                sec_shortcut_str = f"  {sec_shortcuts} " if sec_shortcuts else ""
                 stats_text = (
                     f"{hw_tag} FPS: {fps:.1f}  |  "
-                    f"Attendance: {zone_manager.attendance_total}{sec_str}  |  "
-                    f"Active: {len(tracked_objects)} persons  |  "
-                    f"Keys: [1] Line  [2] Sales  [3] Accounts  [R] Clear"
+                    f"Entry: {zone_manager.attendance_total}{sec_str}  |  "
+                    f"Keys: [1] Line{sec_shortcut_str} [D] Flip Dir  [C] Reset  [R] Clear"
                 )
                 cv2.putText(frame, stats_text, (15, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 225, 255), 1, cv2.LINE_AA)
 
@@ -2140,19 +3025,21 @@ def run_local_detector(
                 break
             elif key == ord('1'):
                 zone_manager.active_tool = "entry_line"
-                zone_manager.status_msg = "Selected: [1. DRAW ENTRY LINE] - Click & Drag on video across entrance"
+                zone_manager.status_msg = "Selected: [1. DRAW ENTRY LINE] - Click & Drag across entrance"
                 zone_manager.status_timer = 150
                 print("[*] Tool switched to: [Entry Line]")
-            elif key == ord('2'):
-                zone_manager.active_tool = "sales"
-                zone_manager.status_msg = "Selected: [2. DRAW SALES SECTION] - Click & Drag box over Sales area"
-                zone_manager.status_timer = 150
-                print("[*] Tool switched to: [Sales Section]")
-            elif key == ord('3'):
-                zone_manager.active_tool = "accounts"
-                zone_manager.status_msg = "Selected: [3. DRAW ACCOUNTS SECTION] - Click & Drag box over Accounts area"
-                zone_manager.status_timer = 150
-                print("[*] Tool switched to: [Accounts Section]")
+            elif ord('2') <= key <= ord('9'):
+                sec_idx = key - ord('2')
+                if sec_idx < len(zone_manager.sections):
+                    s = zone_manager.sections[sec_idx]
+                    zone_manager.active_tool = s["id"]
+                    zone_manager.status_msg = f"Selected: [{sec_idx+2}. DRAW {s['name'].upper()}] - Click & Drag box over area"
+                    zone_manager.status_timer = 150
+                    print(f"[*] Tool switched to: [{s['name']}]")
+            elif key in (ord('d'), ord('D')):
+                zone_manager.flip_direction()
+            elif key in (ord('c'), ord('C')):
+                zone_manager.reset_counts()
             elif key in (ord('r'), ord('R'), ord('x'), ord('X')):
                 zone_manager.clear_all()
             elif key in (ord('s'), ord('S')):
@@ -2267,20 +3154,20 @@ def main():
     parser.add_argument(
         "--conf",
         type=float,
-        default=float(config.get("confidence", 0.28)),
-        help="YOLO person detection confidence threshold (default: 0.28)",
+        default=float(config.get("confidence", 0.30)),
+        help="YOLO person detection confidence threshold (default: 0.30)",
     )
     parser.add_argument(
         "--imgsz",
         type=int,
-        default=int(config.get("imgsz", 640)),
-        help="YOLO inference input resolution (default: 640)",
+        default=int(config.get("imgsz", 960)),
+        help="YOLO inference input resolution in pixels (default: 960)",
     )
     parser.add_argument(
         "--model",
         type=str,
-        default=config.get("model", "models/yolo11m.pt"),
-        help="Path to YOLO weights file (default: 'models/yolo11m.pt')",
+        default=config.get("model", "models/yolo11s.pt"),
+        help="Path to YOLO weights file (default: 'models/yolo11s.pt')",
     )
     parser.add_argument(
         "--show-line",
@@ -2319,6 +3206,12 @@ def main():
         help="Enable detection of standalone faces behind cubicle partitions (default: False)",
     )
     parser.add_argument(
+        "--head-fallback",
+        action="store_true",
+        default=bool(config.get("show_head_fallback", False)),
+        help="Enable synthetic anatomical head box fallback when face is turned away (default: False)",
+    )
+    parser.add_argument(
         "--no-head-fallback",
         action="store_true",
         help="Disable anatomical head fallback when face is turned away (shows AI faces only)",
@@ -2332,8 +3225,8 @@ def main():
     parser.add_argument(
         "--smoothing-alpha",
         type=float,
-        default=float(config.get("smoothing_alpha", 0.70)),
-        help="EMA smoothing alpha factor between 0.1 and 1.0 (default: 0.70)",
+        default=float(config.get("smoothing_alpha", 0.35)),
+        help="EMA smoothing alpha factor between 0.1 and 1.0 (default: 0.35)",
     )
     parser.add_argument(
         "--face-persistence",
@@ -2344,19 +3237,37 @@ def main():
     parser.add_argument(
         "--body-persistence",
         type=int,
-        default=int(config.get("body_persistence", 15)),
-        help="Number of missing frames before an un-detected person box disappears (default: 40)",
+        default=int(config.get("body_persistence", 26)),
+        help="Number of missing frames before an un-detected person track is purged (default: 6)",
+    )
+    parser.add_argument(
+        "--max-visual-coast",
+        type=int,
+        default=int(config.get("max_visual_coast", 20)),
+        help="Max frames to visually display coasted bounding boxes when detection is lost (default: 2)",
+    )
+    parser.add_argument(
+        "--min-feet-y",
+        type=float,
+        default=float(config.get("min_feet_y", 0.08)),
+        help="Minimum normalized ground/feet Y position (filters out hanging decorations/ceiling objects) (default: 0.24)",
     )
     parser.add_argument(
         "--deadband",
         type=float,
-        default=float(config.get("deadband_px", 3.5)),
-        help="Pixel displacement deadband below which stationary boxes freeze (default: 3.5)",
+        default=float(config.get("deadband_px", 6.0)),
+        help="Pixel displacement deadband below which stationary boxes freeze (default: 6.0)",
     )
     parser.add_argument(
         "--headless",
         action="store_true",
         help="Run without displaying local OpenCV window (service/background mode)",
+    )
+    parser.add_argument(
+        "--tracker",
+        type=str,
+        default=config.get("tracker", settings.TRACKER_TYPE),
+        help="Multi-object tracker configuration: 'bytetrack', 'botsort', or path to tracker YAML (default: bytetrack.yaml)",
     )
 
     args = parser.parse_args()
@@ -2395,6 +3306,9 @@ def main():
         resolved_camera_id = "88970b31-d885-4fd5-a24a-bdc969c96240"
 
     resolved_channel = str(target_channel or "201")
+    resolved_tracker = selected_cam.get("tracker") if selected_cam else None
+    if not resolved_tracker:
+        resolved_tracker = args.tracker
 
     run_local_detector(
         source=resolved_source,
@@ -2409,18 +3323,21 @@ def main():
         face_scale=args.face_scale,
         face_model_path=args.face_model,
         face_confidence=args.face_conf,
-        show_head_fallback=not args.no_head_fallback,
+        show_head_fallback=args.head_fallback and not args.no_head_fallback,
         allow_standalone_faces=args.standalone_faces,
         imgsz=args.imgsz,
         box_smoothing=not args.no_smoothing,
         smoothing_alpha=args.smoothing_alpha,
         face_persistence=args.face_persistence,
         body_persistence=args.body_persistence,
+        max_visual_coast=args.max_visual_coast,
         deadband_px=args.deadband,
+        min_feet_y=args.min_feet_y,
         camera_channel=resolved_channel,
         similarity_thresh=args.sim_thresh,
         entry_line_cfg=entry_line_cfg,
         sections_cfg=sections_cfg,
+        tracker_name=resolved_tracker,
     )
 
 

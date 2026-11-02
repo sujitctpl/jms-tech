@@ -35,6 +35,26 @@ export interface FootfallSummary {
   section_occupancy?: Record<string, number>;
 }
 
+export interface DepartmentModel {
+  id: string;
+  name: string;
+  color: string;
+  camera_id?: string | null;
+  box?: number[] | null;
+  is_active: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface DepartmentCreatePayload {
+  id?: string;
+  name: string;
+  color?: string;
+  camera_id?: string | null;
+  box?: number[] | null;
+  is_active?: boolean;
+}
+
 // Built-in configured cameras matching backend database
 export const FALLBACK_CAMERAS: CameraModel[] = [
   {
@@ -233,6 +253,81 @@ class CameraService {
       // Graceful fallback
     }
     return null;
+  }
+
+  /**
+   * List all configured detection departments
+   */
+  async listDepartments(cameraId?: string): Promise<DepartmentModel[]> {
+    try {
+      const url = cameraId
+        ? `${this.getBaseUrl()}/api/v1/departments?camera_id=${cameraId}`
+        : `${this.getBaseUrl()}/api/v1/departments`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
+      if (res.ok) {
+        return await res.json();
+      }
+    } catch (e) {
+      console.warn('[CameraService] Failed to fetch departments from backend', e);
+    }
+    return [
+      { id: 'sales', name: 'Sales Section', color: '#00D7FF', is_active: true },
+      { id: 'service', name: 'Service Section', color: '#32E178', is_active: true },
+      { id: 'accounts', name: 'Accounts Section', color: '#FF8C00', is_active: true },
+    ];
+  }
+
+  /**
+   * Create a new detection department
+   */
+  async createDepartment(payload: DepartmentCreatePayload): Promise<DepartmentModel | null> {
+    try {
+      const res = await fetch(`${this.getBaseUrl()}/api/v1/departments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) {
+        return await res.json();
+      }
+    } catch (e) {
+      console.error('[CameraService] Failed to create department', e);
+    }
+    return null;
+  }
+
+  /**
+   * Update department details
+   */
+  async updateDepartment(departmentId: string, payload: Partial<DepartmentCreatePayload>): Promise<DepartmentModel | null> {
+    try {
+      const res = await fetch(`${this.getBaseUrl()}/api/v1/departments/${departmentId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) {
+        return await res.json();
+      }
+    } catch (e) {
+      console.error('[CameraService] Failed to update department', e);
+    }
+    return null;
+  }
+
+  /**
+   * Delete a detection department
+   */
+  async deleteDepartment(departmentId: string): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.getBaseUrl()}/api/v1/departments/${departmentId}`, {
+        method: 'DELETE',
+      });
+      return res.status === 204 || res.ok;
+    } catch (e) {
+      console.error('[CameraService] Failed to delete department', e);
+      return false;
+    }
   }
 }
 

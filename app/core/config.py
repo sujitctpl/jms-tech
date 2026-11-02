@@ -20,8 +20,8 @@ class Settings(BaseSettings):
     DB_POOL_RECYCLE: int = 1800
 
     # Vision & Detection Settings
-    YOLO_MODEL_PATH: str = "models/yolo11m.pt"
-    DETECTION_CONFIDENCE_THRESHOLD: float = 0.28
+    YOLO_MODEL_PATH: str = "models/yolo11s.pt"
+    DETECTION_CONFIDENCE_THRESHOLD: float = 0.35
     PERSON_CLASS_ID: int = 0
     DEVICE: str = "cuda:0"
     TRACKER_TYPE: str = "bytetrack.yaml"
@@ -37,10 +37,10 @@ class Settings(BaseSettings):
 
     # Face Embedding & Identity Recovery Settings
     ARCFACE_MODEL_PATH: str = "models/w600k_r50.onnx"
-    FACE_SIMILARITY_THRESHOLD: float = 0.40  # Calibrated operating threshold for high precision
-    FACE_MATCH_MARGIN: float = 0.05  # Minimum difference between Top-1 and Top-2 distinct candidate matches
+    FACE_SIMILARITY_THRESHOLD: float = 0.38  # Calibrated operating threshold for high precision
+    FACE_MATCH_MARGIN: float = 0.030  # Minimum difference between Top-1 and Top-2 distinct candidate matches
     FACE_MIN_SIZE: int = 16  # Minimum face width/height in pixels (calibrated for seated/back-row staff)
-    FACE_MIN_CONFIDENCE: float = 0.45  # Minimum face detector confidence to reject ears/hair/monitors
+    FACE_MIN_CONFIDENCE: float = 0.30  # Minimum face detector confidence to reject ears/hair/monitors
     FACE_BLUR_THRESHOLD: float = 5.0  # Minimum Laplacian variance for blur filtering
     FACE_MAX_YAW: float = 65.0  # Maximum head yaw in degrees (calibrated for angled seating / walking)
     FACE_MAX_PITCH: float = 50.0  # Maximum head pitch in degrees (accommodates 35°-45° overhead CCTV)
@@ -48,8 +48,8 @@ class Settings(BaseSettings):
     FACE_MIN_EYE_DIST: float = 2.5  # Minimum inter-ocular distance in pixels for distant 720p streams
     FACE_MIN_ILLUMINATION: float = 18.0  # Minimum average grayscale brightness (reject silhouettes)
     FACE_MAX_ILLUMINATION: float = 245.0  # Maximum average grayscale brightness (reject blown-out glare)
-    EMPLOYEE_MIN_CONFIRM_FRAMES: int = 3  # Minimum confirmed frames before locking identity
-    EMPLOYEE_VOTE_WINDOW: int = 6  # Temporal sliding window for employee voting buffer
+    EMPLOYEE_MIN_CONFIRM_FRAMES: int = 1  # Minimum confirmed frames before locking identity
+    EMPLOYEE_VOTE_WINDOW: int = 5  # Temporal sliding window for employee voting buffer
     FACE_RECOGNITION_COOLDOWN_FRAMES: int = 5  # Cooldown between recognition attempts on unresolved tracks
     FACE_MAX_RECOGNITION_ATTEMPTS: int = 5  # Maximum attempts per track to avoid redundant inference
 

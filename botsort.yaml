@@ -1,0 +1,22 @@
+# BoT-SORT tracker configuration for showroom / CCTV edge detector
+# Reference: https://docs.ultralytics.com/modes/track
+
+tracker_type: botsort # (str) Tracker backend: botsort
+track_high_thresh: 0.25 # (float) First-stage match threshold
+track_low_thresh: 0.10 # (float) Second-stage threshold for low-score matches
+new_track_thresh: 0.25 # (float) Minimum confidence to initiate a new tracklet
+track_buffer: 120 # (int) Frames to keep lost tracks alive (~4-5s across temporary occlusions & seated pauses)
+match_thresh: 0.70 # (float) Association similarity threshold (IoU/cost)
+fuse_score: True # (bool) Fuse detection score with motion/IoU for matching
+
+# BoT-SORT Camera Motion Compensation (GMC)
+# Options: sparseOptFlow | orb | sift | ecc | none
+# For static or PTZ CCTV, 'sparseOptFlow' or 'orb' compensates for camera vibration/sway; 'none' is fastest.
+gmc_method: sparseOptFlow
+
+# ReID appearance model settings
+proximity_thresh: 0.5 # (float) Min IoU to consider tracks proximate for ReID
+appearance_thresh: 0.80 # (float) Min appearance similarity for ReID (higher avoids identity swaps)
+with_reid: False # (bool) Enable ReID model use; True requires ReID feature extraction
+model: auto # (str) ReID model name/path; "auto" uses detector features if available
+

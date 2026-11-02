@@ -5,11 +5,13 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from app.api.routes import HEALTH
-from app.api.v1 import analytics, cameras, employees, identity
+from app.api.v1 import analytics, cameras, employees, identity, departments
 from app.core.config import settings
 from app.core.logging import logger, setup_logging
-from app.db.session import SessionLocal
+from app.db.base import Base
+from app.db.session import SessionLocal, engine
 from app.repositories.employee_repo import EmployeeRepository
+from app.repositories.department_repo import DepartmentRepository
 from app.services.employee_service import global_employee_recognizer
 from app.services.retention_service import retention_scheduler
 from app.workers.video_worker import worker_manager
@@ -20,6 +22,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manages application startup and shutdown lifecycle."""
     setup_logging()
     logger.info("Initializing %s...", settings.APP_NAME)
+
+    # Ensure database tables exist (departments, etc.)
+    try:
+        Base.metadata.create_all(bind=engine)
+        db = SessionLocal()
+        dept_repo = DepartmentRepository(db)
+        dept_repo.seed_defaults_if_empty()
+        db.close()
+    except Exception as e:
+        logger.warning("Could not auto-create/seed tables on startup: %s", str(e))
 
     # Load active registered employee face embeddings into vector store cache
     try:
@@ -74,6 +86,7 @@ app.include_router(cameras.router)
 app.include_router(analytics.router)
 app.include_router(identity.router)
 app.include_router(employees.router)
+app.include_router(departments.router)
 
 
 @app.exception_handler(Exception)

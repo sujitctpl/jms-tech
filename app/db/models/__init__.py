@@ -6,6 +6,7 @@ from app.db.models.footfall_event import FootfallEvent
 from app.db.models.person_identity import PersonIdentity
 from app.db.models.employee import Employee, EmployeeFace
 from app.db.models.employee_attendance import EmployeeAttendanceLog, EmployeeDailyAttendance
+from app.db.models.department import Department
 
 __all__ = [
     "Camera",
@@ -18,4 +19,5 @@ __all__ = [
     "EmployeeFace",
     "EmployeeAttendanceLog",
     "EmployeeDailyAttendance",
+    "Department",
 ]

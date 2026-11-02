@@ -186,6 +186,13 @@ class EmployeeRecognitionManager:
                 attempts,
                 status_str
             )
+            # Real-time console telemetry for biometric evaluation visibility
+            sval = sim_val if sim_val is not None else similarity
+            ename = emp_val or employee_id or "Unknown"
+            if status_str == "CONFIRMED_MATCH":
+                print(f"[+] Biometrics Match Track #{track_id}: {status_str} -> {ename} (sim={sval:.3f}, thresh={threshold:.2f})")
+            elif sval >= 0.28:
+                print(f"[*] Biometrics Check Track #{track_id}: {status_str} -> {ename} (sim={sval:.3f}, thresh={threshold:.2f})")
 
         # 2. Strict face quality check
         is_reliable, reason = self.embedder.is_face_reliable(face_crop, face_conf, landmarks)
@@ -231,18 +238,11 @@ class EmployeeRecognitionManager:
         similarity = float(best_score)
 
         if best_emp_id is not None:
-            # Enforce single active physical body: an employee cannot be in two locations at the same time
+            # Enforce single active physical body: seamlessly transfer employee mapping to the newest active track
             for existing_tid, existing_eid in list(self.track_to_employee.items()):
                 if existing_eid == best_emp_id and existing_tid != tid:
-                    logger.debug(
-                        "Employee %s already actively tracked on track %s. Rejecting duplicate match for track %s",
-                        best_emp_id,
-                        existing_tid,
-                        tid,
-                    )
-                    final_status = f"REJECTED_DUPLICATE_BODY_{existing_tid}"
-                    _log_attempt(final_status)
-                    return None
+                    del self.track_to_employee[existing_tid]
+                    self.track_votes.pop(existing_tid, None)
 
             # Multi-Frame Temporal Confirmation (Quality-Weighted Voting Buffer)
             quality_weight = float(
