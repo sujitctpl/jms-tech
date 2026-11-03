@@ -76,9 +76,19 @@ def cleanup():
 
 
 def main():
+    cli_args = [a.lower() for a in sys.argv[1:]]
+    is_v2 = ("v2" in cli_args) or ("--v2" in cli_args)
+    if is_v2:
+        os.environ["DETECTION_MODEL_TYPE"] = "rf-detr"
+        version_desc = "v2 (RF-DETR Transformer Pipeline)"
+    else:
+        os.environ["DETECTION_MODEL_TYPE"] = "yolo"
+        version_desc = "v1 (YOLO26s Engine)"
+
     print("=" * 70)
     print("  CAPERMINT SHOWROOM INTELLIGENCE - ALL-IN-ONE SERVICE RUNNER")
     print("=" * 70)
+    print(f"  - Pipeline Engine  : {version_desc}")
     print("  - Backend API Docs : http://localhost:8000/docs")
     print("  - Auth API Health  : http://localhost:5000/health")
     print("  - Web Dashboard    : http://localhost:5173")
@@ -86,7 +96,7 @@ def main():
     print("  Press Ctrl+C at any time to cleanly stop all services.\n")
 
     # 1. FastAPI Backend (Cyan: 36)
-    backend_cmd = f'"{VENV_PYTHON}" -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload'
+    backend_cmd = f'"{VENV_PYTHON}" -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app'
     start_service("FASTAPI", backend_cmd, ROOT_DIR, "36")
 
     # 2. Auth Server (Magenta: 35)

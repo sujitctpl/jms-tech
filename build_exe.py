@@ -28,9 +28,9 @@ def build():
             print("[*] Then re-run: python build_exe.py")
             return
 
-    model_file = "yolo11n.pt"
+    model_file = "models/yolo26s.pt" if os.path.exists("models/yolo26s.pt") else "yolo26s.pt"
     if not os.path.exists(model_file):
-        print(f"[!] Warning: Model file '{model_file}' not found in current folder.")
+        print(f"[!] Warning: Model file '{model_file}' not found.")
 
     # PyInstaller command
     # Using --onedir by default because PyTorch/YOLO extract faster on startup

@@ -97,8 +97,16 @@ class FaceEmbedder:
                 self.output_name = self.session.get_outputs()[0].name
                 logger.info("ArcFace embedding model loaded successfully from %s", resolved)
             except Exception as e:
-                logger.warning("Could not load ArcFace model from %s: %s", resolved, str(e))
-                self.session = None
+                # If CUDA / BFCArena allocation failed, attempt fallback to CPUExecutionProvider
+                try:
+                    logger.warning("Failed loading ArcFace on %s: %s. Falling back to CPUExecutionProvider...", active, str(e))
+                    self.session = ort.InferenceSession(resolved, providers=["CPUExecutionProvider"])
+                    self.input_name = self.session.get_inputs()[0].name
+                    self.output_name = self.session.get_outputs()[0].name
+                    logger.info("ArcFace embedding model loaded successfully on CPU fallback from %s", resolved)
+                except Exception as cpu_err:
+                    logger.warning("Could not load ArcFace model from %s on CPU: %s", resolved, str(cpu_err))
+                    self.session = None
 
     @staticmethod
     def estimate_head_pose(landmarks: List[Tuple[int, int]]) -> Tuple[float, float, float]:

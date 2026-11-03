@@ -7,7 +7,7 @@ echo ======================================================================
 echo   CAPERMINT SHOWROOM INTELLIGENCE - LOCAL AI DETECTOR
 echo ======================================================================
 echo.
-echo Starting local YOLO person detection and tracking engine...
+echo Starting local YOLO26s person detection and tracking engine...
 echo Video and detections are processed locally on this machine.
 echo Data and visitor counts are synchronized with the Dashboard.
 echo.

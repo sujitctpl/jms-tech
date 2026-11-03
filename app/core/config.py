@@ -19,9 +19,14 @@ class Settings(BaseSettings):
     DB_MAX_OVERFLOW: int = 20
     DB_POOL_RECYCLE: int = 1800
 
-    # Vision & Detection Settings
-    YOLO_MODEL_PATH: str = "models/yolo11s.pt"
-    DETECTION_CONFIDENCE_THRESHOLD: float = 0.35
+    # Vision & Detection Settings (YOLO26s Engine)
+    DETECTION_MODEL_TYPE: str = "yolo"
+    YOLO_MODEL_PATH: str = "models/yolo26s.pt"
+    RTMDet_MODEL_PATH: str = "models/rtmdet-m-person.onnx"
+    RF_DETR_VARIANT: str = "small"
+    RF_DETR_WEIGHTS_PATH: Optional[str] = None
+    DETECTION_CONFIDENCE_THRESHOLD: float = 0.33
+    DETECTION_IMGSZ: int = 960
     PERSON_CLASS_ID: int = 0
     DEVICE: str = "cuda:0"
     TRACKER_TYPE: str = "bytetrack.yaml"

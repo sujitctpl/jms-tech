@@ -131,7 +131,7 @@ class SyntheticSceneGenerator:
 class TrackerEvaluator:
     """Runs and computes quantitative MOT metrics for a given tracker."""
 
-    def __init__(self, model_path: str = "models/yolo11s.pt", device: str = "cpu"):
+    def __init__(self, model_path: str = "models/yolo26s.pt", device: str = "cpu"):
         self.model_path = model_path
         self.device = device
         self._model = None
@@ -309,7 +309,7 @@ class TrackerEvaluator:
         )
 
 
-def run_benchmark(model_path: str = "models/yolo11s.pt", device: str = "cpu") -> str:
+def run_benchmark(model_path: str = "models/yolo26s.pt", device: str = "cpu") -> str:
     """Runs complete comparative benchmark and returns a structured markdown report."""
     evaluator = TrackerEvaluator(model_path=model_path, device=device)
 
@@ -387,7 +387,7 @@ Tests track retention and identity re-association after a visitor is hidden behi
 
 def run_video_benchmark(
     video_path: str,
-    model_path: str = "models/yolo11s.pt",
+    model_path: str = "models/yolo26s.pt",
     device: str = "cpu",
     max_frames: int = 300,
 ) -> str:
@@ -489,7 +489,7 @@ def run_video_benchmark(
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark ByteTrack vs BoT-SORT vs RobustFallbackTracker")
-    parser.add_argument("--model", type=str, default="models/yolo11s.pt", help="Path to YOLO weights")
+    parser.add_argument("--model", type=str, default="models/yolo26s.pt", help="Path to YOLO weights")
     parser.add_argument("--device", type=str, default="cpu", help="Compute device (cpu, cuda:0)")
     parser.add_argument("--video", type=str, default=None, help="Optional real video path to benchmark on")
     parser.add_argument("--max-frames", type=int, default=200, help="Max frames to evaluate on video")

@@ -46,8 +46,10 @@ except Exception:
     linear_assignment = None
 
 # Handle PyInstaller onefile directory resolution
-def get_resource_path(relative_path: str) -> str:
+def get_resource_path(relative_path: Optional[str]) -> str:
     """Get absolute path to resource, works for dev, models folder, and PyInstaller."""
+    if not relative_path:
+        return ""
     base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
     target = os.path.join(base_path, relative_path)
     if os.path.exists(target):
@@ -368,6 +370,13 @@ class RobustFallbackTracker:
         max_id = max(active_objects.keys(), default=0)
         if max_id >= self.next_id:
             self.next_id = max_id + 1
+
+    def coast_tracks(self) -> Dict[int, Tuple[float, float, float, float]]:
+        """Coasts active tracks forward along velocity vectors on cadence-skipped frames without aging disappeared counter."""
+        for oid in list(self.objects.keys()):
+            if self.disappeared.get(oid, 0) == 0:
+                self.objects[oid] = self.predict_box(oid)
+        return {oid: box for oid, box in self.objects.items() if self.disappeared.get(oid, 0) == 0}
 
     def update(
         self,
@@ -1717,7 +1726,10 @@ class ThreadedRTSPReader:
     def read_latest(self) -> Tuple[bool, Optional[np.ndarray]]:
         with self.lock:
             if self.latest_frame is not None:
-                return True, self.latest_frame.copy()
+                try:
+                    return True, self.latest_frame.copy()
+                except Exception:
+                    return True, self.latest_frame
             return False, None
 
     def release(self):
@@ -2018,7 +2030,7 @@ def run_local_detector(
     face_confidence: float = 0.30,
     show_head_fallback: bool = False,
     allow_standalone_faces: bool = False,
-    imgsz: int = 640,
+    imgsz: int = 960,
     box_smoothing: bool = True,
     smoothing_alpha: float = 0.35,
     face_persistence: int = 8,
@@ -2030,7 +2042,10 @@ def run_local_detector(
     similarity_thresh: Optional[float] = None,
     entry_line_cfg: Optional[dict] = None,
     sections_cfg: Optional[list] = None,
+    exclusion_zones: Optional[list] = None,
     tracker_name: Optional[str] = None,
+    model_type: str = "auto",
+    rf_detr_variant: str = "medium",
 ):
     print("=" * 70)
     print("  CAPERMINT SHOWROOM INTELLIGENCE - LOCAL AI EDGE DETECTOR")
@@ -2038,7 +2053,9 @@ def run_local_detector(
     print(f"[*] Camera ID      : {camera_id}")
     print(f"[*] Video Source   : {source}")
     print(f"[*] Backend API    : {api_url}")
-    print(f"[*] Detection Model: {model_path} (imgsz={imgsz})")
+    print(f"[*] Model Type     : {model_type}")
+    model_label = model_path if model_path else f"Pretrained COCO ({rf_detr_variant})"
+    print(f"[*] Detection Model: {model_label} (imgsz={imgsz})")
     print(f"[*] Face AI Model  : {face_model_path} (threshold: {face_confidence:.2f})")
     print(f"[*] Confidence     : {confidence_thresh:.2f}")
     from app.core.config import settings
@@ -2058,32 +2075,127 @@ def run_local_detector(
     import torch
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
     print(f"[*] Compute Device : {device.upper()} ({device_name})")
 
-    # Resolve model file
-    resolved_model = get_resource_path(model_path)
-    if not os.path.exists(resolved_model):
-        if os.path.exists("models/yolo11s.pt"):
-            resolved_model = "models/yolo11s.pt"
-        elif os.path.exists("models/yolo11n.pt"):
-            resolved_model = "models/yolo11n.pt"
-        elif os.path.exists("models/yolo11m.pt"):
-            resolved_model = "models/yolo11m.pt"
-        elif os.path.exists("yolo11s.pt"):
-            resolved_model = "yolo11s.pt"
-        elif os.path.exists("yolo11n.pt"):
-            resolved_model = "yolo11n.pt"
-        elif os.path.exists("yolo11m.pt"):
-            resolved_model = "yolo11m.pt"
-        else:
-            resolved_model = model_path
+    def is_in_exclusion(bx1: float, by1: float, bx2: float, by2: float) -> bool:
+        if not exclusion_zones:
+            return False
+        bcx = (bx1 + bx2) * 0.5
+        bcy = (by1 + by2) * 0.5
+        barea = max(1.0, (bx2 - bx1) * (by2 - by1))
+        for ez in exclusion_zones:
+            ebox = ez if isinstance(ez, (list, tuple)) else ez.get("box", [0, 0, 0, 0])
+            ex1, ey1, ex2, ey2 = float(ebox[0]), float(ebox[1]), float(ebox[2]), float(ebox[3])
+            if ex1 <= bcx <= ex2 and ey1 <= bcy <= ey2:
+                return True
+            ix1, iy1 = max(bx1, ex1), max(by1, ey1)
+            ix2, iy2 = min(bx2, ex2), min(by2, ey2)
+            if ix2 > ix1 and iy2 > iy1:
+                iarea = (ix2 - ix1) * (iy2 - iy1)
+                if (iarea / barea) > 0.25:
+                    return True
+        return False
 
-    print(f"[*] Loading YOLO model: {resolved_model} on {device.upper()}...")
-    from ultralytics import YOLO
+    model_type_str = str(model_type or "rtmdet").lower()
+    model_path_str = str(model_path or "").lower()
 
-    model = YOLO(resolved_model)
-    model.to(device)
-    print(f"[+] YOLO model loaded successfully on {device_name}!")
+    if model_type_str in ("rf-detr", "rfdetr") or ("rf-detr" in model_path_str or "rfdetr" in model_path_str):
+        resolved_family = "rf-detr"
+    elif model_type_str in ("rtmdet", "rtm-det", "rtm_det") or "rtmdet" in model_path_str:
+        resolved_family = "rtmdet"
+    elif model_type_str in ("rtdetr", "rt-detr", "rt_detr") or "rtdetr" in model_path_str:
+        resolved_family = "rtdetr"
+    elif model_type_str in ("yolo",) or "yolo" in model_path_str:
+        resolved_family = "yolo"
+    else:
+        resolved_family = "rtmdet"
+
+    custom_detector = None
+    model = None
+
+    if resolved_family == "rtmdet":
+        resolved_model = get_resource_path(model_path) if model_path else None
+        if not resolved_model or not os.path.exists(resolved_model):
+            for cand in [
+                model_path,
+                os.path.join("models", model_path) if model_path else None,
+                "models/rtmdet-m-person.onnx",
+                "models/rtmdet-s-coco.onnx",
+                "rtmdet-m-person.onnx",
+            ]:
+                if cand and os.path.exists(cand):
+                    resolved_model = cand
+                    break
+            if not resolved_model:
+                resolved_model = "models/rtmdet-m-person.onnx"
+
+        print(f"[*] Loading OpenMMLab RTMDet model: {resolved_model} on {device.upper()}...")
+        from app.vision.detector import create_detector
+        custom_detector = create_detector(
+            model_type="rtmdet",
+            model_path=resolved_model,
+            confidence_threshold=confidence_thresh,
+            device=device,
+        )
+        _ = custom_detector.model
+        print(f"[+] RTMDet model loaded successfully on {device_name}!")
+
+    elif resolved_family == "rf-detr":
+        custom_weights = get_resource_path(model_path) if (model_path and os.path.exists(model_path) and "yolo" not in os.path.basename(model_path).lower()) else None
+        print(f"[*] Loading Roboflow RF-DETR model ({rf_detr_variant}) on {device.upper()}...")
+        from app.vision.detector import create_detector
+        custom_detector = create_detector(
+            model_type="rf-detr",
+            model_path=custom_weights,
+            rf_detr_variant=rf_detr_variant,
+            confidence_threshold=confidence_thresh,
+            device=device,
+        )
+        _ = custom_detector.model
+        print(f"[+] RF-DETR model loaded successfully on {device_name}!")
+
+    elif resolved_family == "rtdetr":
+        resolved_model = get_resource_path(model_path) if model_path else "models/rtdetr-l.pt"
+        if not os.path.exists(resolved_model) and os.path.exists("models/rtdetr-l.pt"):
+            resolved_model = "models/rtdetr-l.pt"
+        print(f"[*] Loading Ultralytics RT-DETR model: {resolved_model} on {device.upper()}...")
+        from app.vision.detector import create_detector
+        custom_detector = create_detector(
+            model_type="rtdetr",
+            model_path=resolved_model,
+            confidence_threshold=confidence_thresh,
+            device=device,
+        )
+        _ = custom_detector.model
+        print(f"[+] RT-DETR model loaded successfully on {device_name}!")
+
+    else:
+        # Resolve YOLO model weights file
+        resolved_model = get_resource_path(model_path) if model_path else None
+        if not resolved_model or not os.path.exists(resolved_model):
+            if model_path and os.path.exists(os.path.join("models", model_path)):
+                resolved_model = os.path.join("models", model_path)
+            elif os.path.exists("models/yolo26m.pt"):
+                resolved_model = "models/yolo26m.pt"
+            elif os.path.exists("models/yolo26s.pt"):
+                resolved_model = "models/yolo26s.pt"
+            elif os.path.exists("models/yolo11s.pt"):
+                resolved_model = "models/yolo11s.pt"
+            elif os.path.exists("models/yolo11n.pt"):
+                resolved_model = "models/yolo11n.pt"
+            elif os.path.exists("models/yolo11m.pt"):
+                resolved_model = "models/yolo11m.pt"
+            else:
+                resolved_model = model_path or "models/yolo26m.pt"
+
+        print(f"[*] Loading YOLO model: {resolved_model} on {device.upper()}...")
+        from ultralytics import YOLO
+
+        model = YOLO(resolved_model)
+        model.to(device)
+        print(f"[+] YOLO model loaded successfully on {device_name}!")
 
     # Load Face Detector (SCRFD or YuNet)
     face_detector_type, face_detector = load_face_detector(face_model_path, face_confidence)
@@ -2250,55 +2362,85 @@ def run_local_detector(
             unmatched_boxes: List[Tuple[float, float, float, float]] = []
             bytetrack_failed = False
 
-            try:
-                results = model.track(
-                    source=frame,
-                    classes=[0],
-                    conf=confidence_thresh,
-                    imgsz=imgsz,
-                    persist=True,
-                    tracker=tracker_config,
-                    verbose=False,
-                )
-                if results and len(results) > 0 and results[0].boxes is not None:
-                    for box in results[0].boxes:
-                        x1, y1, x2, y2 = box.xyxy[0].tolist()
-                        if (x2 - x1) < 14 or (y2 - y1) < 18:
-                            continue
-                        detections.append((x1, y1, x2, y2))
-                        if box.id is not None:
-                            try:
-                                track_id = int(box.id[0].item())
-                                tracked_objects[track_id] = (x1, y1, x2, y2)
-                            except Exception:
-                                unmatched_boxes.append((x1, y1, x2, y2))
-                        else:
-                            unmatched_boxes.append((x1, y1, x2, y2))
-            except Exception:
+            is_cadence_skip = False
+            if custom_detector is not None:
                 bytetrack_failed = True
-                # Fallback to model.predict if tracking plugin encounters issue
-                try:
-                    results = model.predict(
-                        source=frame,
-                        classes=[0],
-                        conf=confidence_thresh,
-                        imgsz=imgsz,
-                        verbose=False,
-                    )
-                    if results and len(results) > 0 and results[0].boxes is not None:
-                        for box in results[0].boxes:
-                            x1, y1, x2, y2 = box.xyxy[0].tolist()
-                            if (x2 - x1) < 14 or (y2 - y1) < 18:
+                # 2-Frame Detection Cadence: Run RTMDet neural inference on alternate frames
+                # or immediately if there are currently no tracked persons.
+                run_detector_now = (frame_counter % 2 == 0) or (len(tracker.objects) == 0)
+                if run_detector_now:
+                    try:
+                        res_dets = custom_detector.detect(frame)
+                        for d in res_dets:
+                            x1, y1, x2, y2 = d.box
+                            bw = x2 - x1
+                            bh = y2 - y1
+                            if bw < 14 or bh < 18 or (bh / max(1.0, bw)) < 0.60 or (y2 / max(1.0, h)) < min_feet_y or is_in_exclusion(x1, y1, x2, y2):
                                 continue
                             detections.append((x1, y1, x2, y2))
                             unmatched_boxes.append((x1, y1, x2, y2))
+                    except Exception:
+                        pass
+                else:
+                    is_cadence_skip = True
+            else:
+                try:
+                    with torch.inference_mode():
+                        results = model.track(
+                            source=frame,
+                            classes=[0],
+                            conf=confidence_thresh,
+                            imgsz=imgsz,
+                            persist=True,
+                            tracker=tracker_config,
+                            verbose=False,
+                        )
+                    if results and len(results) > 0 and results[0].boxes is not None:
+                        for box in results[0].boxes:
+                            x1, y1, x2, y2 = box.xyxy[0].tolist()
+                            bw = x2 - x1
+                            bh = y2 - y1
+                            if bw < 14 or bh < 18 or (bh / max(1.0, bw)) < 0.60 or (y2 / max(1.0, h)) < min_feet_y or is_in_exclusion(x1, y1, x2, y2):
+                                continue
+                            detections.append((x1, y1, x2, y2))
+                            if box.id is not None:
+                                try:
+                                    track_id = int(box.id[0].item())
+                                    tracked_objects[track_id] = (x1, y1, x2, y2)
+                                except Exception:
+                                    unmatched_boxes.append((x1, y1, x2, y2))
+                            else:
+                                unmatched_boxes.append((x1, y1, x2, y2))
                 except Exception:
-                    pass
+                    bytetrack_failed = True
+                    try:
+                        with torch.inference_mode():
+                            results = model.predict(
+                                source=frame,
+                                classes=[0],
+                                conf=confidence_thresh,
+                                imgsz=imgsz,
+                                verbose=False,
+                            )
+                        if results and len(results) > 0 and results[0].boxes is not None:
+                            for box in results[0].boxes:
+                                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                                bw = x2 - x1
+                                bh = y2 - y1
+                                if bw < 14 or bh < 18 or (bh / max(1.0, bw)) < 0.60 or (y2 / max(1.0, h)) < min_feet_y or is_in_exclusion(x1, y1, x2, y2):
+                                    continue
+                                detections.append((x1, y1, x2, y2))
+                                unmatched_boxes.append((x1, y1, x2, y2))
+                    except Exception:
+                        pass
 
             # Controlled fallback & unmatched detection handling
             if bytetrack_failed:
-                # Primary tracker failed -> use RobustFallbackTracker with velocity and appearance
-                if detections:
+                if is_cadence_skip:
+                    # On cadence-skipped frames: project active tracks forward along velocity in 0.02ms!
+                    tracked_objects = tracker.coast_tracks()
+                elif detections:
+                    # Active detection frame: update tracker positions and re-estimate velocity
                     tracked_objects = tracker.update(detections, frame=frame)
                 else:
                     tracked_objects = tracker.update([], frame=frame)
@@ -2378,6 +2520,15 @@ def run_local_detector(
                             suppressed_tids.add(tid2)
                 tracked_objects = deduped_tracked
 
+            # Filter out any tracks violating min_feet_y, abnormal aspect ratio, or located inside exclusion zones (e.g. ceiling lamp, wall decor, edge slivers)
+            if tracked_objects:
+                tracked_objects = {
+                    tid: box for tid, box in tracked_objects.items()
+                    if (box[3] / max(1.0, h)) >= min_feet_y
+                    and ((box[3] - box[1]) / max(1.0, box[2] - box[0])) >= 0.60
+                    and not is_in_exclusion(box[0], box[1], box[2], box[3])
+                }
+
             # Apply Anti-Jitter Smoothing & Deadband to Person Bounding Boxes
             tracked_objects = smoother.smooth_body_boxes(tracked_objects, frame_shape=(w, h))
 
@@ -2453,12 +2604,12 @@ def run_local_detector(
             should_detect_faces = (
                 face_detector is not None
                 and (len(tracked_objects) > 0 or allow_standalone_faces)
-                and (frame_counter % 2 == 0)
+                and (frame_counter % 3 == 0)
             )
             if should_detect_faces:
                 if face_detector_type == "scrfd":
-                    det_w = min(w, 960)
-                    det_h = min(h, 960)
+                    det_w = min(w, 640)
+                    det_h = min(h, 640)
                     all_detected_faces = face_detector.detect(frame, input_size=(det_w, det_h))
                 elif face_detector_type == "yunet":
                     face_detector.setInputSize((w, h))
@@ -2486,6 +2637,7 @@ def run_local_detector(
             # ---------------------------------------------------------------
             # 1. Draw Bounding Boxes for each Tracked Person (Body: Emerald Green, Face: Vivid Magenta)
             matched_faces_count = 0
+            embeddings_extracted_this_frame = 0
             for obj_id, (x1, y1, x2, y2) in tracked_objects.items():
                 ix1, iy1, ix2, iy2 = int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))
                 box_w = max(1, ix2 - ix1)
@@ -2614,7 +2766,8 @@ def run_local_detector(
                                             anchor["last_track_id"] = tid
                                             break
 
-                            if not is_confirmed and (now_ts - last_attempt >= 0.35):
+                            if not is_confirmed and (now_ts - last_attempt >= 0.45) and (embeddings_extracted_this_frame < 1):
+                                embeddings_extracted_this_frame += 1
                                 track_last_recognition_attempt[tid] = now_ts
                                 emp_match = employee_recognizer.evaluate_track_face(
                                     tracker_id=tid,
@@ -3107,10 +3260,20 @@ def main():
         description="Local AI Video Processor and Person Detection Engine"
     )
     parser.add_argument(
-        "channel",
-        nargs="?",
-        default=None,
-        help="Showroom camera channel number (e.g. 101, 201, 301, 401)",
+        "channel_args",
+        nargs="*",
+        default=[],
+        help="Showroom camera channel (e.g. 101, 201) and/or optional version keyword ('v2' or 'v1')",
+    )
+    parser.add_argument(
+        "--v2",
+        action="store_true",
+        help="Run in v2 mode using RF-DETR (Roboflow Detection Transformer)",
+    )
+    parser.add_argument(
+        "--v1",
+        action="store_true",
+        help="Run in v1 mode using YOLO",
     )
     parser.add_argument(
         "--channel",
@@ -3154,20 +3317,34 @@ def main():
     parser.add_argument(
         "--conf",
         type=float,
-        default=float(config.get("confidence", 0.30)),
-        help="YOLO person detection confidence threshold (default: 0.30)",
+        default=float(config.get("confidence", 0.33)),
+        help="Person detection confidence threshold (default: 0.33)",
     )
     parser.add_argument(
         "--imgsz",
         type=int,
         default=int(config.get("imgsz", 960)),
-        help="YOLO inference input resolution in pixels (default: 960)",
+        help="Inference input resolution in pixels (default: 960)",
+    )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        choices=["auto", "yolo", "rtmdet", "rf-detr", "rtdetr"],
+        default=config.get("model_type", "yolo"),
+        help="Detector model architecture: 'yolo' (default), 'rtmdet', 'rf-detr', 'rtdetr', or 'auto'",
+    )
+    parser.add_argument(
+        "--rf-detr-variant",
+        type=str,
+        choices=["nano", "small", "medium", "base", "large"],
+        default=config.get("rf_detr_variant", "small"),
+        help="Roboflow RF-DETR model variant (default: 'small')",
     )
     parser.add_argument(
         "--model",
         type=str,
-        default=config.get("model", "models/yolo11s.pt"),
-        help="Path to YOLO weights file (default: 'models/yolo11s.pt')",
+        default=config.get("model", "models/yolo26s.pt"),
+        help="Path to detector weights checkpoint (default: 'models/yolo26s.pt')",
     )
     parser.add_argument(
         "--show-line",
@@ -3249,8 +3426,8 @@ def main():
     parser.add_argument(
         "--min-feet-y",
         type=float,
-        default=float(config.get("min_feet_y", 0.08)),
-        help="Minimum normalized ground/feet Y position (filters out hanging decorations/ceiling objects) (default: 0.24)",
+        default=float(config.get("min_feet_y", 0.20)),
+        help="Minimum normalized ground/feet Y position (filters out hanging decorations/ceiling objects) (default: 0.20)",
     )
     parser.add_argument(
         "--deadband",
@@ -3272,8 +3449,24 @@ def main():
 
     args = parser.parse_args()
 
-    # Resolve target channel: flag > positional > default
-    target_channel = args.channel_flag or args.channel
+    # Process positional arguments for channel and version keyword (e.g. '201', 'v2')
+    raw_pos = [str(a).strip() for a in args.channel_args]
+    has_v2_keyword = args.v2 or any(p.lower() == 'v2' for p in raw_pos)
+    has_v1_keyword = args.v1 or any(p.lower() == 'v1' for p in raw_pos)
+
+    # Extract channel from positional arguments (ignoring 'v1' / 'v2')
+    channel_candidates = [p for p in raw_pos if p.lower() not in ('v1', 'v2')]
+    target_channel = args.channel_flag or (channel_candidates[0] if channel_candidates else None)
+
+    # Resolve model type: explicit keyword > CLI flag > settings default
+    if has_v2_keyword:
+        resolved_model_type = 'rf-detr'
+    elif has_v1_keyword:
+        resolved_model_type = 'yolo'
+    elif args.model_type != 'auto':
+        resolved_model_type = args.model_type
+    else:
+        resolved_model_type = getattr(settings, 'DETECTION_MODEL_TYPE', 'yolo')
     
     # If target channel is provided and matches config
     selected_cam = None
@@ -3298,6 +3491,9 @@ def main():
             resolved_camera_id = selected_cam.get("camera_id")
         entry_line_cfg = selected_cam.get("entry_line")
         sections_cfg = selected_cam.get("sections")
+        exclusion_zones_cfg = selected_cam.get("exclusion_zones")
+    else:
+        exclusion_zones_cfg = config.get("exclusion_zones")
 
     # Final fallbacks if no channel matched and no args given
     if not resolved_source:
@@ -3310,13 +3506,17 @@ def main():
     if not resolved_tracker:
         resolved_tracker = args.tracker
 
+    resolved_min_feet_y = float(selected_cam.get("min_feet_y", args.min_feet_y)) if selected_cam and "min_feet_y" in selected_cam else args.min_feet_y
+    resolved_conf = float(selected_cam.get("confidence", args.conf)) if selected_cam and "confidence" in selected_cam else args.conf
+    resolved_standalone_faces = bool(selected_cam.get("allow_standalone_faces", args.standalone_faces)) if selected_cam and "allow_standalone_faces" in selected_cam else args.standalone_faces
+
     run_local_detector(
         source=resolved_source,
         camera_id=resolved_camera_id,
         api_url=args.api_url,
         line_ratio=args.line_y,
         direction=args.direction,
-        confidence_thresh=args.conf,
+        confidence_thresh=resolved_conf,
         model_path=args.model,
         headless=args.headless,
         show_entry_line=args.show_line,
@@ -3324,7 +3524,7 @@ def main():
         face_model_path=args.face_model,
         face_confidence=args.face_conf,
         show_head_fallback=args.head_fallback and not args.no_head_fallback,
-        allow_standalone_faces=args.standalone_faces,
+        allow_standalone_faces=resolved_standalone_faces,
         imgsz=args.imgsz,
         box_smoothing=not args.no_smoothing,
         smoothing_alpha=args.smoothing_alpha,
@@ -3332,12 +3532,15 @@ def main():
         body_persistence=args.body_persistence,
         max_visual_coast=args.max_visual_coast,
         deadband_px=args.deadband,
-        min_feet_y=args.min_feet_y,
+        min_feet_y=resolved_min_feet_y,
         camera_channel=resolved_channel,
         similarity_thresh=args.sim_thresh,
         entry_line_cfg=entry_line_cfg,
         sections_cfg=sections_cfg,
+        exclusion_zones=exclusion_zones_cfg,
         tracker_name=resolved_tracker,
+        model_type=resolved_model_type,
+        rf_detr_variant=args.rf_detr_variant,
     )
 
 

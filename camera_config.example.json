@@ -1,11 +1,13 @@
 {
   "default_channel": "101",
   "api_url": "http://127.0.0.1:8000",
-  "model": "models/yolo11m.pt",
-  "confidence": 0.35,
+  "model_type": "yolo",
+  "rf_detr_variant": "small",
+  "model": "models/yolo26s.pt",
+  "confidence": 0.33,
   "imgsz": 960,
   "face_model": "models/scrfd_2.5g_bnkps.onnx",
-  "face_confidence": 0.30,
+  "face_confidence": 0.3,
   "show_entry_line": true,
   "face_scale": 1.05,
   "allow_standalone_faces": false,
@@ -15,7 +17,7 @@
   "face_persistence": 8,
   "body_persistence": 40,
   "deadband_px": 3.5,
-  "min_feet_y": 0.24,
+  "min_feet_y": 0.08,
   "line_y": 0.35,
   "direction": "top_to_bottom",
   "cameras": {
@@ -66,6 +68,35 @@
             434
           ]
         }
+      ],
+      "exclusion_zones": [
+        {
+          "name": "ceiling_lamp",
+          "box": [
+            40,
+            40,
+            200,
+            220
+          ]
+        },
+        {
+          "name": "wall_decor",
+          "box": [
+            50,
+            430,
+            120,
+            520
+          ]
+        },
+        {
+          "name": "bottom_floor_edge",
+          "box": [
+            550,
+            620,
+            800,
+            720
+          ]
+        }
       ]
     },
     "201": {
@@ -79,6 +110,9 @@
       "name": "Showroom Camera 301 (Lounge & Billing Desk)",
       "camera_id": "8da1af51-b4fb-4745-bc47-a5a5c0e4571e",
       "source": "rtsp://username:password@192.168.1.101:554/Streaming/Channels/301",
+      "confidence": 0.33,
+      "min_feet_y": 0.08,
+      "allow_standalone_faces": false,
       "entry_line": null,
       "sections": []
     },
@@ -91,4 +125,3 @@
     }
   }
 }
-

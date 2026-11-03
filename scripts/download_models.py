@@ -9,6 +9,8 @@ import urllib.request
 MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
 
 MODEL_SOURCES = {
+    "yolo26s.pt": "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26s.pt",
+    "yolo26m.pt": "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26m.pt",
     "face_detection_yunet_2023mar.onnx": "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
     "scrfd_10g_bnkps.onnx": "https://huggingface.co/public-data/insightface/resolve/main/models/buffalo_l/det_10g.onnx",
     "scrfd_2.5g_bnkps.onnx": "https://github.com/deepinsight/insightface/releases/download/v0.7/scrfd_2.5g_bnkps.onnx",

@@ -1,6 +1,6 @@
 # Showroom Visitor Intelligence & Footfall Analytics Platform
 
-An enterprise-grade, edge-AI hybrid visitor intelligence and showroom analytics platform. The system leverages existing CCTV / RTSP camera infrastructure to deliver real-time person detection (YOLOv11), persistent multi-object tracking (ByteTrack), face/head detection fallbacks (SCRFD / YuNet), directional virtual entry-line crossing, dwell-time analytics, showroom zone occupancy, and an interactive React 19 web dashboard.
+An enterprise-grade, edge-AI hybrid visitor intelligence and showroom analytics platform. The system leverages existing CCTV / RTSP camera infrastructure to deliver real-time person detection powered by Roboflow RF-DETR (Real-Time Detection Transformer with DINOv2 backbone, with YOLOv11 fallback), persistent multi-object tracking (ByteTrack & motion-predicted Hungarian matching), face/head detection fallbacks (SCRFD / YuNet), directional virtual entry-line crossing, dwell-time analytics, showroom zone occupancy, and an interactive React 19 web dashboard.
 
 ---
 
@@ -12,7 +12,7 @@ The platform operates on a high-efficiency **Edge-AI Hybrid Architecture**:
 graph TD
     subgraph Edge Layer [Showroom Edge / Local Machine]
         CCTV["CCTV / IP Cameras (RTSP TCP)"]
-        Detector["Edge AI Engine (local_detector.py)\n• YOLOv11 Person Detection\n• SCRFD / YuNet Face Tracking\n• ByteTrack & Bounding Box Smoothing\n• Entry/Exit Line & Zone Dwell Timers\n• Local MJPEG Stream Server"]
+        Detector["Edge AI Engine (local_detector.py)\n• RF-DETR Transformer Detection\n• SCRFD / YuNet Face Tracking\n• ByteTrack & Bounding Box Smoothing\n• Entry/Exit Line & Zone Dwell Timers\n• Local MJPEG Stream Server"]
         SyncQueue["Background Sync Client (Queue)"]
     end
 
@@ -42,7 +42,7 @@ Detailed architectural flows, algorithms, and math models are documented in [flo
 
 ## 2. Key Features
 
-- **Local Edge AI Inference (`local_detector.py`)**: Runs YOLOv11 person detection directly on local hardware without sending raw video feeds over the cloud.
+- **Local Edge AI Inference (`local_detector.py`)**: Runs Roboflow RF-DETR person detection directly on local hardware without sending raw video feeds over the cloud.
 - **RTSP TCP Buffer Management**: Forces TCP transport globally (`rtsp_transport;tcp`) and uses a non-blocking threaded frame grabber (`ThreadedRTSPReader`) to prevent frame delay and macroblock artifacts.
 - **Persistent Tracking & Smoothing**: Powered by ByteTrack and Euclidean centroid tracking with EMA (Exponential Moving Average) bounding box smoothing and deadband jitter suppression.
 - **Face & Torso Alignment**: Integrated SCRFD / YuNet face detection constrained within upper-torso regions to prevent false face detections on posters or clothing graphics.
@@ -60,7 +60,7 @@ Detailed architectural flows, algorithms, and math models are documented in [flo
 
 | Component | Technologies |
 |---|---|
-| **Edge AI Engine** | Python 3.11+, Ultralytics YOLOv11, ByteTrack, OpenCV, NumPy |
+| **Edge AI Engine** | Python 3.11+, Roboflow RF-DETR, Ultralytics YOLOv11 (fallback), ByteTrack, OpenCV, NumPy |
 | **Backend API** | FastAPI, SQLAlchemy 2.x, Alembic, Pydantic v2, PostgreSQL (`psycopg` 3) |
 | **Auth Service** | Node.js, Express 5, TypeScript (`tsx`), `pg`, bcryptjs |
 | **Frontend Web** | React 19, TypeScript, Vite, Tailwind CSS v4, Recharts, Lucide Icons |
