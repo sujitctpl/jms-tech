@@ -73,6 +73,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
     attendance,
     quickCheckInEmployee,
     quickCheckOutEmployee,
+    staffDepartmentDwell,
+    departments,
   } = useShowroom();
 
   // Interactive Chart States (Neon Wave Curve / Dual Comparative Pillars / Stacked)
@@ -244,7 +246,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             </div>
             <div className="mt-3 flex items-center text-xs text-emerald-700 font-bold gap-1 bg-emerald-50 px-2 py-0.5 rounded-lg border border-emerald-200/60 w-fit">
               <ArrowUpRight className="w-3.5 h-3.5" />
-              <span>+{Math.abs(metrics.comparisonYesterdayPct)}% vs yesterday</span>
+              <span>+{isNaN(metrics.comparisonYesterdayPct) ? 0 : Math.abs(metrics.comparisonYesterdayPct)}% vs yesterday</span>
             </div>
           </div>
 
@@ -296,7 +298,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             </div>
             <div className="flex items-baseline gap-2">
               <span className="text-3xl sm:text-4xl font-extrabold text-slate-900 font-['Outfit'] tracking-tight">
-                {metrics.comparisonYesterdayPct >= 0 ? `+${metrics.comparisonYesterdayPct}%` : `${metrics.comparisonYesterdayPct}%`}
+                {isNaN(metrics.comparisonYesterdayPct) ? '+0%' : (metrics.comparisonYesterdayPct >= 0 ? `+${metrics.comparisonYesterdayPct}%` : `${metrics.comparisonYesterdayPct}%`)}
               </span>
               <span className="text-xs font-semibold text-slate-600">(0 y&apos;day)</span>
             </div>
@@ -331,67 +333,124 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             </div>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5 mt-4">
-            {/* Main Entrance Attendance Card */}
-            <div className="p-4 rounded-xl bg-slate-800/70 border border-slate-700/80 flex items-center justify-between">
-              <div>
-                <div className="flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                  <span className="text-xs font-bold text-slate-300 uppercase tracking-wide">Main Entry Attendance</span>
-                </div>
-                <div className="text-2xl sm:text-3xl font-extrabold font-['Outfit'] text-white mt-1">
-                  {metrics.totalVisitors}
-                </div>
-                <div className="text-[11px] text-slate-400 mt-0.5">
-                  Crossed Virtual Line
-                </div>
-              </div>
-              <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400">
-                <Users className="w-6 h-6" />
-              </div>
-            </div>
+          <div className="mt-4">
+            {/* Dynamic Section Metrics Cards */}
+            {(() => {
+              const allTelemetryKeys = Array.from(
+                new Set([
+                  ...Object.keys(metrics.sectionCounts || {}),
+                  ...Object.keys(metrics.sectionOccupancy || {}),
+                ])
+              ).filter(Boolean);
 
-            {/* Sales Section Card */}
-            <div className="p-4 rounded-xl bg-slate-800/70 border border-amber-500/30 flex items-center justify-between">
-              <div>
-                <div className="flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full bg-amber-400" />
-                  <span className="text-xs font-bold text-amber-300 uppercase tracking-wide">Sales Section</span>
-                </div>
-                <div className="text-2xl sm:text-3xl font-extrabold font-['Outfit'] text-amber-400 mt-1">
-                  {metrics.sectionCounts?.sales || 0}
-                </div>
-                <div className="text-[11px] text-slate-400 mt-0.5 flex items-center gap-1.5">
-                  <span>Cumulative Visits</span>
-                  <span className="text-slate-600">•</span>
-                  <span className="text-amber-300 font-semibold">{metrics.sectionOccupancy?.sales || 0} active now</span>
-                </div>
-              </div>
-              <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-400">
-                <Flame className="w-6 h-6" />
-              </div>
-            </div>
+              // 1. Dynamically retrieve all active departments configured in Settings / database
+              const activeConfiguredDepts = (departments || []).filter((d) => d.is_active !== false);
+              const activeDeptIds = activeConfiguredDepts.map((d) => d.id);
 
-            {/* Accounts Section Card */}
-            <div className="p-4 rounded-xl bg-slate-800/70 border border-blue-500/30 flex items-center justify-between">
-              <div>
+              // 2. Base fallback if departments not loaded yet
+              const baseKeys = activeDeptIds.length > 0 ? activeDeptIds : ['ai_department', 'bde', 'marketing'];
+
+              // 3. Merge active configured department IDs + any sections that have telemetry counts
+              const displaySectionKeys = Array.from(
+                new Set([
+                  ...baseKeys,
+                  ...allTelemetryKeys,
+                ])
+              );
+
+              const getSectionTheme = (index: number) => {
+                const themes = [
+                  { dot: 'bg-amber-400', text: 'text-amber-300', num: 'text-amber-400', active: 'text-amber-300', border: 'border-amber-500/30', iconBg: 'bg-amber-500/10 text-amber-400 border-amber-500/20' },
+                  { dot: 'bg-blue-400', text: 'text-blue-300', num: 'text-blue-400', active: 'text-blue-300', border: 'border-blue-500/30', iconBg: 'bg-blue-500/10 text-blue-400 border-blue-500/20' },
+                  { dot: 'bg-cyan-400', text: 'text-cyan-300', num: 'text-cyan-400', active: 'text-cyan-300', border: 'border-cyan-500/30', iconBg: 'bg-cyan-500/10 text-cyan-400 border-cyan-500/20' },
+                  { dot: 'bg-purple-400', text: 'text-purple-300', num: 'text-purple-400', active: 'text-purple-300', border: 'border-purple-500/30', iconBg: 'bg-purple-500/10 text-purple-400 border-purple-500/20' },
+                ];
+                return themes[index % themes.length];
+              };
+
+              return (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3.5">
+                  {/* Main Entrance Attendance Card */}
+                  <div className="p-4 rounded-xl bg-slate-800/70 border border-slate-700/80 flex items-center justify-between">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                        <span className="text-xs font-bold text-slate-300 uppercase tracking-wide">Main Entry Attendance</span>
+                      </div>
+                      <div className="text-2xl sm:text-3xl font-extrabold font-['Outfit'] text-white mt-1">
+                        {metrics.totalVisitors}
+                      </div>
+                      <div className="text-[11px] text-slate-400 mt-0.5">
+                        Crossed Virtual Line
+                      </div>
+                    </div>
+                    <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400">
+                      <Users className="w-6 h-6" />
+                    </div>
+                  </div>
+
+                  {/* Dynamic Section Cards */}
+                  {displaySectionKeys.map((secKey, idx) => {
+                    const theme = getSectionTheme(idx);
+                    const deptObj = (departments || []).find((d) => d.id.toLowerCase() === secKey.toLowerCase());
+                    const title = deptObj?.name ? deptObj.name.toUpperCase() : secKey.replace(/_/g, ' ').toUpperCase();
+                    const visits = metrics.sectionCounts?.[secKey] || 0;
+                    const active = metrics.sectionOccupancy?.[secKey] || 0;
+
+                    return (
+                      <div key={secKey} className={`p-4 rounded-xl bg-slate-800/70 border ${theme.border} flex items-center justify-between`}>
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <span className={`w-2 h-2 rounded-full ${theme.dot}`} />
+                            <span className={`text-xs font-bold ${theme.text} uppercase tracking-wide`}>{title}</span>
+                          </div>
+                          <div className={`text-2xl sm:text-3xl font-extrabold font-['Outfit'] ${theme.num} mt-1`}>
+                            {visits}
+                          </div>
+                          <div className="text-[11px] text-slate-400 mt-0.5 flex items-center gap-1.5">
+                            <span>Cumulative Visits</span>
+                            <span className="text-slate-600">•</span>
+                            <span className={`${theme.active} font-semibold`}>{active} active now</span>
+                          </div>
+                        </div>
+                        <div className={`p-3 rounded-xl border ${theme.iconBg}`}>
+                          {idx % 2 === 0 ? <Flame className="w-6 h-6" /> : <BarChart3 className="w-6 h-6" />}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })()}
+
+            {/* Active Staff Department Presence & Dwell Ribbon */}
+            {staffDepartmentDwell && Object.keys(staffDepartmentDwell).length > 0 && (
+              <div className="mt-3.5 p-3.5 rounded-xl bg-slate-800/90 border border-amber-500/40 flex flex-wrap items-center justify-between gap-3 shadow-md">
                 <div className="flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full bg-blue-400" />
-                  <span className="text-xs font-bold text-blue-300 uppercase tracking-wide">Accounts Section</span>
+                  <span className="relative flex h-2.5 w-2.5">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                    <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500" />
+                  </span>
+                  <span className="text-xs font-bold text-amber-300 uppercase tracking-wider font-['Outfit']">
+                    Active Staff in Departments
+                  </span>
                 </div>
-                <div className="text-2xl sm:text-3xl font-extrabold font-['Outfit'] text-blue-400 mt-1">
-                  {metrics.sectionCounts?.accounts || 0}
-                </div>
-                <div className="text-[11px] text-slate-400 mt-0.5 flex items-center gap-1.5">
-                  <span>Cumulative Visits</span>
-                  <span className="text-slate-600">•</span>
-                  <span className="text-blue-300 font-semibold">{metrics.sectionOccupancy?.accounts || 0} active now</span>
+                <div className="flex items-center gap-2 flex-wrap">
+                  {Object.entries(staffDepartmentDwell).map(([empId, s]) => (
+                    <div
+                      key={empId}
+                      className="px-3 py-1.5 rounded-lg bg-amber-500/15 border border-amber-500/30 flex items-center gap-2.5 text-xs text-white shadow-2xs"
+                    >
+                      <span className="font-bold text-amber-300">{s.name}</span>
+                      <span className="text-slate-400 font-medium">({s.department_name})</span>
+                      <span className="font-mono font-extrabold text-emerald-400 px-1.5 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/30">
+                        ⏱ {s.dwell_formatted}
+                      </span>
+                    </div>
+                  ))}
                 </div>
               </div>
-              <div className="p-3 rounded-xl bg-blue-500/10 border border-blue-500/20 text-blue-400">
-                <BarChart3 className="w-6 h-6" />
-              </div>
-            </div>
+            )}
           </div>
         </div>
 

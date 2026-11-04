@@ -22,7 +22,7 @@ import {
   PURPOSE_COLORS,
   YESTERDAY_METRICS,
 } from '../data/seedData';
-import { cameraService } from '../services/cameraService';
+import { cameraService, DepartmentModel } from '../services/cameraService';
 import { FASTAPI_BASE_URL } from '../config/env';
 
 interface ShowroomContextType {
@@ -95,6 +95,19 @@ interface ShowroomContextType {
   // Section Tracking
   sectionCounts: { sales: number; accounts: number; [key: string]: number };
   sectionOccupancy: { sales: number; accounts: number; [key: string]: number };
+  staffDepartmentDwell: Record<string, {
+    name: string;
+    department_id: string;
+    department_name: string;
+    dwell_seconds: number;
+    dwell_formatted: string;
+    is_active?: boolean;
+    total_seconds?: number;
+    total_formatted?: string;
+    visits?: number;
+  }>;
+  departments: DepartmentModel[];
+  refreshDepartments: () => Promise<void>;
 
   // CSV Export
   exportVisitorsCSV: () => void;
@@ -598,6 +611,36 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     sales: 0,
     accounts: 0,
   });
+  const [staffDepartmentDwell, setStaffDepartmentDwell] = useState<Record<string, {
+    name: string;
+    department_id: string;
+    department_name: string;
+    dwell_seconds: number;
+    dwell_formatted: string;
+    is_active?: boolean;
+    total_seconds?: number;
+    total_formatted?: string;
+    visits?: number;
+  }>>({});
+
+  const [departments, setDepartments] = useState<DepartmentModel[]>([]);
+
+  const refreshDepartments = async () => {
+    try {
+      const data = await cameraService.listDepartments();
+      if (data && Array.isArray(data)) {
+        setDepartments(data);
+      }
+    } catch (e) {
+      console.warn('[ShowroomContext] Failed to load departments:', e);
+    }
+  };
+
+  useEffect(() => {
+    refreshDepartments();
+    const deptInterval = setInterval(refreshDepartments, 3000);
+    return () => clearInterval(deptInterval);
+  }, []);
 
   // Real-time backend footfall polling (receives live entries from local AI detector / edge client)
   const [lastSyncedFootfall, setLastSyncedFootfall] = useState<number | null>(null);
@@ -615,6 +658,9 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         }
         if (data.section_occupancy) {
           setSectionOccupancy((prev) => ({ ...prev, ...data.section_occupancy }));
+        }
+        if (data.staff_dwell) {
+          setStaffDepartmentDwell(data.staff_dwell);
         }
 
         const backendTotal = data.total_entries;
@@ -665,9 +711,16 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     const newVisitorPct = totalVisitors > 0 ? Math.round((newVisitors / totalVisitors) * 100) : 0;
     const returningVisitorPct = totalVisitors > 0 ? Math.round((returningVisitors / totalVisitors) * 100) : 0;
 
-    // Comparison with yesterday (using seed baseline)
-    const diff = totalVisitors - YESTERDAY_METRICS.totalVisitors;
-    const comparisonYesterdayPct = Math.round((diff / YESTERDAY_METRICS.totalVisitors) * 100);
+    // Comparison with yesterday (safely guarded against division by zero/NaN)
+    const yTotal = YESTERDAY_METRICS.totalVisitors;
+    let comparisonYesterdayPct = 0;
+    if (yTotal > 0) {
+      comparisonYesterdayPct = Math.round(((totalVisitors - yTotal) / yTotal) * 100);
+    } else if (totalVisitors > 0) {
+      comparisonYesterdayPct = 100;
+    } else {
+      comparisonYesterdayPct = 0;
+    }
 
     // Employees attendance
     const employeesTotal = attendance.length;
@@ -944,6 +997,9 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         metrics,
         sectionCounts,
         sectionOccupancy,
+        staffDepartmentDwell,
+        departments,
+        refreshDepartments,
         exportVisitorsCSV,
         exportAttendanceCSV,
       }}

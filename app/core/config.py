@@ -25,8 +25,8 @@ class Settings(BaseSettings):
     RTMDet_MODEL_PATH: str = "models/rtmdet-m-person.onnx"
     RF_DETR_VARIANT: str = "small"
     RF_DETR_WEIGHTS_PATH: Optional[str] = None
-    DETECTION_CONFIDENCE_THRESHOLD: float = 0.33
-    DETECTION_IMGSZ: int = 960
+    DETECTION_CONFIDENCE_THRESHOLD: float = 0.31
+    DETECTION_IMGSZ: int = 1024
     PERSON_CLASS_ID: int = 0
     DEVICE: str = "cuda:0"
     TRACKER_TYPE: str = "bytetrack.yaml"
@@ -42,10 +42,10 @@ class Settings(BaseSettings):
 
     # Face Embedding & Identity Recovery Settings
     ARCFACE_MODEL_PATH: str = "models/w600k_r50.onnx"
-    FACE_SIMILARITY_THRESHOLD: float = 0.38  # Calibrated operating threshold for high precision
+    FACE_SIMILARITY_THRESHOLD: float = 0.32  # Calibrated operating threshold for high precision
     FACE_MATCH_MARGIN: float = 0.030  # Minimum difference between Top-1 and Top-2 distinct candidate matches
     FACE_MIN_SIZE: int = 16  # Minimum face width/height in pixels (calibrated for seated/back-row staff)
-    FACE_MIN_CONFIDENCE: float = 0.30  # Minimum face detector confidence to reject ears/hair/monitors
+    FACE_MIN_CONFIDENCE: float = 0.36  # Minimum face detector confidence to reject ears/hair/monitors
     FACE_BLUR_THRESHOLD: float = 5.0  # Minimum Laplacian variance for blur filtering
     FACE_MAX_YAW: float = 65.0  # Maximum head yaw in degrees (calibrated for angled seating / walking)
     FACE_MAX_PITCH: float = 50.0  # Maximum head pitch in degrees (accommodates 35°-45° overhead CCTV)

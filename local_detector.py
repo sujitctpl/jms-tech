@@ -139,6 +139,7 @@ class DashboardSyncClient:
         total_entries: int,
         section_counts: Optional[dict] = None,
         section_occupancy: Optional[dict] = None,
+        staff_dwell: Optional[dict] = None,
     ) -> None:
         """Enqueue periodic heartbeat telemetry with multi-zone stats."""
         payload = {
@@ -149,6 +150,7 @@ class DashboardSyncClient:
             "total_entries": total_entries,
             "section_counts": section_counts or {},
             "section_occupancy": section_occupancy or {},
+            "staff_dwell": staff_dwell or {},
         }
         try:
             self.queue.put_nowait(("heartbeat", payload))
@@ -961,6 +963,339 @@ class TrackSmoother:
 
 
 # ---------------------------------------------------------------------------
+# Employee Department Dwell & Presence Tracker
+# ---------------------------------------------------------------------------
+class EmployeeDepartmentTracker:
+    """
+    Real-Time Employee Department & Section Dwell Time Tracker.
+    - Accurately tracks when recognized showroom staff enter a department, how much continuous
+      time they spend inside, and when they exit.
+    - Emits high-visibility, formatted console logs:
+      * Entry:
+        [--> EMPLOYEE ENTERED DEPARTMENT] Staff {name} ({emp_id}) entered '{dept_name}' at {time_str}
+      * Active Dwell Updates (default every 10s):
+        [⏱️ EMPLOYEE IN DEPARTMENT] Staff {name} ({emp_id}) in '{dept_name}' | Time spent: {dwell_str} ({seconds}s) | Total today: {cumul_str}
+      * Exit:
+        [<-- EMPLOYEE LEFT DEPARTMENT] Staff {name} ({emp_id}) left '{dept_name}' | Total time spent: {dwell_str} ({seconds}s) | Total today: {cumul_str} (Visits: {visits})
+    - Keyed by persistent employee_id, ensuring zero timer resets or losses on ByteTrack ID flips.
+    - Seamlessly transfers pre-recognition candidate track dwell time once biometric verification succeeds.
+    - Debounces exits by 2.0s to prevent false exits due to momentary edge crossings or occlusions.
+    - Formats digital timers (MM:SS) for bounding box badges & HUD telemetry.
+    """
+
+    def __init__(self, log_interval: float = 10.0, exit_debounce: float = 2.0):
+        self.log_interval = float(log_interval)
+        self.exit_debounce = float(exit_debounce)
+
+        # Active employee department sessions: emp_id -> dict
+        self.active_sessions: Dict[str, dict] = {}
+
+        # Pending exit timestamps: emp_id -> timestamp when first not seen in dept
+        self.pending_exits: Dict[str, float] = {}
+
+        # Cumulative time spent per employee per department: emp_id -> { dept_id: total_seconds }
+        self.cumulative_dwell: Dict[str, Dict[str, float]] = {}
+
+        # Visit counts per employee per department: emp_id -> { dept_id: count }
+        self.visit_counts: Dict[str, Dict[str, int]] = {}
+
+        # Unconfirmed track history before biometric confirmation:
+        # track_id (str) -> { "dept_id": str, "dept_name": str, "entry_time": float, "last_seen_time": float }
+        self.unconfirmed_tracks: Dict[str, dict] = {}
+
+    @staticmethod
+    def format_duration(seconds: float) -> str:
+        """Formats duration into human-readable representation: e.g. '45s', '2m 15s', '1h 05m 20s'."""
+        secs = int(max(0, round(seconds)))
+        if secs < 60:
+            return f"{secs}s"
+        mins = secs // 60
+        rem_secs = secs % 60
+        if mins < 60:
+            return f"{mins}m {rem_secs:02d}s"
+        hrs = mins // 60
+        rem_mins = mins % 60
+        return f"{hrs}h {rem_mins:02d}m {rem_secs:02d}s"
+
+    @staticmethod
+    def format_digital(seconds: float) -> str:
+        """Formats duration into digital clock format: MM:SS or HH:MM:SS."""
+        secs = int(max(0, round(seconds)))
+        mins = secs // 60
+        rem_secs = secs % 60
+        if mins < 60:
+            return f"{mins:02d}:{rem_secs:02d}"
+        hrs = mins // 60
+        rem_mins = mins % 60
+        return f"{hrs:02d}:{rem_mins:02d}:{rem_secs:02d}"
+
+    def update_employee_presence(
+        self,
+        emp_id: str,
+        emp_name: str,
+        current_dept: Optional[Tuple[str, str]],
+        now_ts: float,
+        track_id: Optional[str] = None,
+    ) -> None:
+        """
+        Updates employee presence in a department.
+        current_dept: (dept_id, dept_name) or None if outside all departments.
+        """
+        emp_id = str(emp_id)
+        if not emp_name:
+            emp_name = emp_id
+
+        if current_dept is not None:
+            dept_id, dept_name = current_dept
+            # Employee confirmed inside department: cancel any pending exit timer
+            self.pending_exits.pop(emp_id, None)
+
+            if emp_id in self.active_sessions:
+                session = self.active_sessions[emp_id]
+                if session["dept_id"] == dept_id:
+                    # Ongoing dwell in same department
+                    session["last_seen_time"] = now_ts
+                    session["emp_name"] = emp_name
+                    if track_id:
+                        session["track_id"] = str(track_id)
+
+                    time_spent = max(0.0, now_ts - session["entry_time"])
+                    if now_ts - session["last_log_time"] >= self.log_interval:
+                        session["last_log_time"] = now_ts
+                        dur_str = self.format_duration(time_spent)
+                        cumul_so_far = self.cumulative_dwell.get(emp_id, {}).get(dept_id, 0.0) + time_spent
+                        cumul_str = self.format_duration(cumul_so_far)
+                        print(
+                            f"[⏱️ EMPLOYEE IN DEPARTMENT] Staff {emp_name} ({emp_id}) in '{dept_name}' | "
+                            f"Time spent: {dur_str} ({time_spent:.1f}s) | Total today: {cumul_str}"
+                        )
+                else:
+                    # Transitioned directly into a different department
+                    old_dept_id = session["dept_id"]
+                    old_dept_name = session["dept_name"]
+                    spent = session["last_seen_time"] - session["entry_time"]
+                    self._finalize_exit(emp_id, session["emp_name"], old_dept_id, old_dept_name, spent)
+
+                    # Start new department session
+                    self._start_session(emp_id, emp_name, dept_id, dept_name, now_ts, track_id)
+            else:
+                # New entry into department
+                entry_time = now_ts
+                if track_id and str(track_id) in self.unconfirmed_tracks:
+                    cand = self.unconfirmed_tracks.pop(str(track_id))
+                    if cand.get("dept_id") == dept_id:
+                        entry_time = cand.get("entry_time", now_ts)
+
+                self._start_session(emp_id, emp_name, dept_id, dept_name, entry_time, track_id, current_ts=now_ts)
+
+        else:
+            # Employee is not inside any department zone in this frame
+            if emp_id in self.active_sessions:
+                if emp_id not in self.pending_exits:
+                    self.pending_exits[emp_id] = now_ts
+                else:
+                    outside_dur = now_ts - self.pending_exits[emp_id]
+                    if outside_dur >= self.exit_debounce:
+                        session = self.active_sessions.pop(emp_id)
+                        self.pending_exits.pop(emp_id, None)
+                        spent = session["last_seen_time"] - session["entry_time"]
+                        self._finalize_exit(emp_id, session["emp_name"], session["dept_id"], session["dept_name"], spent)
+
+    def _start_session(
+        self,
+        emp_id: str,
+        emp_name: str,
+        dept_id: str,
+        dept_name: str,
+        entry_time: float,
+        track_id: Optional[str] = None,
+        current_ts: Optional[float] = None,
+    ) -> None:
+        now_ts = current_ts or entry_time
+        self.active_sessions[emp_id] = {
+            "emp_id": emp_id,
+            "emp_name": emp_name,
+            "dept_id": dept_id,
+            "dept_name": dept_name,
+            "entry_time": entry_time,
+            "last_seen_time": now_ts,
+            "last_log_time": now_ts,
+            "track_id": str(track_id) if track_id else None,
+        }
+        time_str = datetime.now().strftime("%H:%M:%S")
+        tid_tag = f" [Track #{track_id}]" if track_id else ""
+        dwell_prior = now_ts - entry_time
+        if dwell_prior > 1.5:
+            dwell_str = self.format_duration(dwell_prior)
+            print(
+                f"[--> EMPLOYEE DETECTED IN DEPARTMENT] Staff {emp_name} ({emp_id}){tid_tag} "
+                f"detected inside '{dept_name}' at {time_str} (Dwell so far: {dwell_str})"
+            )
+        else:
+            print(
+                f"[--> EMPLOYEE ENTERED DEPARTMENT] Staff {emp_name} ({emp_id}){tid_tag} "
+                f"entered '{dept_name}' at {time_str}"
+            )
+
+    def _finalize_exit(self, emp_id: str, emp_name: str, dept_id: str, dept_name: str, time_spent: float) -> None:
+        if time_spent < 1.0:
+            return
+        emp_cumul = self.cumulative_dwell.setdefault(emp_id, {})
+        emp_cumul[dept_id] = emp_cumul.get(dept_id, 0.0) + time_spent
+
+        emp_visits = self.visit_counts.setdefault(emp_id, {})
+        emp_visits[dept_id] = emp_visits.get(dept_id, 0) + 1
+
+        dur_str = self.format_duration(time_spent)
+        tot_cumul_str = self.format_duration(emp_cumul[dept_id])
+        num_visits = emp_visits[dept_id]
+        print(
+            f"[<-- EMPLOYEE LEFT DEPARTMENT] Staff {emp_name} ({emp_id}) left '{dept_name}' | "
+            f"Total time spent: {dur_str} ({time_spent:.1f}s) | "
+            f"Total today: {tot_cumul_str} (Visits: {num_visits})"
+        )
+
+    def update_unconfirmed_track(self, track_id: str, dept: Optional[Tuple[str, str]], now_ts: float) -> None:
+        """Tracks department presence for candidate tracks before facial recognition confirms identity."""
+        tid = str(track_id)
+        if dept is not None:
+            dept_id, dept_name = dept
+            if tid in self.unconfirmed_tracks and self.unconfirmed_tracks[tid]["dept_id"] == dept_id:
+                self.unconfirmed_tracks[tid]["last_seen_time"] = now_ts
+            else:
+                self.unconfirmed_tracks[tid] = {
+                    "dept_id": dept_id,
+                    "dept_name": dept_name,
+                    "entry_time": now_ts,
+                    "last_seen_time": now_ts,
+                }
+        else:
+            if tid in self.unconfirmed_tracks:
+                if now_ts - self.unconfirmed_tracks[tid]["last_seen_time"] >= self.exit_debounce:
+                    self.unconfirmed_tracks.pop(tid, None)
+
+    def promote_track_to_employee(self, track_id: str, emp_id: str, emp_name: str, now_ts: float) -> None:
+        """Promotes a track to an identified employee, transferring active department dwell if applicable."""
+        tid = str(track_id)
+        emp_id = str(emp_id)
+        if tid in self.unconfirmed_tracks:
+            cand = self.unconfirmed_tracks.pop(tid)
+            if emp_id not in self.active_sessions:
+                self._start_session(
+                    emp_id=emp_id,
+                    emp_name=emp_name,
+                    dept_id=cand["dept_id"],
+                    dept_name=cand["dept_name"],
+                    entry_time=cand["entry_time"],
+                    track_id=tid,
+                    current_ts=now_ts,
+                )
+
+    def tick_inactive_employees(self, visible_staff_ids: Set[str], now_ts: float) -> None:
+        """Checks for employees in active sessions who were not seen in this frame."""
+        for emp_id in list(self.active_sessions.keys()):
+            if emp_id not in visible_staff_ids:
+                if emp_id not in self.pending_exits:
+                    self.pending_exits[emp_id] = now_ts
+                else:
+                    if (now_ts - self.pending_exits[emp_id]) >= self.exit_debounce:
+                        session = self.active_sessions.pop(emp_id)
+                        self.pending_exits.pop(emp_id, None)
+                        spent = session["last_seen_time"] - session["entry_time"]
+                        self._finalize_exit(emp_id, session["emp_name"], session["dept_id"], session["dept_name"], spent)
+
+    def on_employee_lost(self, emp_id: str, now_ts: float) -> None:
+        """Immediate cleanup when an employee track expires or is explicitly lost."""
+        emp_id = str(emp_id)
+        self.pending_exits.pop(emp_id, None)
+        if emp_id in self.active_sessions:
+            session = self.active_sessions.pop(emp_id)
+            spent = session["last_seen_time"] - session["entry_time"]
+            self._finalize_exit(emp_id, session["emp_name"], session["dept_id"], session["dept_name"], spent)
+
+    def get_active_dwell_info(self, emp_id: str, now_ts: float) -> Optional[Tuple[str, str, str]]:
+        """Returns (dept_name, digital_str, duration_str) or None."""
+        session = self.active_sessions.get(str(emp_id))
+        if not session:
+            return None
+        time_spent = max(0.0, now_ts - session["entry_time"])
+        return session["dept_name"], self.format_digital(time_spent), self.format_duration(time_spent)
+
+    def get_staff_in_dept(self, dept_id: str, now_ts: float) -> List[Tuple[str, str]]:
+        """Returns list of (emp_name, digital_timer_str) for staff currently active in dept_id."""
+        res = []
+        for emp_id, s in self.active_sessions.items():
+            if s["dept_id"] == dept_id:
+                dur = self.format_digital(max(0.0, now_ts - s["entry_time"]))
+                res.append((s["emp_name"], dur))
+        return res
+
+    def get_all_active_summary(self, now_ts: float) -> str:
+        """Returns a concise summary string of all staff currently inside departments for HUD ribbon."""
+        items = []
+        for emp_id, s in self.active_sessions.items():
+            dur = self.format_digital(max(0.0, now_ts - s["entry_time"]))
+            short_dept = s["dept_name"].split()[0]
+            short_name = s["emp_name"].split()[0]
+            items.append(f"{short_name} ({short_dept} {dur})")
+        return "  |  ".join(items)
+
+    def get_all_active_sessions_payload(self, now_ts: float) -> Dict[str, dict]:
+        """Returns JSON-serializable dictionary of active and cumulative employee dwell for heartbeat telemetry."""
+        payload = {}
+        all_emp_ids = set(self.active_sessions.keys()).union(self.cumulative_dwell.keys())
+        for emp_id in all_emp_ids:
+            is_active = emp_id in self.active_sessions
+            session = self.active_sessions.get(emp_id)
+            spent = max(0.0, now_ts - session["entry_time"]) if session else 0.0
+
+            if session:
+                dept_id = session["dept_id"]
+                dept_name = session["dept_name"]
+                emp_name = session["emp_name"]
+            else:
+                emp_depts = self.cumulative_dwell.get(emp_id, {})
+                dept_id = max(emp_depts.keys(), key=lambda d: emp_depts[d]) if emp_depts else "ai_department"
+                dept_name = dept_id.replace("_", " ").title()
+                emp_name = emp_id
+
+            cumul_total = self.cumulative_dwell.get(emp_id, {}).get(dept_id, 0.0) + spent
+
+            payload[emp_id] = {
+                "name": emp_name,
+                "department_id": dept_id,
+                "department_name": dept_name,
+                "is_active": is_active,
+                "dwell_seconds": int(round(spent)),
+                "dwell_formatted": self.format_digital(spent),
+                "total_seconds": int(round(cumul_total)),
+                "total_formatted": self.format_duration(cumul_total),
+                "visits": self.visit_counts.get(emp_id, {}).get(dept_id, 1 if is_active else 0),
+            }
+        return payload
+
+    def finalize_all(self, now_ts: float) -> None:
+        """Finalizes all active sessions on shutdown and prints a comprehensive summary table."""
+        for emp_id in list(self.active_sessions.keys()):
+            session = self.active_sessions.pop(emp_id)
+            spent = session["last_seen_time"] - session["entry_time"]
+            self._finalize_exit(emp_id, session["emp_name"], session["dept_id"], session["dept_name"], spent)
+        self.pending_exits.clear()
+
+        # Print summary if any dwell was recorded
+        if self.cumulative_dwell:
+            print("\n" + "=" * 65)
+            print("  SHOWROOM EMPLOYEE DEPARTMENT DWELL TIME SUMMARY")
+            print("=" * 65)
+            for emp_id, depts in self.cumulative_dwell.items():
+                print(f"[*] Employee: {emp_id}")
+                for d_id, total_secs in depts.items():
+                    v_count = self.visit_counts.get(emp_id, {}).get(d_id, 0)
+                    print(f"    - {d_id}: {self.format_duration(total_secs)} ({total_secs:.1f}s) across {v_count} visit(s)")
+            print("=" * 65 + "\n")
+
+
+# ---------------------------------------------------------------------------
 # Interactive Multi-Zone & Dynamic User-Drawn Entry Line Manager
 # ---------------------------------------------------------------------------
 class ZoneManager:
@@ -1031,6 +1366,7 @@ class ZoneManager:
         self.counted_person_sections: Dict[str, Set[str]] = {}
         self.person_section_dwell: Dict[Tuple[int, str], int] = {}
         self.track_positions: Dict[int, Tuple[float, float]] = {}  # obj_id -> prev feet (x, y)
+        self.section_occupants: Dict[str, list] = {s["id"]: [] for s in self.sections}
 
         # Visual Flash Timers
         self.line_flash_timer = 0
@@ -1043,6 +1379,7 @@ class ZoneManager:
         self.mouse_current = (0, 0)
         self.status_msg = "CLICK & DRAG TO DRAW ENTRY LINE OR SELECT A DEPARTMENT TOOL ABOVE"
         self.status_timer = 250
+        self.dept_tracker: Optional[Any] = None
 
         # Dynamic Toolbar button layout (computes dynamic department buttons)
         self.btn_sections: List[Tuple[int, int, int, int, dict]] = []
@@ -1068,6 +1405,57 @@ class ZoneManager:
         self.btn_reset = (curr_x, 8, curr_x + 95, 46)
         curr_x += 103
         self.btn_clear = (curr_x, 8, curr_x + 85, 46)
+
+    def find_section_for_box(self, box: Tuple[float, float, float, float]) -> Optional[Tuple[str, str]]:
+        """
+        Returns (section_id, section_name) if the bounding box torso center or body volume is genuinely inside a department.
+        Uses torso center and overlap ratio to avoid false triggers from background passersby.
+        """
+        x1, y1, x2, y2 = box
+        feet_x = (x1 + x2) * 0.5
+        feet_y = y2
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        person_area = max(1.0, (x2 - x1) * (y2 - y1))
+
+        best_match = None
+        max_overlap = 0.0
+
+        for s in self.sections:
+            bx1, by1, bx2, by2 = s["box"]
+            if (bx2 - bx1) <= 15 or (by2 - by1) <= 15:
+                continue
+
+            # Compute intersection overlap
+            inter_w = max(0.0, min(x2, bx2) - max(x1, bx1))
+            inter_h = max(0.0, min(y2, by2) - max(y1, by1))
+            overlap_ratio = (inter_w * inter_h) / person_area
+
+            # Torso center is inside department box
+            center_inside = (bx1 <= cx <= bx2) and (by1 <= cy <= by2)
+            # Feet inside department box and person's center is not far above the box in the background
+            feet_inside = (bx1 <= feet_x <= bx2) and (by1 <= feet_y <= by2) and (cy >= by1 - 15)
+
+            if center_inside or overlap_ratio >= 0.25 or feet_inside:
+                score = overlap_ratio if overlap_ratio > 0 else (1.0 if center_inside else 0.5)
+                if score > max_overlap:
+                    max_overlap = score
+                    best_match = (s["id"], s["name"])
+
+        return best_match
+
+    def find_section_for_point(self, pt: Tuple[float, float]) -> Optional[Tuple[str, str]]:
+        """
+        Returns (section_id, section_name) if the point (x, y) is inside a valid drawn department.
+        """
+        px, py = pt
+        for s in self.sections:
+            bx1, by1, bx2, by2 = s["box"]
+            if (bx2 - bx1) <= 15 or (by2 - by1) <= 15:
+                continue
+            if bx1 <= px <= bx2 and by1 <= py <= by2:
+                return s["id"], s["name"]
+        return None
 
     def check_and_reload_config(self) -> bool:
         """Dynamically reloads departments and entry line if camera_config.json was modified."""
@@ -1126,6 +1514,8 @@ class ZoneManager:
         self.person_visited_sections.clear()
         self.counted_person_sections.clear()
         self.person_section_dwell.clear()
+        for sid in self.section_occupants:
+            self.section_occupants[sid].clear()
         for sid in self.section_totals:
             self.section_totals[sid] = 0
         self.status_msg = "[+] Entry count cleared and reset to 0!"
@@ -1141,6 +1531,10 @@ class ZoneManager:
                 self.counted_person_ids.add(pid)
             if pid in self.counted_person_sections:
                 self.person_visited_sections.setdefault(obj_id, set()).update(self.counted_person_sections[pid])
+            for sid, occupants in self.section_occupants.items():
+                for occ in occupants:
+                    if occ.get("track_id") == obj_id:
+                        occ["pid"] = pid
 
     def flip_direction(self):
         """Cycles entry line crossing direction between forward, backward, and bidirectional (both)."""
@@ -1328,28 +1722,39 @@ class ZoneManager:
 
             self.track_positions[obj_id] = curr_pos
 
-            # 2. Check Sections (Sales, Service, Accounts, etc.) with Anti-Grazing Dwell Verification
+            # 2. Check Sections (AI Dept, BDE, Marketing, etc.) with Torso-Anchored Dwell Verification
             if self.sections:
                 visited = self.person_visited_sections.setdefault(obj_id, set())
+                matched_sec = self.find_section_for_box(box)
                 for s in self.sections:
-                    bx1, by1, bx2, by2 = s["box"]
-                    dwell_key = (obj_id, s["id"])
-                    if bx1 <= feet_x <= bx2 and by1 <= feet_y <= by2:
-                        self.live_occupancy[s["id"]] = self.live_occupancy.get(s["id"], 0) + 1
+                    sid = s["id"]
+                    dwell_key = (obj_id, sid)
+                    is_in_this_sec = (matched_sec is not None and matched_sec[0] == sid)
+
+                    if is_in_this_sec:
+                        self.live_occupancy[sid] = self.live_occupancy.get(sid, 0) + 1
                         # Track consecutive frames inside department zone
                         self.person_section_dwell[dwell_key] = self.person_section_dwell.get(dwell_key, 0) + 1
                         # Require at least 3 consecutive frames (~0.12s) to register genuine entry
                         if self.person_section_dwell[dwell_key] >= 3:
-                            if s["id"] not in visited:
-                                visited.add(s["id"])
+                            if sid not in visited:
+                                visited.add(sid)
                                 if pid:
-                                    self.counted_person_sections.setdefault(pid, set()).add(s["id"])
-                                self.section_totals[s["id"]] = self.section_totals.get(s["id"], 0) + 1
-                                self.section_flash_timers[s["id"]] = 25
-                                new_section_entries.append((obj_id, s["id"], s["name"]))
+                                    self.counted_person_sections.setdefault(pid, set()).add(sid)
+                                self.section_totals[sid] = self.section_totals.get(sid, 0) + 1
+                                self.section_flash_timers[sid] = 25
+                                new_section_entries.append((obj_id, sid, s["name"]))
                     else:
                         if dwell_key in self.person_section_dwell:
                             self.person_section_dwell[dwell_key] = 0
+                        # Re-arm visit if person has been outside this section for >= 15 frames (~0.6s)
+                        if sid in visited:
+                            outside_key = (obj_id, f"{sid}_outside")
+                            outside_cnt = self.person_section_dwell.get(outside_key, 0) + 1
+                            self.person_section_dwell[outside_key] = outside_cnt
+                            if outside_cnt >= 15:
+                                visited.discard(sid)
+                                self.person_section_dwell.pop(outside_key, None)
 
         # Decrement flash timers
         if self.line_flash_timer > 0:
@@ -2243,6 +2648,8 @@ def run_local_detector(
         direction=direction,
         api_url=api_url,
     )
+    employee_dept_tracker = EmployeeDepartmentTracker(log_interval=10.0, exit_debounce=2.0)
+    zone_manager.dept_tracker = employee_dept_tracker
     sync_client = DashboardSyncClient(base_url=api_url, camera_id=camera_id)
 
     # Face Embedding & Identity Recovery System (ArcFace + pgvector + 14-Day Retention)
@@ -2549,6 +2956,7 @@ def run_local_detector(
                     track_last_seen.pop(old_id, None)
                     identity_manager.on_track_lost(str(old_id))
                     track_last_recognition_attempt.pop(str(old_id), None)
+                    employee_dept_tracker.unconfirmed_tracks.pop(str(old_id), None)
 
             # Evaluate Dynamic Entry Line Crossing & Multi-Zone Section Visits
             new_attendance, new_sections = zone_manager.process(tracked_objects)
@@ -2566,7 +2974,12 @@ def run_local_detector(
 
             for (p_id, s_id, s_name) in new_sections:
                 sec_tot = zone_manager.section_totals.get(s_id, 0)
-                print(f"[--> SECTION VISIT] Person #{p_id} entered {s_name}! Total {s_name} Visits: {sec_tot}")
+                if employee_recognizer.is_track_employee(str(p_id)):
+                    emp_id = employee_recognizer.get_employee_id(str(p_id))
+                    emp_label = employee_names.get(emp_id, emp_id)
+                    print(f"[--> STAFF VISIT] Staff member {emp_label} (#{p_id}) entered {s_name}! Total {s_name} Visits: {sec_tot}")
+                else:
+                    print(f"[--> SECTION VISIT] Person #{p_id} entered {s_name}! Total {s_name} Visits: {sec_tot}")
                 sync_client.send_section_entry_event(tracker_id=str(p_id), section_id=s_id, section_name=s_name)
 
             # Send Telemetry Heartbeat every 2.5 seconds
@@ -2579,6 +2992,7 @@ def run_local_detector(
                     total_entries=zone_manager.attendance_total,
                     section_counts=zone_manager.section_totals,
                     section_occupancy=zone_manager.live_occupancy,
+                    staff_dwell=employee_dept_tracker.get_all_active_sessions_payload(now),
                 )
                 last_heartbeat_time = now
 
@@ -2637,7 +3051,8 @@ def run_local_detector(
             # ---------------------------------------------------------------
             # 1. Draw Bounding Boxes for each Tracked Person (Body: Emerald Green, Face: Vivid Magenta)
             matched_faces_count = 0
-            embeddings_extracted_this_frame = 0
+            embeddings_extracted_this_frame = 0 
+            visible_staff_this_frame: Set[str] = set()
             for obj_id, (x1, y1, x2, y2) in tracked_objects.items():
                 ix1, iy1, ix2, iy2 = int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))
                 box_w = max(1, ix2 - ix1)
@@ -2798,6 +3213,7 @@ def run_local_detector(
                                     announced_staff_tracks.add(obj_id)
                                     emp_label = employee_names.get(emp_id, emp_id)
                                     print(f"[+] Biometrics: Verified Staff {emp_label} ({emp_id}) on Track #{obj_id} (conf: {emp_conf:.2f})")
+                                    employee_dept_tracker.promote_track_to_employee(tid, emp_id, emp_label, now_ts)
                                 last_punch = punched_employee_ids.get(emp_id, 0.0)
                                 if (now_ts - last_punch) > 300.0:
                                     punched_employee_ids[emp_id] = now_ts
@@ -2922,6 +3338,8 @@ def run_local_detector(
                                 employee_recognizer.track_to_employee[str(obj_id)] = s_eid
                                 anchor["last_seen"] = now_ts
                                 anchor["last_track_id"] = str(obj_id)
+                                emp_label = employee_names.get(s_eid, s_eid)
+                                employee_dept_tracker.promote_track_to_employee(str(obj_id), s_eid, emp_label, now_ts)
                                 break
 
                 if is_staff and emp_id:
@@ -2934,10 +3352,23 @@ def run_local_detector(
                         except Exception:
                             pass
                     emp_display = employee_names.get(emp_id, emp_id)
-                    main_label = f"STAFF [{emp_display}] #{obj_id} | {timer_str}"
+                    visible_staff_this_frame.add(emp_id)
+
+                    # Update employee department dwell and live timer
+                    staff_dept = zone_manager.find_section_for_box((x1, y1, x2, y2))
+                    employee_dept_tracker.update_employee_presence(emp_id, emp_display, staff_dept, now_ts, track_id=str(obj_id))
+
+                    dwell_info = employee_dept_tracker.get_active_dwell_info(emp_id, now_ts)
+                    if dwell_info:
+                        d_name, d_dig, _ = dwell_info
+                        main_label = f"STAFF [{emp_display}] #{obj_id} | In {d_name}: {d_dig} | {timer_str}"
+                    else:
+                        main_label = f"STAFF [{emp_display}] #{obj_id} | {timer_str}"
                     body_color = (0, 215, 255)  # Vivid Golden Yellow for verified showroom staff
                     cv2.rectangle(frame, (ix1, iy1), (ix2, iy2), body_color, 2)
                 else:
+                    cand_dept = zone_manager.find_section_for_box((x1, y1, x2, y2))
+                    employee_dept_tracker.update_unconfirmed_track(str(obj_id), cand_dept, now_ts)
                     pid_val = identity_manager.get_person_id(obj_id)
                     pid_desc = f" | {pid_val}" if pid_val else " | PID: Unresolved"
                     main_label = f"Person #{obj_id}{pid_desc} | {timer_str}"
@@ -3131,12 +3562,22 @@ def run_local_detector(
                     if eid in currently_active_staff or time_since_seen > 3.5:
                         employee_recognizer.on_track_lost(s_track.get("tracker_id", f"seated_{eid}"))
                         employee_recognizer.on_track_lost(str(eid))
+                        employee_dept_tracker.on_employee_lost(str(eid), now_ts)
                         del seated_staff_tracks[eid]
                         continue
 
                     bx1, by1, bx2, by2 = s_track["box"]
                     ename = s_track["emp_name"]
                     econf = s_track["conf"]
+                    visible_staff_this_frame.add(eid)
+
+                    # Update seated employee department presence & dwell
+                    s_dept = zone_manager.find_section_for_box((bx1, by1, bx2, by2))
+                    employee_dept_tracker.update_employee_presence(eid, ename, s_dept, now_ts, track_id=s_track.get("tracker_id"))
+                    if s_dept:
+                        s_sid = s_dept[0]
+                        if zone_manager.live_occupancy.get(s_sid, 0) == 0:
+                            zone_manager.live_occupancy[s_sid] = 1
 
                     # Golden Yellow Bounding Box for Staff
                     cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 215, 255), 2)
@@ -3144,10 +3585,18 @@ def run_local_detector(
                         if 0 <= lx < w and 0 <= ly < h:
                             cv2.circle(frame, (lx, ly), 2, (0, 255, 255), -1)
 
-                    slabel = f"STAFF [{ename}] | Face {int(econf * 100)}%"
+                    s_dwell = employee_dept_tracker.get_active_dwell_info(eid, now_ts)
+                    if s_dwell:
+                        s_dname, s_ddig, _ = s_dwell
+                        slabel = f"STAFF [{ename}] | In {s_dname}: {s_ddig} | Face {int(econf * 100)}%"
+                    else:
+                        slabel = f"STAFF [{ename}] | Face {int(econf * 100)}%"
                     (slw, slh), _ = cv2.getTextSize(slabel, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
                     cv2.rectangle(frame, (bx1, max(0, by1 - 18)), (bx1 + slw + 8, by1), (15, 23, 42), -1)
                     cv2.putText(frame, slabel, (bx1 + 4, max(12, by1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 215, 255), 1, cv2.LINE_AA)
+
+            # Check for inactive staff who left camera view
+            employee_dept_tracker.tick_inactive_employees(visible_staff_this_frame, now_ts)
 
             # 3. Render User-Drawn Sections, Entry Line, and Interactive Clickable Top Toolbar
             frame = zone_manager.render_overlay(frame)
@@ -3165,9 +3614,11 @@ def run_local_detector(
                 sec_str = f"  |  {sec_badges}" if sec_badges else ""
                 sec_shortcuts = "  ".join([f"[{i+2}] {s['name'].split()[0]}" for i, s in enumerate(zone_manager.sections)])
                 sec_shortcut_str = f"  {sec_shortcuts} " if sec_shortcuts else ""
+                staff_hud = employee_dept_tracker.get_all_active_summary(now_ts)
+                staff_hud_str = f"  |  Staff: {staff_hud}" if staff_hud else ""
                 stats_text = (
                     f"{hw_tag} FPS: {fps:.1f}  |  "
-                    f"Entry: {zone_manager.attendance_total}{sec_str}  |  "
+                    f"Entry: {zone_manager.attendance_total}{sec_str}{staff_hud_str}  |  "
                     f"Keys: [1] Line{sec_shortcut_str} [D] Flip Dir  [C] Reset  [R] Clear"
                 )
                 cv2.putText(frame, stats_text, (15, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 225, 255), 1, cv2.LINE_AA)
@@ -3225,6 +3676,7 @@ def run_local_detector(
         if not headless:
             cv2.destroyAllWindows()
         sync_client.stop()
+        employee_dept_tracker.finalize_all(time.time())
         print(f"\n[+] Local detection finished. Total Attendance: {zone_manager.attendance_total}, Section visits: {zone_manager.section_totals}")
 
 
@@ -3317,14 +3769,14 @@ def main():
     parser.add_argument(
         "--conf",
         type=float,
-        default=float(config.get("confidence", 0.33)),
-        help="Person detection confidence threshold (default: 0.33)",
+        default=float(config.get("confidence", 0.31)),
+        help="Person detection confidence threshold (default: 0.31)",
     )
     parser.add_argument(
         "--imgsz",
         type=int,
-        default=int(config.get("imgsz", 960)),
-        help="Inference input resolution in pixels (default: 960)",
+        default=int(config.get("imgsz", 1024)),
+        help="Inference input resolution in pixels (default: 1024)",
     )
     parser.add_argument(
         "--model-type",
@@ -3367,14 +3819,14 @@ def main():
     parser.add_argument(
         "--face-conf",
         type=float,
-        default=float(config.get("face_confidence", 0.30)),
-        help="Neural face detection confidence threshold (default: 0.30)",
+        default=float(config.get("face_confidence", 0.36)),
+        help="Neural face detection confidence threshold (default: 0.36)",
     )
     parser.add_argument(
         "--sim-thresh",
         type=float,
         default=float(config.get("face_similarity_threshold", settings.FACE_SIMILARITY_THRESHOLD)),
-        help="Biometric face cosine similarity threshold for staff identification (default: 0.38)",
+        help="Biometric face cosine similarity threshold for staff identification (default: 0.32)",
     )
     parser.add_argument(
         "--standalone-faces",

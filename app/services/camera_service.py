@@ -242,6 +242,7 @@ class CameraService:
             "total_entries": heartbeat.total_entries,
             "section_counts": heartbeat.section_counts,
             "section_occupancy": heartbeat.section_occupancy,
+            "staff_dwell": heartbeat.staff_dwell,
             "last_seen": time.time(),
         }
         return {"status": "ok", "camera_id": camera.id}

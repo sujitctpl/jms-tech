@@ -18,6 +18,7 @@ import {
   X,
   Camera,
   Sparkles,
+  Building2,
 } from 'lucide-react';
 import { AddEmployeeModal } from '../modals/AddEmployeeModal';
 import { AddEmployeePhotosModal } from '../modals/AddEmployeePhotosModal';
@@ -31,6 +32,8 @@ export const AttendanceView: React.FC = () => {
     quickCheckOutEmployee,
     exportAttendanceCSV,
     metrics,
+    staffDepartmentDwell,
+    departments: configuredDepartments,
   } = useShowroom();
 
   const [searchQuery, setSearchQuery] = useState('');
@@ -271,6 +274,95 @@ export const AttendanceView: React.FC = () => {
         </div>
       </div>
 
+      {/* Floor Department Presence & Live Dwell Tracker */}
+      <div className="p-4 sm:p-5 bg-gradient-to-r from-slate-900 via-slate-800 to-indigo-950 rounded-3xl border border-slate-700/80 text-white shadow-md">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-3 pb-3 border-b border-slate-700/70">
+          <div className="flex items-center gap-2.5">
+            <div className="p-2 rounded-xl bg-blue-500/20 text-blue-400 border border-blue-500/30">
+              <Building2 className="w-4 h-4" />
+            </div>
+            <div>
+              <h3 className="text-sm font-bold font-['Outfit'] flex items-center gap-2">
+                Floor Department Presence & Staff Dwell Time
+                <span className="text-[9px] font-mono px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 border border-blue-500/30">
+                  LIVE CCTV AI
+                </span>
+              </h3>
+              <p className="text-[11px] text-slate-400 mt-0.5">
+                Real-time tracking of employee presence, departmental shifts, and logged time spent per zone.
+              </p>
+            </div>
+          </div>
+          <div className="text-[11px] text-slate-300 bg-slate-800/90 px-3 py-1.5 rounded-xl border border-slate-700 flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+            <span>AI Tracker Live</span>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+          {(() => {
+            const activeDepts = (configuredDepartments || []).filter((d) => d.is_active !== false);
+            const deptsToDisplay = activeDepts.length > 0 ? activeDepts : [
+              { id: 'ai_department', name: 'AI Department', color: '#3B82F6', is_active: true },
+              { id: 'bde', name: 'BDE Department', color: '#10B981', is_active: true },
+              { id: 'marketing', name: 'Marketing', color: '#14B8A6', is_active: true },
+            ];
+
+            return deptsToDisplay.map((dept) => {
+              const assignedStaff = Object.values(staffDepartmentDwell || {}).find(
+                (d) => d.department_id?.toLowerCase() === dept.id.toLowerCase() ||
+                       d.department_name?.toLowerCase().includes(dept.name.toLowerCase())
+              );
+              const isLive = assignedStaff && assignedStaff.is_active !== false && assignedStaff.dwell_seconds > 0;
+              const hasPastDwell = assignedStaff && assignedStaff.total_seconds && assignedStaff.total_seconds > 0;
+
+              return (
+                <div key={dept.id} className="p-3.5 rounded-2xl bg-slate-800/90 border border-slate-700/80 hover:border-slate-600 transition flex flex-col justify-between shadow-inner">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold text-white flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full" style={{ backgroundColor: dept.color || '#3B82F6' }} />
+                      {dept.name}
+                    </span>
+                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${isLive ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 animate-pulse' : 'bg-slate-700 text-slate-300 border-slate-600'}`}>
+                      {isLive ? '1 Active' : '0 Active'}
+                    </span>
+                  </div>
+                  <div className="mt-2.5">
+                    <div className="flex items-baseline justify-between">
+                      <span className="text-xl font-extrabold font-['Outfit'] text-white">
+                        {isLive ? assignedStaff.dwell_formatted : hasPastDwell ? assignedStaff.total_formatted : '00:00'}
+                      </span>
+                      <span className="text-[10px] text-slate-400 font-semibold">{isLive ? 'Active Timer' : hasPastDwell ? "Today's Dwell" : 'Floor Idle'}</span>
+                    </div>
+                    <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-slate-300">
+                      {isLive ? (
+                        <>
+                          <UserCheck className="w-3.5 h-3.5 text-emerald-400" />
+                          <span className="font-semibold text-white">{assignedStaff.name}</span>
+                          <span className="text-emerald-300 text-[10px]">
+                            (Live: {assignedStaff.dwell_formatted})
+                          </span>
+                        </>
+                      ) : hasPastDwell ? (
+                        <>
+                          <UserCheck className="w-3.5 h-3.5 text-blue-400" />
+                          <span className="font-semibold text-white">{assignedStaff.name}</span>
+                          <span className="text-slate-400 text-[10px]">
+                            ({assignedStaff.total_formatted} logged)
+                          </span>
+                        </>
+                      ) : (
+                        <span className="text-slate-400 text-[10px]">No active staff inside</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            });
+          })()}
+        </div>
+      </div>
+
       {/* Filter and Search Bar */}
       <div className="bg-white rounded-3xl p-5 border border-slate-200/80 shadow-[0_4px_24px_-4px_rgba(15,23,42,0.06)] flex flex-col sm:flex-row gap-3">
         <div className="flex-1 relative">
@@ -400,11 +492,65 @@ export const AttendanceView: React.FC = () => {
                     </td>
                     <td className="py-3 px-3">
                       <p className="text-slate-800 font-semibold">{rec.role}</p>
-                      <span className="text-[10px] text-slate-400 font-medium">{rec.department}</span>
+                      <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
+                        <span className="text-[10px] text-slate-400 font-medium">Base: {rec.department}</span>
+                      </div>
+                      {(() => {
+                        const empKey = rec.employeeId?.toUpperCase();
+                        const empNameLower = rec.employeeName?.toLowerCase();
+                        const dwell = (staffDepartmentDwell && (staffDepartmentDwell[rec.employeeId] || staffDepartmentDwell[empKey])) ||
+                          (staffDepartmentDwell && Object.values(staffDepartmentDwell).find(
+                            (d) => d.name?.toLowerCase() === empNameLower
+                          ));
+
+                        if (!dwell) return null;
+
+                        const isLive = dwell.is_active !== false && dwell.dwell_seconds > 0;
+                        const hasDwell = dwell.total_seconds && dwell.total_seconds > 0;
+
+                        if (isLive) {
+                          return (
+                            <div className="mt-1 flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-900 border border-emerald-300 text-[10px] font-bold w-fit shadow-2xs">
+                              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                              <span>🟢 Live in {dwell.department_name} ({dwell.dwell_formatted})</span>
+                            </div>
+                          );
+                        }
+
+                        if (hasDwell) {
+                          return (
+                            <div className="mt-1 flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-blue-50 text-blue-900 border border-blue-200 text-[10px] font-bold w-fit shadow-2xs">
+                              <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />
+                              <span>📍 {dwell.department_name}: {dwell.total_formatted}</span>
+                            </div>
+                          );
+                        }
+
+                        return null;
+                      })()}
                     </td>
                     <td className="py-3 px-3 font-mono font-medium text-slate-700">{rec.checkInTime || '—'}</td>
                     <td className="py-3 px-3 font-mono font-medium text-slate-700">{rec.checkOutTime || 'On Duty'}</td>
-                    <td className="py-3 px-3 font-mono text-slate-700">{rec.workHours ? `${rec.workHours}h` : '0h'}</td>
+                    <td className="py-3 px-3 font-mono text-slate-700">
+                      <div className="font-bold text-slate-900">{rec.workHours ? `${rec.workHours}h` : '0h'}</div>
+                      {(() => {
+                        const empKey = rec.employeeId?.toUpperCase();
+                        const empNameLower = rec.employeeName?.toLowerCase();
+                        const dwell = (staffDepartmentDwell && (staffDepartmentDwell[rec.employeeId] || staffDepartmentDwell[empKey])) ||
+                          (staffDepartmentDwell && Object.values(staffDepartmentDwell).find(
+                            (d) => d.name?.toLowerCase() === empNameLower
+                          ));
+                        if (!dwell) return null;
+                        const isLive = dwell.is_active !== false && dwell.dwell_seconds > 0;
+                        const timeStr = isLive ? dwell.dwell_formatted : (dwell.total_seconds && dwell.total_seconds > 0 ? dwell.total_formatted : null);
+                        if (!timeStr) return null;
+                        return (
+                          <span className={`text-[10px] font-semibold block mt-0.5 whitespace-nowrap ${isLive ? 'text-emerald-600 font-bold' : 'text-blue-600'}`}>
+                            ⏱️ {timeStr} in {dwell.department_name}
+                          </span>
+                        );
+                      })()}
+                    </td>
                     <td className="py-3 px-3 text-[11px] text-slate-500">{rec.method}</td>
                     <td className="py-3 px-3">
                       <span

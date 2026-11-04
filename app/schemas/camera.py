@@ -95,6 +95,7 @@ class CameraStatusResponse(BaseModel):
     total_entries: int = 0
     section_counts: Dict[str, int] = Field(default_factory=dict)
     section_occupancy: Dict[str, int] = Field(default_factory=dict)
+    staff_dwell: Dict[str, Any] = Field(default_factory=dict)
 
 
 class FootfallRecordRequest(BaseModel):
@@ -124,4 +125,5 @@ class CameraHeartbeatRequest(BaseModel):
     total_entries: int = 0
     section_counts: Dict[str, int] = Field(default_factory=dict)
     section_occupancy: Dict[str, int] = Field(default_factory=dict)
+    staff_dwell: Dict[str, Any] = Field(default_factory=dict)
 

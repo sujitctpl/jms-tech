@@ -37,7 +37,7 @@ const PRESET_COLORS = [
 
 export const SettingsView: React.FC = () => {
   const { user } = useAuth();
-  const { storeHours, updateStoreHours, isStoreCurrentlyOpen } = useShowroom();
+  const { storeHours, updateStoreHours, isStoreCurrentlyOpen, refreshDepartments } = useShowroom();
 
   // Tab State
   const [activeTab, setActiveTab] = useState<'detection' | 'schedule'>('detection');
@@ -158,6 +158,7 @@ export const SettingsView: React.FC = () => {
         const created = await cameraService.createDepartment(payload);
         if (created) {
           setDepartments((prev) => [...prev, created]);
+          refreshDepartments();
           setDeptMessage({
             type: 'success',
             text: `New department "${created.name}" created! It now appears on the CCTV detection screen.`,

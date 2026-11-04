@@ -12,6 +12,8 @@ class FootfallTotalResponse(BaseModel):
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
     section_counts: Optional[dict] = None
+    section_occupancy: Optional[dict] = None
+    staff_dwell: Optional[dict] = None
 
 
 class DailyFootfallItem(BaseModel):

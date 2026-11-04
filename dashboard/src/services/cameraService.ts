@@ -33,6 +33,13 @@ export interface FootfallSummary {
   end_time: string | null;
   section_counts?: Record<string, number>;
   section_occupancy?: Record<string, number>;
+  staff_dwell?: Record<string, {
+    name: string;
+    department_id: string;
+    department_name: string;
+    dwell_seconds: number;
+    dwell_formatted: string;
+  }>;
 }
 
 export interface DepartmentModel {
@@ -271,9 +278,11 @@ class CameraService {
       console.warn('[CameraService] Failed to fetch departments from backend', e);
     }
     return [
+      { id: 'ai_department', name: 'AI Department', color: '#3B82F6', is_active: true },
+      { id: 'bde', name: 'BDE Department', color: '#10B981', is_active: true },
       { id: 'sales', name: 'Sales Section', color: '#00D7FF', is_active: true },
-      { id: 'service', name: 'Service Section', color: '#32E178', is_active: true },
       { id: 'accounts', name: 'Accounts Section', color: '#FF8C00', is_active: true },
+      { id: 'service', name: 'Service Section', color: '#32E178', is_active: true },
     ];
   }
 
