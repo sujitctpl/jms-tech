@@ -12,6 +12,10 @@ import {
   Sparkles,
   ArrowRight,
   Camera,
+  X,
+  ZoomIn,
+  Trash2,
+  User,
 } from 'lucide-react';
 import { PURPOSE_COLORS } from '../../data/seedData';
 
@@ -31,12 +35,14 @@ const PURPOSES: VisitPurpose[] = [
 ];
 
 export const VisitPurposeView: React.FC<VisitPurposeViewProps> = ({ onTagVisitor }) => {
-  const { visitors, tagVisitor, metrics, exportVisitorsCSV, employees } = useShowroom();
+  const { visitors, tagVisitor, clearAllVisitors, metrics, exportVisitorsCSV, employees } = useShowroom();
 
   const [activeTabFilter, setActiveTabFilter] = useState<'all' | 'untagged' | 'tagged'>('all');
   const [purposeFilter, setPurposeFilter] = useState<string>('all');
   const [salespersonFilter, setSalespersonFilter] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState('');
+  const [previewVisitor, setPreviewVisitor] = useState<VisitorRecord | null>(null);
+  const [isClearing, setIsClearing] = useState(false);
 
   // Extract salespeople
   const salespeople = useMemo(() => {
@@ -88,13 +94,32 @@ export const VisitPurposeView: React.FC<VisitPurposeViewProps> = ({ onTagVisitor
           </p>
         </div>
 
-        <button
-          onClick={exportVisitorsCSV}
-          className="px-3.5 py-2 bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 hover:border-slate-400 rounded-xl text-xs font-semibold shadow-2xs flex items-center gap-1.5 transition self-start sm:self-auto"
-        >
-          <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
-          <span>Export Tagged CSV</span>
-        </button>
+        <div className="flex items-center gap-2 self-start sm:self-auto">
+          {visitors.length > 0 && (
+            <button
+              onClick={async () => {
+                if (window.confirm('Are you sure you want to clear all visitor records and captured photos? This will reset the visitor list to start fresh.')) {
+                  setIsClearing(true);
+                  await clearAllVisitors();
+                  setIsClearing(false);
+                }
+              }}
+              disabled={isClearing}
+              className="px-3.5 py-2 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 rounded-xl text-xs font-semibold shadow-2xs flex items-center gap-1.5 transition active:scale-95 disabled:opacity-50"
+            >
+              <Trash2 className="w-4 h-4 text-red-600" />
+              <span>{isClearing ? 'Clearing...' : 'Clear All Visitors'}</span>
+            </button>
+          )}
+
+          <button
+            onClick={exportVisitorsCSV}
+            className="px-3.5 py-2 bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 hover:border-slate-400 rounded-xl text-xs font-semibold shadow-2xs flex items-center gap-1.5 transition"
+          >
+            <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+            <span>Export Tagged CSV</span>
+          </button>
+        </div>
       </div>
 
       {/* Untagged Warning Banner */}
@@ -243,7 +268,20 @@ export const VisitPurposeView: React.FC<VisitPurposeViewProps> = ({ onTagVisitor
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 bg-white">
-              {filteredVisitors.map((vis) => {
+              {filteredVisitors.length === 0 ? (
+                <tr>
+                  <td colSpan={8} className="py-12 text-center text-slate-400">
+                    <div className="flex flex-col items-center justify-center gap-2">
+                      <Camera className="w-8 h-8 text-slate-300 animate-pulse" />
+                      <p className="text-sm font-semibold text-slate-600">No visitors recorded yet</p>
+                      <p className="text-xs text-slate-400">
+                        CCTV AI detection will automatically snapshot arriving customers and list them here for 1-click tagging.
+                      </p>
+                    </div>
+                  </td>
+                </tr>
+              ) : (
+                filteredVisitors.map((vis) => {
                 const isTagged = vis.taggingStatus === 'Tagged' && vis.visitPurpose;
                 const purposeColor = vis.visitPurpose ? PURPOSE_COLORS[vis.visitPurpose] : '#94a3b8';
 
@@ -256,24 +294,43 @@ export const VisitPurposeView: React.FC<VisitPurposeViewProps> = ({ onTagVisitor
                   >
                     <td className="py-3 px-4">
                       <div className="flex items-center gap-3">
-                        <div className="relative shrink-0 overflow-hidden rounded-xl border border-slate-700/80 bg-slate-950 shadow-xs w-10 h-10">
-                          <img
-                            src={vis.avatarUrl || 'https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?w=160&auto=format&fit=crop&q=80'}
-                            alt={vis.visitorId}
-                            className="w-full h-full object-cover object-top contrast-[1.05] brightness-95"
-                          />
-                          <div className="absolute inset-0.5 border border-emerald-400/40 rounded-lg pointer-events-none" />
+                        <div 
+                          onClick={() => vis.avatarUrl && setPreviewVisitor(vis)}
+                          title={vis.avatarUrl ? "Click to zoom high-res CCTV photo" : "No photo captured"}
+                          className={`relative group shrink-0 overflow-hidden rounded-xl border border-slate-700/80 bg-slate-950 shadow-xs w-11 h-11 ${
+                            vis.avatarUrl ? 'cursor-pointer' : 'cursor-default'
+                          }`}
+                        >
+                          {vis.avatarUrl ? (
+                            <>
+                              <img
+                                src={vis.avatarUrl}
+                                alt={vis.visitorId}
+                                className="w-full h-full object-cover object-top contrast-[1.05] brightness-95 group-hover:scale-110 transition duration-200"
+                              />
+                              <div className="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 transition flex items-center justify-center">
+                                <ZoomIn className="w-3.5 h-3.5 text-white drop-shadow" />
+                              </div>
+                            </>
+                          ) : (
+                            <div className="w-full h-full flex items-center justify-center bg-slate-800 text-slate-400">
+                              <User className="w-5 h-5 text-slate-400" />
+                            </div>
+                          )}
                           <div className="absolute top-0.5 left-1 bg-black/80 px-1 py-0.2 rounded text-[7px] font-mono font-bold text-emerald-400 leading-tight">
-                            CAM-01
-                          </div>
-                          <div className="absolute bottom-0.5 right-1 flex items-center gap-0.5 bg-black/80 px-1 py-0.2 rounded leading-tight">
-                            <span className="w-1 h-1 rounded-full bg-red-500 animate-ping" />
-                            <span className="text-[7px] font-mono text-white/90 font-bold">REC</span>
+                            {vis.cameraSource ? vis.cameraSource.slice(0, 7) : 'CAM-01'}
                           </div>
                         </div>
                         <div>
-                          <span className="font-mono font-bold text-slate-900 block">{vis.visitorId}</span>
-                          <span className="text-[10px] text-slate-400 font-medium">Main Gate NVR</span>
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="font-mono font-bold text-slate-900 block">{vis.visitorId}</span>
+                            {vis.notes && vis.notes.includes("Appearance:") && (
+                              <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-purple-50 text-purple-700 border border-purple-200">
+                                👔 {vis.notes.split('|')[0].replace("Appearance:", "").trim()}
+                              </span>
+                            )}
+                          </div>
+                          <span className="text-[10px] text-slate-400 font-medium">{vis.cameraSource || 'Entrance Camera'}</span>
                         </div>
                       </div>
                     </td>
@@ -338,11 +395,87 @@ export const VisitPurposeView: React.FC<VisitPurposeViewProps> = ({ onTagVisitor
                     </td>
                   </tr>
                 );
-              })}
+              }))}
             </tbody>
           </table>
         </div>
       </div>
+
+      {/* Visitor Photo Lightbox Modal */}
+      {previewVisitor && (
+        <div 
+          onClick={() => setPreviewVisitor(null)}
+          className="fixed inset-0 bg-slate-900/75 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-fadeIn"
+        >
+          <div 
+            onClick={(e) => e.stopPropagation()}
+            className="bg-white rounded-3xl max-w-sm w-full p-5 shadow-2xl border border-slate-200 relative animate-scaleUp"
+          >
+            <button
+              onClick={() => setPreviewVisitor(null)}
+              className="absolute top-4 right-4 p-2 text-slate-400 hover:text-slate-600 rounded-xl hover:bg-slate-100 transition"
+            >
+              <X className="w-5 h-5" />
+            </button>
+            <div className="relative rounded-2xl overflow-hidden border border-slate-700 bg-slate-950 aspect-square shadow-inner flex items-center justify-center">
+              {previewVisitor.avatarUrl ? (
+                <img
+                  src={previewVisitor.avatarUrl}
+                  alt={previewVisitor.visitorId}
+                  className="w-full h-full object-cover object-top contrast-[1.05] brightness-95"
+                />
+              ) : (
+                <div className="w-full h-full flex flex-col items-center justify-center bg-slate-900 text-slate-400">
+                  <User className="w-16 h-16 text-slate-500 mb-2" />
+                  <span className="text-xs font-semibold">No face photo captured</span>
+                </div>
+              )}
+              <div className="absolute top-2 left-2 bg-black/80 px-2 py-0.5 rounded text-[10px] font-mono font-bold text-emerald-400">
+                {previewVisitor.cameraSource || 'Entrance Camera'}
+              </div>
+              <div className="absolute bottom-2 right-2 flex items-center gap-1 bg-black/80 px-2 py-0.5 rounded text-[10px] font-mono text-white font-bold">
+                <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-ping" />
+                <span>AI CAPTURE</span>
+              </div>
+            </div>
+            <div className="mt-4 space-y-2">
+              <div className="flex items-center justify-between">
+                <div>
+                  <span className="font-mono font-extrabold text-slate-900 text-lg block">{previewVisitor.visitorId}</span>
+                  <span className="text-xs text-slate-500">First seen: {previewVisitor.firstSeenTime} ({previewVisitor.durationMinutes} mins ago)</span>
+                </div>
+                <span className="px-2.5 py-1 rounded-full text-xs font-bold bg-blue-100 text-blue-800">
+                  {previewVisitor.visitorType}
+                </span>
+              </div>
+              {previewVisitor.notes && previewVisitor.notes.includes("Appearance:") && (
+                <div className="p-2.5 rounded-xl bg-purple-50 border border-purple-100 text-xs font-semibold text-purple-800 flex items-center gap-1.5">
+                  <span>👔</span>
+                  <span>{previewVisitor.notes.split('|')[0].replace("Appearance:", "").trim()}</span>
+                </div>
+              )}
+              <div className="pt-2 flex gap-2">
+                <button
+                  onClick={() => {
+                    const v = previewVisitor;
+                    setPreviewVisitor(null);
+                    onTagVisitor(v);
+                  }}
+                  className="flex-1 py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl text-xs transition shadow-md shadow-blue-500/20 active:scale-95"
+                >
+                  Tag This Visitor
+                </button>
+                <button
+                  onClick={() => setPreviewVisitor(null)}
+                  className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-xl text-xs transition"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

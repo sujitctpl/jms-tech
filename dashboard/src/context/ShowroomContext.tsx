@@ -31,6 +31,8 @@ interface ShowroomContextType {
   tagVisitor: (visitorId: string, purpose: VisitPurpose, salesperson: string, notes: string) => void;
   addNewVisitor: (record: Partial<VisitorRecord>) => void;
   checkoutVisitor: (visitorId: string) => void;
+  refreshVisitors: () => Promise<void>;
+  clearAllVisitors: () => Promise<void>;
 
   // Employees & Attendance
   employees: Employee[];
@@ -118,19 +120,21 @@ const ShowroomContext = createContext<ShowroomContextType | undefined>(undefined
 
 export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [visitors, setVisitors] = useState<VisitorRecord[]>(() => {
+    // Purge legacy mock seed data so visitor list is populated strictly by real detections
     const saved = localStorage.getItem('capermint_visitors') || localStorage.getItem('jms_visitors');
-    if (!saved) return INITIAL_VISITORS;
+    if (!saved) return [];
     try {
       const parsed: VisitorRecord[] = JSON.parse(saved);
-      // Auto-purge legacy mock seed data (ids starting with vis-10 or vis-11) so values start fresh at 0
-      if (parsed.some((v) => v.id.startsWith('vis-10') || v.id.startsWith('vis-11'))) {
+      // Auto-purge any records containing stock Unsplash photos
+      const hasUnsplash = parsed.some((v) => v.avatarUrl && v.avatarUrl.includes('unsplash.com'));
+      if (hasUnsplash || parsed.some((v) => v.id.startsWith('vis-10') || v.id.startsWith('vis-11'))) {
         localStorage.removeItem('capermint_visitors');
         localStorage.removeItem('jms_visitors');
         return [];
       }
       return parsed;
     } catch {
-      return INITIAL_VISITORS;
+      return [];
     }
   });
 
@@ -320,6 +324,9 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   // Tag visitor
   const tagVisitor = (visitorId: string, purpose: VisitPurpose, salesperson: string, notes: string) => {
+    const target = visitors.find((v) => v.id === visitorId || v.visitorId === visitorId);
+    const pidToTag = target?.visitorId || target?.id || visitorId;
+
     setVisitors((prev) =>
       prev.map((v) => {
         if (v.id === visitorId || v.visitorId === visitorId) {
@@ -334,25 +341,72 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         return v;
       })
     );
+    // Sync with backend API using canonical visitor ID
+    cameraService.tagVisitor(pidToTag, purpose, salesperson, notes).catch((err) => {
+      console.warn('Failed to persist visitor tag to server:', err);
+    });
   };
+
+  // Synchronize live visitors from backend (including AI detected face photos)
+  const refreshVisitors = async () => {
+    try {
+      const data = await cameraService.listVisitors();
+      if (data && Array.isArray(data.visitors)) {
+        const mapped: VisitorRecord[] = data.visitors.map((v: any) => ({
+          id: v.id,
+          visitorId: v.visitorId,
+          avatarUrl: v.avatarUrl
+            ? (v.avatarUrl.startsWith('http') ? v.avatarUrl : `${FASTAPI_BASE_URL}${v.avatarUrl}`)
+            : undefined,
+          firstSeenTime: v.firstSeenTime,
+          lastSeenTime: v.lastSeenTime,
+          exitTime: v.exitTime,
+          visitorType: (v.visitorType as 'New' | 'Returning') || 'New',
+          visitPurpose: v.visitPurpose || null,
+          assignedSalesperson: v.assignedSalesperson || null,
+          durationMinutes: v.durationMinutes || 1,
+          notes: v.notes || '',
+          taggingStatus: (v.taggingStatus as 'Tagged' | 'Untagged') || (v.visitPurpose ? 'Tagged' : 'Untagged'),
+          date: v.date,
+          genderEstimated: v.genderEstimated || 'Male',
+          ageGroupEstimated: v.ageGroupEstimated || '26-35',
+          zoneEntered: v.zoneEntered || 'Main Showroom',
+          confidenceScore: v.confidenceScore || 0.96,
+          cameraSource: v.cameraSource || 'Entrance Camera',
+          zoneDwell: v.zoneDwell || { [v.zoneEntered || 'Main Showroom']: `${v.durationMinutes || 1} mins` },
+        }));
+
+        setVisitors(mapped);
+      }
+    } catch (_) {}
+  };
+
+  const clearAllVisitors = async () => {
+    try {
+      await cameraService.clearAllVisitors();
+    } catch (e) {
+      console.warn('Failed to clear visitors on backend:', e);
+    }
+    setVisitors([]);
+    localStorage.removeItem('capermint_visitors');
+    localStorage.removeItem('jms_visitors');
+  };
+
+  useEffect(() => {
+    refreshVisitors();
+    const visInterval = setInterval(refreshVisitors, 2500);
+    return () => clearInterval(visInterval);
+  }, []);
 
   // Add new visitor
   const addNewVisitor = (record: Partial<VisitorRecord>) => {
     const now = new Date();
     const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
     const count = visitors.length + 1;
-    const sampleFaces = [
-      'https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?w=150&auto=format&fit=crop&q=80',
-      'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80',
-      'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&auto=format&fit=crop&q=80',
-      'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=150&auto=format&fit=crop&q=80',
-      'https://images.unsplash.com/photo-1524504388940-b1c1722653e1?w=150&auto=format&fit=crop&q=80',
-      'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=150&auto=format&fit=crop&q=80',
-    ];
     const newRecord: VisitorRecord = {
       id: `vis-${Date.now()}`,
       visitorId: `VIS-2026-${1040 + count}`,
-      avatarUrl: record.avatarUrl || sampleFaces[Math.floor(Math.random() * sampleFaces.length)],
+      avatarUrl: record.avatarUrl || undefined,
       firstSeenTime: timeStr,
       lastSeenTime: null,
       exitTime: null,
@@ -360,17 +414,26 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       visitPurpose: record.visitPurpose || null,
       assignedSalesperson: record.assignedSalesperson || null,
       durationMinutes: 1,
-      notes: record.notes || 'Walk-in visitor tracked via CCTV AI Detection Line',
+      notes: record.notes || 'Front desk manual walk-in entry',
       taggingStatus: record.visitPurpose ? 'Tagged' : 'Untagged',
-      date: '2026-10-26',
+      date: new Date().toISOString().split('T')[0],
       genderEstimated: record.genderEstimated || 'Male',
       ageGroupEstimated: record.ageGroupEstimated || '26-35',
       zoneEntered: record.zoneEntered || 'Main Showroom',
       confidenceScore: 0.96,
-      cameraSource: 'Main Glass Entrance NVR-01',
+      cameraSource: record.cameraSource || 'Reception Front Desk',
     };
 
     setVisitors((prev) => [newRecord, ...prev]);
+
+    // Persist to backend database as manual walk-in
+    cameraService.createWalkIn({
+      visit_purpose: record.visitPurpose || undefined,
+      assigned_salesperson: record.assignedSalesperson || undefined,
+      notes: record.notes || undefined,
+    }).then(() => {
+      refreshVisitors();
+    }).catch(() => {});
 
     // Update actual last exit or first entry in store hours if needed
     if (!storeHours.actualFirstEntryToday) {
@@ -392,11 +455,17 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
             lastSeenTime: timeStr,
             exitTime: timeStr,
             durationMinutes: duration,
+            zoneDwell: v.zoneDwell || { [v.zoneEntered || 'Main Showroom']: `${duration} mins` },
           };
         }
         return v;
       })
     );
+
+    const target = visitors.find((v) => v.id === visitorId || v.visitorId === visitorId);
+    if (target) {
+      cameraService.checkoutVisitor(target.visitorId || target.id, timeStr).catch(() => {});
+    }
 
     setStoreHours((prev) => ({ ...prev, actualLastExitToday: timeStr }));
   };
@@ -473,7 +542,7 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           const mapped: Employee[] = data.map((d: any) => {
             const photo = d.photo_url
               ? (d.photo_url.startsWith('http') || d.photo_url.startsWith('data:') ? d.photo_url : `${FASTAPI_BASE_URL}${d.photo_url}`)
-              : 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=120&auto=format&fit=crop&q=80';
+              : '';
             return {
               id: d.employee_id,
               name: d.name,
@@ -562,45 +631,10 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     setIsLiveSimulationActive((prev) => !prev);
   };
 
-  // Live CCTV Event Simulator (Periodically simulates walk-in detection)
+  // Live CCTV Event Simulator (Disabled: strictly real detections from edge camera)
   useEffect(() => {
-    if (!isLiveSimulationActive) return;
-
-    const interval = setInterval(() => {
-      const actions = ['entry', 'tag', 'checkout'];
-      const action = actions[Math.floor(Math.random() * actions.length)];
-
-      if (action === 'entry') {
-        const bikePurposes: VisitPurpose[] = ['Test Ride', 'Vehicle Enquiry', 'Booking', 'Service'];
-        const randomPurpose = Math.random() > 0.4 ? bikePurposes[Math.floor(Math.random() * bikePurposes.length)] : null;
-        const salespeople = employees.length > 0 ? employees.map((e) => e.name) : ['Floor Consultant'];
-        const randomSalesperson = randomPurpose ? salespeople[Math.floor(Math.random() * salespeople.length)] : null;
-        const isReturning = Math.random() > 0.65;
-
-        addNewVisitor({
-          visitorType: isReturning ? 'Returning' : 'New',
-          visitPurpose: randomPurpose,
-          assignedSalesperson: randomSalesperson,
-          notes: randomPurpose
-            ? `Customer interested in ${randomPurpose}. Approached floor executive.`
-            : 'Unassisted walk-in visitor detected near main entrance standee.',
-          genderEstimated: Math.random() > 0.35 ? 'Male' : 'Female',
-          zoneEntered: 'Display Area',
-        });
-
-        setLastSimulatedEvent(`Live AI Detection: New ${isReturning ? 'Returning' : 'First-time'} visitor entered showroom.`);
-      } else if (action === 'checkout') {
-        // Find an active visitor
-        const active = visitors.find((v) => !v.exitTime);
-        if (active) {
-          checkoutVisitor(active.id);
-          setLastSimulatedEvent(`Live AI Detection: Visitor ${active.visitorId} exited via Main Gate.`);
-        }
-      }
-    }, 12000);
-
-    return () => clearInterval(interval);
-  }, [isLiveSimulationActive, visitors]);
+    // No mock visitors are generated; visitor registry is strictly populated via local camera AI detections
+  }, []);
 
   // Section tracking state
   const [sectionCounts, setSectionCounts] = useState<{ sales: number; accounts: number; [key: string]: number }>({
@@ -675,18 +709,7 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         if (backendTotal > lastSyncedFootfall) {
           const newEntriesCount = backendTotal - lastSyncedFootfall;
           setLastSyncedFootfall(backendTotal);
-
-          for (let i = 0; i < newEntriesCount; i++) {
-            addNewVisitor({
-              visitorType: Math.random() > 0.3 ? 'New' : 'Returning',
-              notes: 'Walk-in visitor tracked via CCTV AI Detection Line (Local Edge Model)',
-              cameraSource: 'Showroom Camera 101 (Local Edge)',
-              zoneEntered: 'Main Showroom',
-              confidenceScore: 0.94,
-            });
-          }
-
-          setLastSimulatedEvent(`Local AI Edge: Registered ${newEntriesCount} new visitor entry count from local model!`);
+          setLastSimulatedEvent(`Local AI Edge: Registered ${newEntriesCount} new visitor entry count from local camera.`);
         }
       } catch {
         // Ignore connection hiccups
@@ -974,6 +997,8 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         tagVisitor,
         addNewVisitor,
         checkoutVisitor,
+        refreshVisitors,
+        clearAllVisitors,
         employees,
         attendance,
         addEmployee,

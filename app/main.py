@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from app.api.routes import HEALTH
-from app.api.v1 import analytics, cameras, employees, identity, departments
+from app.api.v1 import analytics, cameras, employees, identity, departments, visitors
 from app.core.config import settings
 from app.core.logging import logger, setup_logging
 from app.db.base import Base
@@ -72,6 +72,7 @@ app.add_middleware(
 
 # Mount static files directory for profile pictures and media assets
 os.makedirs("static/uploads/employees", exist_ok=True)
+os.makedirs("static/uploads/visitors", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Centralized health check endpoint (using path constant from routes.py)
@@ -87,6 +88,7 @@ app.include_router(analytics.router)
 app.include_router(identity.router)
 app.include_router(employees.router)
 app.include_router(departments.router)
+app.include_router(visitors.router)
 
 
 @app.exception_handler(Exception)

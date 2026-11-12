@@ -15,11 +15,18 @@ class PersonIdentityRepository:
         self.vector_manager = PgVectorStoreManager(db)
 
     def get_by_person_id(self, person_id: str) -> Optional[PersonIdentity]:
-        return (
+        rec = (
             self.db.query(PersonIdentity)
             .filter(PersonIdentity.person_id == str(person_id))
             .first()
         )
+        if not rec:
+            try:
+                uid = uuid.UUID(str(person_id))
+                rec = self.db.query(PersonIdentity).filter(PersonIdentity.id == uid).first()
+            except (ValueError, TypeError, AttributeError):
+                pass
+        return rec
 
     def get_by_id(self, identity_id: uuid.UUID) -> Optional[PersonIdentity]:
         return (
@@ -43,26 +50,55 @@ class PersonIdentityRepository:
     def create_or_update(
         self,
         person_id: str,
-        embedding: np.ndarray,
+        embedding: Optional[np.ndarray] = None,
         timestamp: Optional[datetime] = None,
+        avatar_url: Optional[str] = None,
+        camera_source: Optional[str] = None,
+        zone_entered: Optional[str] = None,
+        notes: Optional[str] = None,
+        visit_purpose: Optional[str] = None,
+        assigned_salesperson: Optional[str] = None,
     ) -> PersonIdentity:
         ts = timestamp or datetime.now(timezone.utc)
-        vec_data = embedding.astype(np.float32).tolist()
+        vec_data = embedding.astype(np.float32).tolist() if embedding is not None else None
 
         try:
             record = self.get_by_person_id(person_id)
             if record:
-                record.face_embedding = vec_data
+                if vec_data is not None:
+                    record.face_embedding = vec_data
                 record.last_seen_at = ts
                 record.is_expired = False
                 record.expired_at = None
+                if avatar_url and not record.avatar_url:
+                    record.avatar_url = avatar_url
+                if camera_source:
+                    record.camera_source = camera_source
+                if zone_entered:
+                    record.zone_entered = zone_entered
+                if visit_purpose:
+                    record.visit_purpose = visit_purpose
+                    record.tagging_status = "Tagged"
+                if assigned_salesperson:
+                    record.assigned_salesperson = assigned_salesperson
+                if notes:
+                    record.notes = notes
             else:
+                tag_status = "Tagged" if visit_purpose else "Untagged"
                 record = PersonIdentity(
                     person_id=str(person_id),
                     face_embedding=vec_data,
                     created_at=ts,
                     last_seen_at=ts,
                     is_expired=False,
+                    avatar_url=avatar_url,
+                    camera_source=camera_source or "Entrance Camera",
+                    zone_entered=zone_entered or "Main Showroom",
+                    notes=notes or "Walk-in visitor tracked via CCTV AI Detection Line",
+                    visit_purpose=visit_purpose,
+                    assigned_salesperson=assigned_salesperson,
+                    tagging_status=tag_status,
+                    visitor_type="New",
                 )
                 self.db.add(record)
 
@@ -73,15 +109,52 @@ class PersonIdentityRepository:
             self.db.rollback()
             record = self.get_by_person_id(person_id)
             if record:
-                record.face_embedding = vec_data
+                if vec_data is not None:
+                    record.face_embedding = vec_data
                 record.last_seen_at = ts
                 record.is_expired = False
                 record.expired_at = None
+                if avatar_url and not record.avatar_url:
+                    record.avatar_url = avatar_url
                 self.db.add(record)
                 self.db.commit()
                 self.db.refresh(record)
                 return record
             raise
+
+    def list_visitors(
+        self,
+        tagging_status: Optional[str] = None,
+        visit_purpose: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[PersonIdentity]:
+        query = self.db.query(PersonIdentity)
+        if tagging_status and tagging_status.lower() != "all":
+            query = query.filter(PersonIdentity.tagging_status == tagging_status)
+        if visit_purpose and visit_purpose.lower() != "all":
+            query = query.filter(PersonIdentity.visit_purpose == visit_purpose)
+        return query.order_by(PersonIdentity.last_seen_at.desc()).limit(limit).all()
+
+    def update_visitor_tag(
+        self,
+        person_id: str,
+        visit_purpose: str,
+        assigned_salesperson: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> Optional[PersonIdentity]:
+        record = self.get_by_person_id(person_id)
+        if not record:
+            return None
+        record.visit_purpose = visit_purpose
+        if assigned_salesperson is not None:
+            record.assigned_salesperson = assigned_salesperson
+        if notes is not None:
+            record.notes = notes
+        record.tagging_status = "Tagged"
+        self.db.add(record)
+        self.db.commit()
+        self.db.refresh(record)
+        return record
 
     def update_last_seen(
         self,

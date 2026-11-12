@@ -2,6 +2,9 @@ HEALTH = "/health"
 
 REGISTER_CAMERAS = "/api/v1/cameras"
 LIST_CAMERAS = "/api/v1/cameras"
+CAMERA_CONFIG = "/api/v1/cameras/config"
+TEST_CAMERA_STREAM = "/api/v1/cameras/test-stream"
+DELETE_CAMERA_CHANNEL = "/api/v1/cameras/channel/{channel_or_id}"
 GET_CAMERA = "/api/v1/cameras/{camera_id}"
 UPDATE_CAMERA = "/api/v1/cameras/{camera_id}"
 

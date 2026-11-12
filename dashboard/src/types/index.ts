@@ -41,9 +41,10 @@ export interface VisitorRecord {
   date: string; // YYYY-MM-DD
   genderEstimated?: 'Male' | 'Female' | 'Unspecified';
   ageGroupEstimated?: '18-25' | '26-35' | '36-50' | '50+';
-  zoneEntered?: 'Main Showroom' | 'Display Area' | 'Test Track' | 'Customer Lounge' | 'Service Bay';
+  zoneEntered?: string;
   confidenceScore?: number;
   cameraSource?: string;
+  zoneDwell?: Record<string, string>; // e.g. { "Sales Section": "8 mins", "Main Showroom": "2 mins" }
 }
 
 export type AttendanceStatus = 'Present' | 'Absent' | 'Late' | 'On Leave';

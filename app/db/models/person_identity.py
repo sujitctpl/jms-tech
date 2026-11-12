@@ -43,6 +43,20 @@ class PersonIdentity(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # Visitor profile and journey metadata
+    avatar_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    visit_purpose: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    assigned_salesperson: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    visitor_type: Mapped[str] = mapped_column(String(20), default="New", nullable=False)
+    tagging_status: Mapped[str] = mapped_column(String(20), default="Untagged", nullable=False)
+    gender_estimated: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    age_group_estimated: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    zone_entered: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    camera_source: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    exit_time: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    zone_dwell: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
     # Relationships
     visitor_tracks: Mapped[List["VisitorTrack"]] = relationship(
         "VisitorTrack", back_populates="person_identity"

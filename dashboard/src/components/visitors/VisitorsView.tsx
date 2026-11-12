@@ -15,8 +15,10 @@ import {
   CheckCircle,
   Camera,
   X,
+  Trash2,
+  User,
 } from 'lucide-react';
-import { PURPOSE_COLORS, INITIAL_EMPLOYEES } from '../../data/seedData';
+import { PURPOSE_COLORS } from '../../data/seedData';
 
 interface VisitorsViewProps {
   onTagVisitor: (visitor: VisitorRecord) => void;
@@ -35,7 +37,7 @@ const PURPOSES: VisitPurpose[] = [
 ];
 
 export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpenQuickAdd }) => {
-  const { visitors, checkoutVisitor, exportVisitorsCSV, metrics } = useShowroom();
+  const { visitors, checkoutVisitor, exportVisitorsCSV, clearAllVisitors, metrics, employees } = useShowroom();
 
   const [searchQuery, setSearchQuery] = useState('');
   const [filterType, setFilterType] = useState<string>('all');
@@ -44,6 +46,7 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
   const [filterSalesperson, setFilterSalesperson] = useState<string>('all');
   const [checkoutNotification, setCheckoutNotification] = useState<string | null>(null);
   const [inspectedVisitor, setInspectedVisitor] = useState<VisitorRecord | null>(null);
+  const [isClearing, setIsClearing] = useState(false);
 
   // Extract unique salespeople
   const salespeople = useMemo(() => {
@@ -109,6 +112,22 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
         </div>
 
         <div className="flex items-center gap-2">
+          {visitors.length > 0 && (
+            <button
+              onClick={async () => {
+                if (window.confirm('Are you sure you want to clear all visitor records and captured photos? This will reset the visitor list to start fresh.')) {
+                  setIsClearing(true);
+                  await clearAllVisitors();
+                  setIsClearing(false);
+                }
+              }}
+              disabled={isClearing}
+              className="px-3.5 py-2 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 rounded-xl text-xs font-semibold shadow-2xs flex items-center gap-1.5 transition active:scale-95 disabled:opacity-50"
+            >
+              <Trash2 className="w-4 h-4 text-red-600" />
+              <span>{isClearing ? 'Clearing...' : 'Clear All Visitors'}</span>
+            </button>
+          )}
           <button
             onClick={exportVisitorsCSV}
             className="px-3.5 py-2 bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 hover:border-slate-400 rounded-xl text-xs font-semibold shadow-2xs flex items-center gap-1.5 transition"
@@ -271,7 +290,7 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
                   const isTagged = vis.taggingStatus === 'Tagged' && vis.visitPurpose;
                   const purposeColor = vis.visitPurpose ? PURPOSE_COLORS[vis.visitPurpose] : '#94a3b8';
                   const isCurrentlyInside = !vis.exitTime;
-                  const assignedRep = INITIAL_EMPLOYEES.find((e) => e.name === vis.assignedSalesperson);
+                  const assignedRep = employees.find((e) => e.name === vis.assignedSalesperson);
 
                   return (
                     <tr
@@ -283,17 +302,25 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
                       <td className="py-3 px-4">
                         <div className="flex items-center gap-3">
                           <div
-                            onClick={() => setInspectedVisitor(vis)}
-                            className="relative group/cctv shrink-0 cursor-pointer overflow-hidden rounded-xl border border-slate-700/80 bg-slate-950 shadow-xs hover:border-emerald-500 transition-all w-11 h-11"
-                            title="Click to view full CCTV camera detection snapshot"
+                            onClick={() => vis.avatarUrl && setInspectedVisitor(vis)}
+                            className={`relative group/cctv shrink-0 overflow-hidden rounded-xl border border-slate-700/80 bg-slate-950 shadow-xs hover:border-emerald-500 transition-all w-12 h-16 ${
+                              vis.avatarUrl ? 'cursor-pointer' : 'cursor-default'
+                            }`}
+                            title={vis.avatarUrl ? "Click to view full CCTV camera detection snapshot" : "No photo captured"}
                           >
-                            <img
-                              src={vis.avatarUrl || 'https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?w=160&auto=format&fit=crop&q=80'}
-                              alt={vis.visitorId}
-                              className="w-full h-full object-cover object-top contrast-[1.05] brightness-95 group-hover/cctv:scale-105 transition-transform"
-                            />
+                            {vis.avatarUrl ? (
+                              <img
+                                src={vis.avatarUrl}
+                                alt={vis.visitorId}
+                                className="w-full h-full object-cover object-top contrast-[1.05] brightness-95 group-hover/cctv:scale-105 transition-transform"
+                              />
+                            ) : (
+                              <div className="w-full h-full flex items-center justify-center bg-slate-800 text-slate-400">
+                                <User className="w-5 h-5 text-slate-400" />
+                              </div>
+                            )}
                             {/* CCTV Reticle & Corner Box */}
-                            <div className="absolute inset-0.5 border border-emerald-400/40 rounded-lg pointer-events-none" />
+                            <div className="absolute inset-0.5 border border-emerald-400/30 rounded-lg pointer-events-none" />
                             <div className="absolute top-0.5 left-1 bg-black/80 px-1 py-0.2 rounded text-[7px] font-mono font-bold text-emerald-400 leading-tight">
                               CAM-01
                             </div>
@@ -310,7 +337,10 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
                           </div>
                         </div>
                       </td>
-                      <td className="py-3 px-3 font-mono text-slate-700 font-medium">{vis.firstSeenTime}</td>
+                      <td className="py-3 px-3 font-mono text-slate-700 font-medium">
+                        <span>{vis.firstSeenTime}</span>
+                        <span className="block text-[10px] text-slate-400 font-sans font-normal">{vis.date}</span>
+                      </td>
                       <td className="py-3 px-3 font-mono">
                         {vis.exitTime ? (
                           <span className="text-slate-700 font-medium">{vis.exitTime}</span>
@@ -348,11 +378,17 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
                       <td className="py-3 px-3">
                         {vis.assignedSalesperson ? (
                           <div className="flex items-center gap-2">
-                            <img
-                              src={assignedRep?.avatarUrl || 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=100&auto=format&fit=crop&q=80'}
-                              alt={vis.assignedSalesperson}
-                              className="w-6 h-6 rounded-full object-cover border border-slate-200 shrink-0 shadow-2xs"
-                            />
+                            {assignedRep?.avatarUrl ? (
+                              <img
+                                src={assignedRep.avatarUrl}
+                                alt={vis.assignedSalesperson}
+                                className="w-6 h-6 rounded-full object-cover border border-slate-200 shrink-0 shadow-2xs"
+                              />
+                            ) : (
+                              <div className="w-6 h-6 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center text-[10px] font-bold border border-blue-200 shrink-0 shadow-2xs">
+                                {vis.assignedSalesperson.charAt(0).toUpperCase()}
+                              </div>
+                            )}
                             <span className="font-semibold text-slate-800">{vis.assignedSalesperson}</span>
                           </div>
                         ) : (
@@ -360,7 +396,17 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
                         )}
                       </td>
                       <td className="py-3 px-3 font-mono font-semibold text-slate-700">{vis.durationMinutes}m</td>
-                      <td className="py-3 px-3 text-slate-600">{vis.zoneEntered || 'Showroom'}</td>
+                      <td className="py-3 px-3 text-slate-600">
+                        <span className="font-semibold text-slate-800 block">{vis.zoneEntered || 'Showroom'}</span>
+                        {vis.zoneDwell && Object.keys(vis.zoneDwell).length > 0 && (
+                          <span
+                            className="text-[10px] text-amber-700 font-medium block truncate max-w-[130px]"
+                            title={Object.entries(vis.zoneDwell).map(([z, t]) => `${z}: ${t}`).join(', ')}
+                          >
+                            {Object.entries(vis.zoneDwell).map(([z, t]) => `${z} (${t})`).join(', ')}
+                          </span>
+                        )}
+                      </td>
                       <td className="py-3 px-4 text-slate-600 max-w-[220px] truncate" title={vis.notes}>
                         {vis.notes}
                       </td>
@@ -422,13 +468,20 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
 
             {/* Modal Body */}
             <div className="p-5 sm:p-6 space-y-4">
-              {/* Clear CCTV Snapshot Frame */}
-              <div className="relative rounded-2xl overflow-hidden border border-slate-800 bg-black flex items-center justify-center h-64 sm:h-72 group shadow-inner">
-                <img
-                  src={inspectedVisitor.avatarUrl || 'https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?w=600&auto=format&fit=crop&q=80'}
-                  alt={inspectedVisitor.visitorId}
-                  className="w-full h-full object-cover object-top contrast-[1.05] brightness-95"
-                />
+              {/* Clear CCTV Snapshot Frame (Full Body Portrait) */}
+              <div className="relative rounded-2xl overflow-hidden border border-slate-800 bg-slate-950 flex items-center justify-center h-80 sm:h-96 group shadow-inner">
+                {inspectedVisitor.avatarUrl ? (
+                  <img
+                    src={inspectedVisitor.avatarUrl}
+                    alt={inspectedVisitor.visitorId}
+                    className="w-full h-full object-contain contrast-[1.05] brightness-95"
+                  />
+                ) : (
+                  <div className="w-full h-full flex flex-col items-center justify-center bg-slate-900 text-slate-400">
+                    <User className="w-16 h-16 text-slate-500 mb-2" />
+                    <span className="text-xs font-semibold">No body photo captured</span>
+                  </div>
+                )}
 
                 {/* CCTV Top Status Overlay */}
                 <div className="absolute top-2.5 inset-x-3 flex items-center justify-between text-[10px] font-mono text-emerald-400 bg-black/75 px-2.5 py-1 rounded border border-emerald-400/20 pointer-events-none">
@@ -436,51 +489,42 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
                     <span className="w-2 h-2 rounded-full bg-red-500 animate-ping" />
                     LIVE • CAM 01 [MAIN ENTRANCE]
                   </span>
-                  <span className="text-slate-300">1080P HD • 25 FPS</span>
-                </div>
-
-                {/* Face Detection Bounding Corners */}
-                <div className="absolute inset-x-12 inset-y-8 border border-emerald-400/80 rounded-xl pointer-events-none shadow-[0_0_15px_rgba(16,185,129,0.4)] flex flex-col justify-between p-2">
-                  <div className="flex justify-between items-start">
-                    <span className="bg-emerald-600 text-slate-950 text-[9px] font-black px-1.5 py-0.5 rounded font-mono uppercase tracking-wider">
-                      AI MATCH 98.8%
-                    </span>
-                    <span className="text-[8px] font-mono text-emerald-300 bg-black/80 px-1 py-0.5 rounded">
-                      ID: {inspectedVisitor.visitorId}
-                    </span>
-                  </div>
-                  <div className="flex justify-between items-end text-[8px] font-mono text-emerald-300/80">
-                    <span>⌜ ROI_FACE_01 ⌝</span>
-                    <span>CONFIRMED</span>
-                  </div>
+                  <span className="text-emerald-400 font-bold bg-emerald-950/80 px-1.5 py-0.5 rounded border border-emerald-500/30">
+                    BODY SNAPSHOT • {inspectedVisitor.visitorId}
+                  </span>
                 </div>
 
                 {/* CCTV Bottom Watermark */}
                 <div className="absolute bottom-2.5 inset-x-3 flex items-center justify-between text-[9px] font-mono text-white/90 bg-black/75 px-2.5 py-1 rounded pointer-events-none">
-                  <span>TIME: 2026-10-26 {inspectedVisitor.firstSeenTime} IST</span>
-                  <span>BITRATE: 4096 KBPS</span>
+                  <span>TIME: {inspectedVisitor.date} {inspectedVisitor.firstSeenTime} IST</span>
+                  <span className="text-slate-400">1080P HD • 4096 KBPS</span>
                 </div>
               </div>
 
               {/* Telemetry Grid */}
               <div className="grid grid-cols-2 gap-2.5 text-xs">
                 <div className="p-3 bg-slate-800/60 rounded-xl border border-slate-700/60">
-                  <span className="text-slate-400 text-[10px] uppercase font-bold block">First Seen</span>
-                  <p className="font-extrabold text-white font-mono mt-0.5">{inspectedVisitor.firstSeenTime}</p>
+                  <span className="text-slate-400 text-[10px] uppercase font-bold block">Arrived Date & Time</span>
+                  <p className="font-extrabold text-white font-mono mt-0.5">{inspectedVisitor.date} • {inspectedVisitor.firstSeenTime}</p>
                 </div>
                 <div className="p-3 bg-slate-800/60 rounded-xl border border-slate-700/60">
-                  <span className="text-slate-400 text-[10px] uppercase font-bold block">Status & Dwell</span>
+                  <span className="text-slate-400 text-[10px] uppercase font-bold block">Departure & Status</span>
                   <p className="font-extrabold text-white font-mono mt-0.5">
-                    {inspectedVisitor.exitTime ? `Exited (${inspectedVisitor.durationMinutes}m)` : `Inside Showroom (${inspectedVisitor.durationMinutes}m)`}
+                    {inspectedVisitor.exitTime ? `Departed at ${inspectedVisitor.exitTime}` : `Inside Showroom (${inspectedVisitor.durationMinutes}m)`}
                   </p>
                 </div>
                 <div className="p-3 bg-slate-800/60 rounded-xl border border-slate-700/60">
-                  <span className="text-slate-400 text-[10px] uppercase font-bold block">Visit Intent</span>
+                  <span className="text-slate-400 text-[10px] uppercase font-bold block">Visit Intent & Staff</span>
                   <p className="font-extrabold text-cyan-400 mt-0.5">{inspectedVisitor.visitPurpose || 'Untagged'}</p>
+                  <p className="text-[11px] text-slate-300 mt-0.5 font-medium">{inspectedVisitor.assignedSalesperson || 'Unassigned Staff'}</p>
                 </div>
                 <div className="p-3 bg-slate-800/60 rounded-xl border border-slate-700/60">
-                  <span className="text-slate-400 text-[10px] uppercase font-bold block">Assigned Staff</span>
-                  <p className="font-extrabold text-white mt-0.5">{inspectedVisitor.assignedSalesperson || 'Unassigned'}</p>
+                  <span className="text-slate-400 text-[10px] uppercase font-bold block">Zone Dwell Time</span>
+                  <p className="font-extrabold text-amber-400 mt-0.5">
+                    {inspectedVisitor.zoneDwell && Object.keys(inspectedVisitor.zoneDwell).length > 0
+                      ? Object.entries(inspectedVisitor.zoneDwell).map(([z, t]) => `${z} (${t})`).join(', ')
+                      : `${inspectedVisitor.zoneEntered || 'Main Showroom'} (${inspectedVisitor.durationMinutes}m)`}
+                  </p>
                 </div>
               </div>
 

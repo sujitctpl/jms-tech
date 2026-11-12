@@ -236,15 +236,14 @@ class IdentityRecoveryManager:
                 message=f"Uncertain similarity ({best_score:.3f}); leaving unresolved to prevent false association.",
             )
 
-        # Require at least 2 reliable face observations before creating a new persistent identity
-        # to prevent temporary noise / partial profile poster reflections from creating duplicate identities
-        if self.track_reliable_frames[tid] < 2:
+        # Require at least 1 reliable face observation to create persistent identity immediately for visitor entry
+        if self.track_reliable_frames[tid] < 1:
             return IdentityMatchResult(
                 tracker_id=tid,
                 person_id=None,
                 similarity=best_score,
                 status=IdentityMatchStatus.UNRESOLVED,
-                message="Awaiting second reliable frame before creating new persistent identity.",
+                message="Awaiting reliable face observation before creating persistent identity.",
             )
 
         # Create New Persistent Identity

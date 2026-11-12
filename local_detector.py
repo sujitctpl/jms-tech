@@ -16,10 +16,13 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Tuple
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.core.config import settings
+
+# Indian Standard Time (UTC+05:30)
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # Force TCP transport for RTSP streams globally to prevent packet loss & H264 macroblock decode corruption
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
@@ -75,9 +78,11 @@ def get_resource_path(relative_path: Optional[str]) -> str:
 class DashboardSyncClient:
     """Non-blocking background client sending footfall events & telemetry to FastAPI."""
 
-    def __init__(self, base_url: str, camera_id: str):
+    def __init__(self, base_url: str, camera_id: str, camera_name: str = "Entrance Camera", is_entrance: bool = True):
         self.base_url = base_url.rstrip("/")
         self.camera_id = camera_id
+        self.camera_name = camera_name
+        self.is_entrance = is_entrance
         self.queue: queue.Queue = queue.Queue(maxsize=1000)
         self.stop_event = threading.Event()
         self.is_connected = False
@@ -89,7 +94,9 @@ class DashboardSyncClient:
         self.worker_thread.start()
 
     def send_entry_event(self, tracker_id: str, confidence: float = 0.92, section_id: Optional[str] = None, section_name: Optional[str] = None, person_id: Optional[str] = None) -> None:
-        """Enqueue an entry event detected locally."""
+        """Enqueue an entry event detected locally. Only store entrance cameras count walk-in footfall."""
+        if not self.is_entrance:
+            return
         payload = {
             "tracker_id": str(tracker_id),
             "confidence": float(confidence),
@@ -128,6 +135,41 @@ class DashboardSyncClient:
         }
         try:
             self.queue.put_nowait(("employee_punch", payload))
+        except queue.Full:
+            pass
+
+    def send_visitor_detect(
+        self,
+        face_image_base64: Optional[str] = None,
+        tracker_id: Optional[str] = None,
+        person_id: Optional[str] = None,
+        confidence: float = 0.95,
+        zone: Optional[str] = None,
+        appearance: Optional[str] = None,
+        face_embedding: Optional[List[float]] = None,
+    ) -> None:
+        """Enqueue a visitor face detection event with snapshot and biometric vector."""
+        payload = {
+            "face_image_base64": face_image_base64,
+            "face_embedding": face_embedding,
+            "camera_id": self.camera_id if self.camera_id and len(self.camera_id) == 36 else None,
+            "camera_name": self.camera_name,
+            "tracker_id": str(tracker_id) if tracker_id else None,
+            "person_id": str(person_id) if person_id else None,
+            "confidence": float(confidence),
+            "zone": zone or "Main Showroom",
+            "appearance": appearance,
+            "is_entrance": self.is_entrance,
+        }
+        try:
+            self.queue.put_nowait(("visitor_detect", payload))
+        except queue.Full:
+            pass
+
+    def send_visitor_zone_update(self, payload: dict) -> None:
+        """Enqueue live visitor zone dwell update or departure."""
+        try:
+            self.queue.put_nowait(("visitor_zone_update", payload))
         except queue.Full:
             pass
 
@@ -191,6 +233,12 @@ class DashboardSyncClient:
                     self.total_synced_entries += 1
             elif event_type == "employee_punch":
                 endpoint = "/api/v1/attendance/punch"
+                self._post(endpoint, payload)
+            elif event_type == "visitor_detect":
+                endpoint = "/api/v1/visitors/detect"
+                self._post(endpoint, payload)
+            elif event_type == "visitor_zone_update":
+                endpoint = "/api/v1/visitors/update-zone"
                 self._post(endpoint, payload)
             elif event_type == "heartbeat":
                 endpoint = f"/api/v1/cameras/{self.camera_id}/heartbeat"
@@ -1296,6 +1344,163 @@ class EmployeeDepartmentTracker:
 
 
 # ---------------------------------------------------------------------------
+# Visitor Detection Zone Dwell & Journey Tracker
+# ---------------------------------------------------------------------------
+class VisitorZoneTracker:
+    """
+    Real-Time Visitor Detection Zone Dwell & Journey Tracker.
+    - Accurately tracks time spent by showroom customers inside detection zones (Sales Section, AI, etc.)
+      as well as general showroom floor ('Main Showroom').
+    - Calculates cumulative dwell per zone, formats durations, and synchronizes real-time stats
+      with the backend CRM and Tag Visitor modal card.
+    - Automatically marks departure time and zone breakdown when visitors leave the camera view.
+    """
+    def __init__(self, sync_client: Optional[Any] = None, sync_interval: float = 4.0):
+        self.sync_client = sync_client
+        self.sync_interval = float(sync_interval)
+        # track_key -> session dict
+        self.sessions: Dict[str, dict] = {}
+        self.track_to_pid: Dict[int, str] = {}
+        self.last_sync_times: Dict[str, float] = {}
+
+    @staticmethod
+    def format_duration(seconds: float) -> str:
+        secs = int(max(0, round(seconds)))
+        mins = secs // 60
+        rem_secs = secs % 60
+        if mins == 0:
+            return f"{rem_secs}s"
+        elif rem_secs == 0:
+            return f"{mins} mins"
+        return f"{mins}m {rem_secs:02d}s"
+
+    def link_track_pid(self, track_id: int, person_id: str) -> None:
+        if not person_id:
+            return
+        self.track_to_pid[track_id] = str(person_id)
+        tid_str = str(track_id)
+        if tid_str in self.sessions:
+            self.sessions[tid_str]["person_id"] = str(person_id)
+
+    def update_visitor_zone(
+        self,
+        track_id: int,
+        current_dept: Optional[Tuple[str, str]],
+        now_ts: float,
+        person_id: Optional[str] = None,
+    ) -> None:
+        if person_id:
+            self.track_to_pid[track_id] = str(person_id)
+        pid = person_id or self.track_to_pid.get(track_id)
+
+        tid_str = str(track_id)
+        zone_name = current_dept[1] if current_dept else "Main Showroom"
+
+        if tid_str not in self.sessions:
+            self.sessions[tid_str] = {
+                "track_id": track_id,
+                "person_id": pid,
+                "first_seen_ts": now_ts,
+                "last_seen_ts": now_ts,
+                "current_zone": zone_name,
+                "zone_dwell": {zone_name: 0.0},
+                "last_log_ts": now_ts,
+            }
+        else:
+            session = self.sessions[tid_str]
+            delta = max(0.0, min(2.0, now_ts - session["last_seen_ts"]))
+            session["last_seen_ts"] = now_ts
+            if pid and not session.get("person_id"):
+                session["person_id"] = pid
+
+            cur_z = session["current_zone"]
+            session["zone_dwell"][cur_z] = session["zone_dwell"].get(cur_z, 0.0) + delta
+
+            if cur_z != zone_name:
+                session["current_zone"] = zone_name
+                if zone_name not in session["zone_dwell"]:
+                    session["zone_dwell"][zone_name] = 0.0
+
+            # Log dwell every 10 seconds
+            if now_ts - session.get("last_log_ts", 0.0) >= 10.0:
+                session["last_log_ts"] = now_ts
+                z_time = session["zone_dwell"].get(zone_name, 0.0)
+                disp_id = pid or f"#{track_id}"
+                print(
+                    f"[⏱️ VISITOR IN ZONE] Visitor {disp_id} in '{zone_name}' | "
+                    f"Time spent in zone: {self.format_duration(z_time)}"
+                )
+
+        # Sync to backend periodically
+        last_sync = self.last_sync_times.get(tid_str, 0.0)
+        if (now_ts - last_sync) >= self.sync_interval:
+            self.last_sync_times[tid_str] = now_ts
+            self._sync_session(self.sessions[tid_str], now_ts, is_departure=False)
+
+    def on_visitor_lost(self, track_id: int, now_ts: float) -> None:
+        tid_str = str(track_id)
+        if tid_str in self.sessions:
+            session = self.sessions.pop(tid_str)
+            self.last_sync_times.pop(tid_str, None)
+            # Sync final zone dwell, but do NOT prematurely mark departed from showroom
+            # because the customer is still inside browsing other zones or camera views!
+            self._sync_session(session, now_ts, is_departure=False)
+
+    def record_visitor_exit(self, track_id: int, now_ts: float) -> None:
+        """Triggered when a visitor physically walks out through the entrance door in reverse."""
+        tid_str = str(track_id)
+        session = self.sessions.pop(tid_str, None)
+        if session:
+            self.last_sync_times.pop(tid_str, None)
+            self._sync_session(session, now_ts, is_departure=True)
+        else:
+            pid = self.track_to_pid.get(track_id)
+            exit_time = datetime.fromtimestamp(now_ts, tz=IST).strftime("%I:%M %p")
+            disp_id = pid or f"#{track_id}"
+            print(f"[<-- VISITOR DEPARTED STORE] Visitor {disp_id} exited store at {exit_time} IST")
+            if self.sync_client:
+                self.sync_client.send_visitor_zone_update({
+                    "person_id": pid,
+                    "tracker_id": tid_str,
+                    "exit_time": exit_time,
+                })
+
+    def _sync_session(self, session: dict, now_ts: float, is_departure: bool = False) -> None:
+        if not self.sync_client:
+            return
+        pid = session.get("person_id")
+        tid_str = str(session["track_id"])
+
+        formatted_dwell = {}
+        for z_name, secs in session["zone_dwell"].items():
+            if secs >= 0.5 or z_name == session["current_zone"]:
+                formatted_dwell[z_name] = self.format_duration(secs)
+
+        top_zone = session["current_zone"]
+        if session["zone_dwell"]:
+            top_zone = max(session["zone_dwell"].items(), key=lambda x: x[1])[0]
+
+        exit_time = None
+        if is_departure:
+            exit_time = datetime.fromtimestamp(session["last_seen_ts"], tz=IST).strftime("%I:%M %p")
+            disp_id = pid or f"#{session['track_id']}"
+            dwell_desc = ", ".join([f"{z}: {t}" for z, t in formatted_dwell.items()])
+            print(
+                f"[<-- VISITOR DEPARTED STORE] Visitor {disp_id} departed at {exit_time} IST | "
+                f"Zone dwell breakdown: {dwell_desc}"
+            )
+
+        payload = {
+            "person_id": pid,
+            "tracker_id": tid_str,
+            "current_zone": top_zone,
+            "zone_dwell": formatted_dwell,
+            "exit_time": exit_time,
+        }
+        self.sync_client.send_visitor_zone_update(payload)
+
+
+# ---------------------------------------------------------------------------
 # Interactive Multi-Zone & Dynamic User-Drawn Entry Line Manager
 # ---------------------------------------------------------------------------
 class ZoneManager:
@@ -1321,14 +1526,16 @@ class ZoneManager:
         line_y_ratio: float = 0.35,
         direction: str = "forward",
         api_url: str = "http://127.0.0.1:8000",
+        is_entrance: bool = False,
     ):
         self.config_path = config_path
         self.camera_channel = str(camera_channel)
         self.frame_w = frame_width
         self.frame_h = frame_height
         self.api_url = str(api_url).rstrip("/")
+        self.is_entrance = is_entrance
 
-        # Load entry line only if explicitly saved by user previously
+        # Load entry line if explicitly saved by user, or initialize default entry line ONLY for entrance cameras
         self.entry_line = None
         if entry_line_cfg and isinstance(entry_line_cfg, dict) and "p1" in entry_line_cfg and "p2" in entry_line_cfg and entry_line_cfg.get("enabled", True):
             p1 = entry_line_cfg["p1"]
@@ -1340,6 +1547,17 @@ class ZoneManager:
                     "p2": [int(p2[0]), int(p2[1])],
                     "direction": entry_line_cfg.get("direction", direction),
                 }
+
+        # ONLY synthesize a default entry line if this camera is a designated Store Entrance Camera
+        if self.entry_line is None and self.is_entrance:
+            # Fallback default entry line across the frame at line_y_ratio
+            y_pos = int(self.frame_h * line_y_ratio)
+            self.entry_line = {
+                "enabled": True,
+                "p1": [int(self.frame_w * 0.05), y_pos],
+                "p2": [int(self.frame_w * 0.95), y_pos],
+                "direction": direction if direction in ("forward", "backward", "top_to_bottom", "bottom_to_top", "both") else "forward",
+            }
 
         # Load sections only if explicitly saved by user previously
         self.sections: List[dict] = []
@@ -1502,6 +1720,25 @@ class ZoneManager:
                     self.status_timer = 140
                     print(f"[*] Dynamically reloaded {len(self.sections)} departments from {self.config_path}")
                     return True
+
+            # Dynamic Entry Line Reload
+            entry_line_cfg = cam_data.get("entry_line")
+            if entry_line_cfg is not None and isinstance(entry_line_cfg, dict):
+                p1 = entry_line_cfg.get("p1")
+                p2 = entry_line_cfg.get("p2")
+                if p1 and p2 and len(p1) == 2 and len(p2) == 2:
+                    new_entry_line = {
+                        "enabled": bool(entry_line_cfg.get("enabled", True)),
+                        "p1": [int(p1[0]), int(p1[1])],
+                        "p2": [int(p2[0]), int(p2[1])],
+                        "direction": str(entry_line_cfg.get("direction", "forward")),
+                    }
+                    if self.entry_line != new_entry_line:
+                        self.entry_line = new_entry_line
+                        self.status_msg = "[+] Entry line dynamically updated from Settings"
+                        self.status_timer = 120
+                        print(f"[*] Dynamically reloaded entry line from {self.config_path}")
+                        return True
         except Exception:
             pass
         return False
@@ -1535,6 +1772,19 @@ class ZoneManager:
                 for occ in occupants:
                     if occ.get("track_id") == obj_id:
                         occ["pid"] = pid
+
+    def mark_employee_crossing(self, obj_id: int):
+        """Marks track as counted across entry line without incrementing visitor attendance."""
+        self.counted_attendance_ids.add(obj_id)
+        self.line_flash_timer = 20
+
+    def record_visitor_entry(self, obj_id: int, pid: Optional[str] = None):
+        """Records a genuine visitor entry crossing: increments visitor attendance count."""
+        self.counted_attendance_ids.add(obj_id)
+        if pid:
+            self.counted_person_ids.add(pid)
+        self.attendance_total += 1
+        self.line_flash_timer = 35
 
     def flip_direction(self):
         """Cycles entry line crossing direction between forward, backward, and bidirectional (both)."""
@@ -1692,10 +1942,6 @@ class ZoneManager:
                             crossed = True
 
                         if crossed:
-                            self.counted_attendance_ids.add(obj_id)
-                            if pid:
-                                self.counted_person_ids.add(pid)
-                            self.attendance_total += 1
                             self.line_flash_timer = 25
                             new_attendance_crossings.append(obj_id)
             elif has_entry_line and (obj_id in self.counted_attendance_ids):
@@ -1719,6 +1965,8 @@ class ZoneManager:
                         self.counted_attendance_ids.discard(obj_id)
                         if pid and pid in self.counted_person_ids:
                             self.counted_person_ids.discard(pid)
+                        if getattr(self, "visitor_tracker", None) and self.is_entrance:
+                            self.visitor_tracker.record_visitor_exit(obj_id, time.time())
 
             self.track_positions[obj_id] = curr_pos
 
@@ -2417,6 +2665,208 @@ def is_valid_facial_geometry(landmarks: List[Tuple[int, int]], min_eye_dist: flo
     return True
 
 
+def compute_face_photo_quality(
+    face_crop: Optional[np.ndarray],
+    face_conf: float = 0.90,
+    landmarks: Optional[List[Tuple[int, int]]] = None,
+) -> float:
+    """
+    Evaluates composite photo capture quality (0.0 to 1.0) across:
+    1. Sharpness / Blur (Laplacian variance)
+    2. Resolution / Size (Area in pixels)
+    3. Head Pose / Frontality (Eye alignment and nose centering)
+    4. Illumination (Contrast and exposure avoiding silhouettes)
+    5. Face detector confidence
+    """
+    if face_crop is None or face_crop.size == 0:
+        return 0.0
+
+    fh, fw = face_crop.shape[:2]
+    if fh < 30 or fw < 30:
+        return 0.05
+
+    # 1. Resolution / Scale score (120x120 is ideal for 1080p entrance camera)
+    res_score = min(1.0, float(fw * fh) / (120.0 * 120.0))
+
+    # 2. Sharpness score via Laplacian variance
+    gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY) if len(face_crop.shape) == 3 else face_crop
+    lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    sharpness_score = min(1.0, max(0.0, lap_var / 220.0))
+
+    # 3. Illumination score (prevent dark silhouettes from showroom glass doors)
+    mean_lum = float(np.mean(gray))
+    if 85.0 <= mean_lum <= 175.0:
+        illum_score = 1.0
+    elif mean_lum < 85.0:
+        illum_score = max(0.10, mean_lum / 85.0)
+    else:
+        illum_score = max(0.10, (255.0 - mean_lum) / 80.0)
+
+    # 4. Frontality / Pose score
+    pose_score = 0.60
+    if landmarks and len(landmarks) >= 5:
+        try:
+            lx, ly = landmarks[0]
+            rx, ry = landmarks[1]
+            eye_dx = float(rx - lx)
+            eye_dy = float(ry - ly)
+            angle = abs(math.degrees(math.atan2(eye_dy, eye_dx)))
+            roll_score = max(0.0, 1.0 - (angle / 25.0))
+
+            nx, ny = landmarks[2]
+            eye_cx = (lx + rx) * 0.5
+            eye_dist = max(1.0, float(math.hypot(eye_dx, eye_dy)))
+            yaw_offset = abs(nx - eye_cx) / eye_dist
+            yaw_score = max(0.0, 1.0 - (yaw_offset / 0.45))
+            pose_score = roll_score * 0.40 + yaw_score * 0.60
+        except Exception:
+            pose_score = 0.50
+
+    composite = (
+        sharpness_score * 0.35 +
+        res_score * 0.25 +
+        pose_score * 0.20 +
+        illum_score * 0.10 +
+        min(1.0, float(face_conf)) * 0.10
+    )
+    return float(composite)
+
+
+def enhance_visitor_portrait(crop_bgr: Optional[np.ndarray]) -> np.ndarray:
+    """
+    Applies CLAHE (Contrast Limited Adaptive Histogram Equalization) on luminance
+    channel to lift shadows caused by bright showroom entrance backlighting.
+    """
+    if crop_bgr is None or crop_bgr.size == 0:
+        return crop_bgr
+    try:
+        lab = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2LAB)
+        l_chan, a_chan, b_chan = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+        l_eq = clahe.apply(l_chan)
+        enhanced = cv2.cvtColor(cv2.merge([l_eq, a_chan, b_chan]), cv2.COLOR_LAB2BGR)
+        return enhanced
+    except Exception:
+        return crop_bgr
+
+
+def extract_visitor_body_crop(
+    clean_frame: Optional[np.ndarray],
+    person_box: Tuple[float, float, float, float],
+    target_w: int = 360,
+    target_h: int = 480,
+) -> Optional[np.ndarray]:
+    """
+    Extracts a high-clarity, full-body portrait crop of a showroom visitor directly
+    from the clean unannotated camera frame (before any HUD bounding boxes or text are rendered).
+    Preserves natural 3:4 portrait aspect ratio without distortion or hazy micro-face zooming.
+    """
+    if clean_frame is None or clean_frame.size == 0:
+        return None
+    try:
+        fh, fw = clean_frame.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in person_box]
+        bw = max(1, x2 - x1)
+        bh = max(1, y2 - y1)
+
+        # Generous full-body portrait framing: 18% horizontal padding, 12% top padding (head/hair), 6% bottom (shoes)
+        pad_x = int(bw * 0.18)
+        pad_top = int(bh * 0.12)
+        pad_bot = int(bh * 0.06)
+
+        px1 = max(0, x1 - pad_x)
+        py1 = max(0, y1 - pad_top)
+        px2 = min(fw, x2 + pad_x)
+        py2 = min(fh, y2 + pad_bot)
+
+        crop = clean_frame[py1:py2, px1:px2]
+        if crop.size == 0 or crop.shape[0] < 40 or crop.shape[1] < 20:
+            return None
+
+        # Light contrast and shadow balancing for showroom lighting
+        enhanced = enhance_visitor_portrait(crop)
+
+        # Scale proportionally to fit cleanly inside (target_w, target_h)
+        ch, cw = enhanced.shape[:2]
+        scale = min(target_w / max(1, cw), target_h / max(1, ch))
+        new_w = max(1, int(cw * scale))
+        new_h = max(1, int(ch * scale))
+        interp = cv2.INTER_LANCZOS4 if scale >= 1.0 else cv2.INTER_AREA
+        resized = cv2.resize(enhanced, (new_w, new_h), interpolation=interp)
+
+        # Center on a dark neutral canvas of target_w x target_h
+        canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+        canvas[:] = (20, 24, 33)  # Dark slate backdrop (#211814 BGR)
+        ox = (target_w - new_w) // 2
+        oy = (target_h - new_h) // 2
+        canvas[oy:oy + new_h, ox:ox + new_w] = resized
+        return canvas
+    except Exception:
+        return None
+
+
+def estimate_torso_appearance(
+    frame: Optional[np.ndarray], person_box: Tuple[float, float, float, float]
+) -> str:
+    """
+    Extracts central upper-body torso patch to identify clothing color tag.
+    Assists showroom floor staff and reception with fast visual identification.
+    """
+    if frame is None or frame.size == 0:
+        return "Casual Attire"
+    try:
+        x1, y1, x2, y2 = [int(v) for v in person_box]
+        h = y2 - y1
+        w = x2 - x1
+        if h < 20 or w < 10:
+            return "Casual Attire"
+
+        # Torso crop: 22% to 60% of person height, inset 15% from sides
+        ty1 = max(0, min(frame.shape[0] - 1, y1 + int(h * 0.22)))
+        ty2 = max(ty1 + 5, min(frame.shape[0], y1 + int(h * 0.60)))
+        tx1 = max(0, min(frame.shape[1] - 1, x1 + int(w * 0.15)))
+        tx2 = max(tx1 + 5, min(frame.shape[1], x2 - int(w * 0.15)))
+
+        torso = frame[ty1:ty2, tx1:tx2]
+        if torso.size == 0:
+            return "Casual Attire"
+
+        hsv = cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
+        th, tw = hsv.shape[:2]
+        inner = hsv[int(th * 0.15):int(th * 0.85), int(tw * 0.15):int(tw * 0.85)]
+        if inner.size == 0:
+            inner = hsv
+
+        mean_h = float(np.mean(inner[:, :, 0]))
+        mean_s = float(np.mean(inner[:, :, 1]))
+        mean_v = float(np.mean(inner[:, :, 2]))
+
+        if mean_v < 48:
+            return "Black / Dark Attire"
+        if mean_s < 38 and mean_v > 175:
+            return "White / Light Shirt"
+        if mean_s < 42:
+            return "Gray Attire"
+
+        # Hue ranges in OpenCV HSV: [0, 180]
+        if mean_h < 10 or mean_h >= 170:
+            return "Red / Maroon Top"
+        if 10 <= mean_h < 26:
+            return "Orange / Brown Top"
+        if 26 <= mean_h < 36:
+            return "Yellow / Mustard Top"
+        if 36 <= mean_h < 85:
+            return "Green Top"
+        if 85 <= mean_h < 135:
+            return "Blue / Navy Top"
+        if 135 <= mean_h < 165:
+            return "Purple / Violet Top"
+
+        return "Casual Attire"
+    except Exception:
+        return "Casual Attire"
+
+
 # ---------------------------------------------------------------------------
 # Main Local Detection Engine
 # ---------------------------------------------------------------------------
@@ -2451,11 +2901,15 @@ def run_local_detector(
     tracker_name: Optional[str] = None,
     model_type: str = "auto",
     rf_detr_variant: str = "medium",
+    is_entrance: bool = False,
+    camera_name: str = "Showroom Camera",
 ):
     print("=" * 70)
     print("  CAPERMINT SHOWROOM INTELLIGENCE - LOCAL AI EDGE DETECTOR")
     print("=" * 70)
     print(f"[*] Camera ID      : {camera_id}")
+    print(f"[*] Camera Name    : {camera_name}")
+    print(f"[*] Camera Role    : {'[STORE ENTRANCE - Counts Walk-Ins]' if is_entrance else '[INTERIOR ZONE - Dwell Time Only]'}")
     print(f"[*] Video Source   : {source}")
     print(f"[*] Backend API    : {api_url}")
     print(f"[*] Model Type     : {model_type}")
@@ -2647,10 +3101,18 @@ def run_local_detector(
         line_y_ratio=line_ratio,
         direction=direction,
         api_url=api_url,
+        is_entrance=is_entrance,
     )
     employee_dept_tracker = EmployeeDepartmentTracker(log_interval=10.0, exit_debounce=2.0)
     zone_manager.dept_tracker = employee_dept_tracker
-    sync_client = DashboardSyncClient(base_url=api_url, camera_id=camera_id)
+    sync_client = DashboardSyncClient(
+        base_url=api_url,
+        camera_id=camera_id,
+        camera_name=camera_name,
+        is_entrance=is_entrance,
+    )
+    visitor_zone_tracker = VisitorZoneTracker(sync_client=sync_client, sync_interval=4.0)
+    zone_manager.visitor_tracker = visitor_zone_tracker
 
     # Face Embedding & Identity Recovery System (ArcFace + pgvector + 14-Day Retention)
     from app.vision.face_embedder import FaceEmbedder
@@ -2694,6 +3156,9 @@ def run_local_detector(
     punched_employee_ids: Dict[str, float] = {}
     track_last_recognition_attempt: Dict[str, float] = {}
     announced_staff_tracks: Set[int] = set()
+    notified_track_ids: Set[int] = set()
+    notified_visitor_pids: Dict[str, float] = {}
+    track_best_snapshots: Dict[int, Dict[str, Any]] = {}
 
     # Preload registered employees and names into recognizer
     employee_names: Dict[str, str] = {}
@@ -2707,8 +3172,14 @@ def run_local_detector(
             for ae in active_emps:
                 employee_names[ae.employee_id] = ae.name
             print(f"[+] Biometric Pipeline: Loaded {loaded} registered employee face embeddings into index.")
+
+            from app.repositories.person_identity_repo import PersonIdentityRepository
+            vis_repo = PersonIdentityRepository(db_session)
+            active_vis = vis_repo.get_active_embeddings()
+            visitor_vector_store.rebuild_from_records(active_vis)
+            print(f"[+] Biometric Pipeline: Loaded {len(active_vis)} active visitor face embeddings into index.")
         except Exception as e:
-            print(f"[!] Warning: Could not load employee embeddings from database: {e}")
+            print(f"[!] Warning: Could not load biometric embeddings from database: {e}")
 
     window_name = f"Capermint Edge AI Detector - Cam {camera_channel}"
     if not headless:
@@ -2727,6 +3198,9 @@ def run_local_detector(
     seated_staff_tracks: Dict[str, dict] = {}
     staff_spatial_anchors: Dict[str, dict] = {}
     bytetrack_empty_streak = 0
+    pending_line_crossings: Dict[int, dict] = {}
+    confirmed_visitor_tracks: Set[int] = set()
+    confirmed_staff_crossings: Set[int] = set()
 
     # Resolve primary tracker configuration (ByteTrack or BoT-SORT)
     chosen_tracker = tracker_name or settings.TRACKER_TYPE
@@ -2747,6 +3221,9 @@ def run_local_detector(
             if not ret or frame is None:
                 time.sleep(0.01)
                 continue
+
+            # Keep pristine clean frame for high-res body portrait extraction (before any HUD drawing)
+            clean_frame = frame.copy()
 
             frame_counter += 1
 
@@ -2951,26 +3428,41 @@ def run_local_detector(
                 inactive_sec = now_ts - track_last_seen.get(old_id, 0.0)
                 if inactive_sec > 25.0:
                     employee_recognizer.on_track_lost(str(old_id))
+                    visitor_zone_tracker.on_visitor_lost(old_id, now_ts)
                 if inactive_sec > 30.0:
                     track_start_times.pop(old_id, None)
                     track_last_seen.pop(old_id, None)
                     identity_manager.on_track_lost(str(old_id))
+                    notified_track_ids.discard(old_id)
+                    track_best_snapshots.pop(old_id, None)
                     track_last_recognition_attempt.pop(str(old_id), None)
                     employee_dept_tracker.unconfirmed_tracks.pop(str(old_id), None)
+                    confirmed_visitor_tracks.discard(old_id)
+                    confirmed_staff_crossings.discard(old_id)
+                    pending_line_crossings.pop(old_id, None)
 
             # Evaluate Dynamic Entry Line Crossing & Multi-Zone Section Visits
             new_attendance, new_sections = zone_manager.process(tracked_objects)
             for crossed_id in new_attendance:
-                # Strictly suppress visitor entry count if the person is a recognized showroom employee
-                if employee_recognizer.is_track_employee(str(crossed_id)):
+                # 1. If this track is already recognized as a showroom employee:
+                if employee_recognizer.is_track_employee(str(crossed_id)) or crossed_id in confirmed_staff_crossings:
                     emp_id = employee_recognizer.get_employee_id(str(crossed_id))
-                    print(f"[*] Staff member #{crossed_id} (EMP: {emp_id}) crossed entry line - visitor footfall count suppressed.")
-                    continue
-
-                pid = identity_manager.get_person_id(crossed_id)
-                pid_desc = f" (PID: {pid})" if pid else " (PID: Unresolved)"
-                print(f"[--> ENTRY DETECTED] Person #{crossed_id}{pid_desc} crossed Entry Line! Total Entry: {zone_manager.attendance_total}")
-                sync_client.send_entry_event(tracker_id=str(crossed_id), confidence=0.94, person_id=pid)
+                    emp_label = employee_names.get(emp_id, emp_id) if emp_id else "Staff"
+                    zone_manager.mark_employee_crossing(crossed_id)
+                    confirmed_staff_crossings.add(crossed_id)
+                    print(f"[*] Staff member {emp_label} (#{crossed_id}, EMP: {emp_id}) crossed Entry Line! Excluded from visitor footfall.")
+                    if emp_id:
+                        last_punch = punched_employee_ids.get(emp_id, 0.0)
+                        if (now_ts - last_punch) > 300.0:
+                            punched_employee_ids[emp_id] = now_ts
+                            sync_client.send_employee_punch_event(emp_id, event_type="CHECK_IN", confidence=0.95)
+                else:
+                    # Enqueue for identity resolution (allow brief grace window for face recognition)
+                    if crossed_id not in pending_line_crossings and crossed_id not in confirmed_visitor_tracks:
+                        pending_line_crossings[crossed_id] = {
+                            "crossed_ts": now_ts,
+                            "box": tracked_objects.get(crossed_id),
+                        }
 
             for (p_id, s_id, s_name) in new_sections:
                 sec_tot = zone_manager.section_totals.get(s_id, 0)
@@ -3008,6 +3500,11 @@ def run_local_detector(
                     employee_names.clear()
                     for ae in active_emps:
                         employee_names[ae.employee_id] = ae.name
+
+                    from app.repositories.person_identity_repo import PersonIdentityRepository
+                    vis_repo = PersonIdentityRepository(db_session)
+                    active_vis = vis_repo.get_active_embeddings()
+                    visitor_vector_store.rebuild_from_records(active_vis)
                 except Exception:
                     pass
 
@@ -3018,7 +3515,7 @@ def run_local_detector(
             should_detect_faces = (
                 face_detector is not None
                 and (len(tracked_objects) > 0 or allow_standalone_faces)
-                and (frame_counter % 3 == 0)
+                and (frame_counter % 2 == 0)
             )
             if should_detect_faces:
                 if face_detector_type == "scrfd":
@@ -3138,7 +3635,10 @@ def run_local_detector(
                         cy1 = max(0, int(m_box[1]))
                         cx2 = min(w, int(m_box[0] + m_box[2]))
                         cy2 = min(h, int(m_box[1] + m_box[3]))
-                        if cx2 > cx1 + 10 and cy2 > cy1 + 10:
+                        fw = cx2 - cx1
+                        fh = cy2 - cy1
+                        # Require minimum face size of 24x24 so we capture real faces from typical CCTV distances
+                        if fw >= 24 and fh >= 24:
                             face_crop = frame[cy1:cy2, cx1:cx2]
                             raw_lms = matched_face.get("landmarks")
                             crop_lms = None
@@ -3214,6 +3714,20 @@ def run_local_detector(
                                     emp_label = employee_names.get(emp_id, emp_id)
                                     print(f"[+] Biometrics: Verified Staff {emp_label} ({emp_id}) on Track #{obj_id} (conf: {emp_conf:.2f})")
                                     employee_dept_tracker.promote_track_to_employee(tid, emp_id, emp_label, now_ts)
+                                else:
+                                    emp_label = employee_names.get(emp_id, emp_id)
+
+                                if obj_id in pending_line_crossings:
+                                    pending_line_crossings.pop(obj_id, None)
+                                    zone_manager.mark_employee_crossing(obj_id)
+                                    confirmed_staff_crossings.add(obj_id)
+                                    print(f"[*] Staff member {emp_label} (#{obj_id}, EMP: {emp_id}) crossed Entry Line! Excluded from visitor footfall.")
+                                elif obj_id in confirmed_visitor_tracks:
+                                    confirmed_visitor_tracks.discard(obj_id)
+                                    confirmed_staff_crossings.add(obj_id)
+                                    if zone_manager.attendance_total > 0:
+                                        zone_manager.attendance_total -= 1
+                                    print(f"[*] Track #{obj_id} corrected to Staff {emp_label}. Visitor footfall adjusted.")
                                 last_punch = punched_employee_ids.get(emp_id, 0.0)
                                 if (now_ts - last_punch) > 300.0:
                                     punched_employee_ids[emp_id] = now_ts
@@ -3240,8 +3754,82 @@ def run_local_detector(
                                     landmarks=crop_lms,
                                     timestamp=now_ts,
                                 )
-                                if match_res.person_id:
-                                    zone_manager.set_identity(obj_id, match_res.person_id)
+                                pid_val_track = match_res.person_id or identity_manager.get_person_id(obj_id)
+                                if pid_val_track:
+                                    zone_manager.set_identity(obj_id, pid_val_track)
+                                    visitor_zone_tracker.link_track_pid(obj_id, pid_val_track)
+
+                                # Full-body high-clarity visitor snapshot extraction from pristine clean frame
+                                try:
+                                    body_crop = extract_visitor_body_crop(clean_frame, (x1, y1, x2, y2))
+                                    if body_crop is not None and body_crop.size > 0:
+                                        q_score = compute_face_photo_quality(
+                                            face_crop=face_crop,
+                                            face_conf=float(matched_face["conf"]),
+                                            landmarks=crop_lms,
+                                        )
+                                        snap_info = track_best_snapshots.get(obj_id)
+                                        should_send = False
+
+                                        if snap_info is None:
+                                            snap_info = {
+                                                "best_score": q_score,
+                                                "last_sent_ts": 0.0,
+                                                "sent_count": 0,
+                                                "first_seen_ts": now_ts,
+                                                "person_id": pid_val_track,
+                                                "portrait": body_crop,
+                                                "conf": float(matched_face["conf"]),
+                                            }
+                                            track_best_snapshots[obj_id] = snap_info
+                                        else:
+                                            if q_score > snap_info["best_score"]:
+                                                snap_info["best_score"] = q_score
+                                                snap_info["portrait"] = body_crop
+                                                snap_info["conf"] = float(matched_face["conf"])
+
+                                        # Only dispatch photo to backend visitor registry if this person crossed the entry line
+                                        if obj_id in confirmed_visitor_tracks:
+                                            if snap_info["sent_count"] == 0:
+                                                should_send = True
+                                                snap_info["sent_count"] = 1
+                                                snap_info["last_sent_ts"] = now_ts
+                                                notified_track_ids.add(obj_id)
+                                            else:
+                                                track_age = now_ts - snap_info["first_seen_ts"]
+                                                time_since_send = now_ts - snap_info["last_sent_ts"]
+                                                is_quality_upgrade = (q_score >= snap_info["best_score"] * 1.25) or (q_score >= snap_info["best_score"] + 0.15)
+                                                if track_age <= 4.0 and is_quality_upgrade and time_since_send >= 0.40 and snap_info["sent_count"] < 4:
+                                                    should_send = True
+                                                    snap_info["best_score"] = max(snap_info["best_score"], q_score)
+                                                    snap_info["last_sent_ts"] = now_ts
+                                                    snap_info["sent_count"] += 1
+
+                                        if should_send:
+                                            ret_enc, buf_enc = cv2.imencode('.jpg', snap_info["portrait"], [cv2.IMWRITE_JPEG_QUALITY, 95])
+                                            if ret_enc:
+                                                import base64
+                                                b64_crop = base64.b64encode(buf_enc).decode('utf-8')
+                                                clothing_color = estimate_torso_appearance(clean_frame, (x1, y1, x2, y2))
+                                                cur_sec_match = zone_manager.find_section_for_box((x1, y1, x2, y2))
+                                                cur_sec_zone = cur_sec_match[1] if cur_sec_match else "Main Showroom"
+                                                track_emb = identity_manager.track_embeddings.get(str(obj_id))
+                                                if track_emb is None and isinstance(obj_id, int):
+                                                    track_emb = identity_manager.track_embeddings.get(obj_id)
+                                                emb_list = track_emb.tolist() if (track_emb is not None and hasattr(track_emb, "tolist")) else None
+                                                sync_client.send_visitor_detect(
+                                                    face_image_base64=b64_crop,
+                                                    tracker_id=str(obj_id),
+                                                    person_id=pid_val_track,
+                                                    confidence=float(matched_face["conf"]),
+                                                    appearance=clothing_color,
+                                                    zone=cur_sec_zone,
+                                                    face_embedding=emb_list,
+                                                )
+                                except Exception:
+                                    pass
+                                except Exception:
+                                    pass
                     except Exception as e:
                         pass
 
@@ -3370,8 +3958,46 @@ def run_local_detector(
                     cand_dept = zone_manager.find_section_for_box((x1, y1, x2, y2))
                     employee_dept_tracker.update_unconfirmed_track(str(obj_id), cand_dept, now_ts)
                     pid_val = identity_manager.get_person_id(obj_id)
+                    visitor_zone_tracker.update_visitor_zone(obj_id, cand_dept, now_ts, person_id=pid_val)
                     pid_desc = f" | {pid_val}" if pid_val else " | PID: Unresolved"
-                    main_label = f"Person #{obj_id}{pid_desc} | {timer_str}"
+                    zone_desc = f" | {cand_dept[1]}" if cand_dept else ""
+                    main_label = f"Person #{obj_id}{pid_desc}{zone_desc} | {timer_str}"
+
+                    # Guaranteed Photo Capture: ONLY for confirmed visitors who crossed the entry line
+                    if obj_id in confirmed_visitor_tracks and obj_id not in notified_track_ids and (now_ts - track_start_times.get(obj_id, now_ts)) >= 0.25:
+                        notified_track_ids.add(obj_id)
+                        try:
+                            body_portrait = extract_visitor_body_crop(clean_frame, (x1, y1, x2, y2))
+                            if body_portrait is not None and body_portrait.size > 0:
+                                ret_b, buf_b = cv2.imencode('.jpg', body_portrait, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                                if ret_b:
+                                    import base64
+                                    b64_b = base64.b64encode(buf_b).decode('utf-8')
+                                    clothing = estimate_torso_appearance(clean_frame, (x1, y1, x2, y2))
+                                    z_name = cand_dept[1] if cand_dept else "Main Showroom"
+                                    track_emb = identity_manager.track_embeddings.get(str(obj_id))
+                                    if track_emb is None and isinstance(obj_id, int):
+                                        track_emb = identity_manager.track_embeddings.get(obj_id)
+                                    emb_list = track_emb.tolist() if (track_emb is not None and hasattr(track_emb, "tolist")) else None
+                                    sync_client.send_visitor_detect(
+                                        face_image_base64=b64_b,
+                                        tracker_id=str(obj_id),
+                                        person_id=pid_val,
+                                        confidence=0.88,
+                                        appearance=clothing,
+                                        zone=z_name,
+                                        face_embedding=emb_list,
+                                    )
+                                    track_best_snapshots[obj_id] = {
+                                        "best_score": 0.35,
+                                        "last_sent_ts": now_ts,
+                                        "sent_count": 1,
+                                        "first_seen_ts": now_ts,
+                                        "person_id": pid_val,
+                                        "portrait": body_portrait,
+                                    }
+                        except Exception:
+                            pass
                 (w_main, _), _ = cv2.getTextSize(main_label, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
 
                 w_face = 0
@@ -3427,6 +4053,83 @@ def run_local_detector(
                 if show_entry_line:
                     cx = int((ix1 + ix2) / 2)
                     cv2.circle(frame, (cx, iy2), 4, (0, 0, 255), -1)
+
+            # ---------------------------------------------------------------
+            # Resolve Pending Entry Line Crossings (Staff vs Visitor Classification)
+            # Evaluates whether the person crossing the entry line is an Employee or Visitor
+            # ---------------------------------------------------------------
+            for cid in list(pending_line_crossings.keys()):
+                cdata = pending_line_crossings[cid]
+                # Check A: Is this track recognized as a showroom employee?
+                if employee_recognizer.is_track_employee(str(cid)) or cid in confirmed_staff_crossings:
+                    emp_id = employee_recognizer.get_employee_id(str(cid))
+                    emp_label = employee_names.get(emp_id, emp_id) if emp_id else "Staff"
+                    zone_manager.mark_employee_crossing(cid)
+                    confirmed_staff_crossings.add(cid)
+                    pending_line_crossings.pop(cid, None)
+                    print(f"[*] Staff member {emp_label} (#{cid}, EMP: {emp_id}) crossed Entry Line! Excluded from visitor footfall.")
+                    if emp_id:
+                        last_punch = punched_employee_ids.get(emp_id, 0.0)
+                        if (now_ts - last_punch) > 300.0:
+                            punched_employee_ids[emp_id] = now_ts
+                            sync_client.send_employee_punch_event(emp_id, event_type="CHECK_IN", confidence=0.95)
+                    continue
+
+                # Check B: Has face evaluation completed, or has the grace window elapsed (0.7s)?
+                elapsed = now_ts - cdata["crossed_ts"]
+                face_tested = (str(cid) in track_last_recognition_attempt) or (identity_manager.get_person_id(cid) is not None)
+                if face_tested or elapsed >= 0.70 or (cid not in tracked_objects):
+                    # Person crossed entry line and is NOT an employee -> Confirmed VISITOR!
+                    pending_line_crossings.pop(cid, None)
+                    pid = identity_manager.get_person_id(cid)
+                    zone_manager.record_visitor_entry(cid, pid)
+                    confirmed_visitor_tracks.add(cid)
+                    pid_desc = f" (PID: {pid})" if pid else " (PID: Unresolved)"
+                    print(f"[--> VISITOR ENTRY DETECTED] Customer #{cid}{pid_desc} crossed Entry Line! Total Visitor Footfall: {zone_manager.attendance_total}")
+                    sync_client.send_entry_event(tracker_id=str(cid), confidence=0.94, person_id=pid)
+
+                    # Extract best full-body portrait snapshot to send to visitor registry
+                    snap_info = track_best_snapshots.get(cid)
+                    port_img = snap_info.get("portrait") if snap_info else None
+                    if port_img is None:
+                        c_box = tracked_objects.get(cid, cdata.get("box"))
+                        if c_box is not None:
+                            port_img = extract_visitor_body_crop(clean_frame, c_box)
+
+                    if port_img is not None and port_img.size > 0:
+                        try:
+                            ret_v, buf_v = cv2.imencode('.jpg', port_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                            if ret_v:
+                                import base64
+                                b64_v = base64.b64encode(buf_v).decode('utf-8')
+                                c_box_now = tracked_objects.get(cid, cdata.get("box"))
+                                clothing = estimate_torso_appearance(clean_frame, c_box_now) if c_box_now else "Walk-in Visitor"
+                                sec_m = zone_manager.find_section_for_box(c_box_now) if c_box_now else None
+                                z_name = sec_m[1] if sec_m else "Main Showroom"
+                                track_emb = identity_manager.track_embeddings.get(str(cid))
+                                if track_emb is None and isinstance(cid, int):
+                                    track_emb = identity_manager.track_embeddings.get(cid)
+                                emb_list = track_emb.tolist() if (track_emb is not None and hasattr(track_emb, "tolist")) else None
+                                sync_client.send_visitor_detect(
+                                    face_image_base64=b64_v,
+                                    tracker_id=str(cid),
+                                    person_id=pid,
+                                    confidence=0.92,
+                                    appearance=clothing,
+                                    zone=z_name,
+                                    face_embedding=emb_list,
+                                )
+                                notified_track_ids.add(cid)
+                                track_best_snapshots[cid] = {
+                                    "best_score": 0.40,
+                                    "last_sent_ts": now_ts,
+                                    "sent_count": 1,
+                                    "first_seen_ts": now_ts,
+                                    "person_id": pid,
+                                    "portrait": port_img,
+                                }
+                        except Exception:
+                            pass
 
             # ---------------------------------------------------------------
             # Standalone Seated Staff Tracking & Verification
@@ -3543,16 +4246,19 @@ def run_local_detector(
                             if (now_ts - last_punch) > 300.0:
                                 punched_employee_ids[s_emp_id] = now_ts
                                 sync_client.send_employee_punch_event(s_emp_id, event_type="CHECK_IN", confidence=s_emp_conf)
-                        elif face["conf"] >= 0.70:
-                            # Draw temporary visitor face ONLY if confidence is very high (>= 70%) and geometry is verified
+                        elif face["conf"] >= 0.65:
+                            # Draw visitor face bounding box and landmarks
                             cv2.rectangle(frame, (sbx1, sby1), (sbx2, sby2), (255, 30, 220), 2)
                             for (lx, ly) in lms:
                                 if 0 <= lx < w and 0 <= ly < h:
                                     cv2.circle(frame, (lx, ly), 2, (0, 255, 255), -1)
-                            slabel = f"Face {int(face['conf'] * 100)}%"
+                            slabel = f"Visitor Face {int(face['conf'] * 100)}%"
                             (slw, slh), _ = cv2.getTextSize(slabel, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
                             cv2.rectangle(frame, (sbx1, max(0, sby1 - 18)), (sbx1 + slw + 8, sby1), (15, 23, 42), -1)
                             cv2.putText(frame, slabel, (sbx1 + 4, max(12, sby1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 30, 220), 1, cv2.LINE_AA)
+
+                            # Standalone face detected - visualized on HUD (entry line crossing required to register walk-in)
+                            pass
 
                 # 5. Render & Persist all confirmed Seated Staff across blinks/head-tilts for up to 3.5s
                 for eid in list(seated_staff_tracks.keys()):
@@ -3618,7 +4324,7 @@ def run_local_detector(
                 staff_hud_str = f"  |  Staff: {staff_hud}" if staff_hud else ""
                 stats_text = (
                     f"{hw_tag} FPS: {fps:.1f}  |  "
-                    f"Entry: {zone_manager.attendance_total}{sec_str}{staff_hud_str}  |  "
+                    f"Visitors: {zone_manager.attendance_total}{sec_str}{staff_hud_str}  |  "
                     f"Keys: [1] Line{sec_shortcut_str} [D] Flip Dir  [C] Reset  [R] Clear"
                 )
                 cv2.putText(frame, stats_text, (15, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 225, 255), 1, cv2.LINE_AA)
@@ -3961,6 +4667,8 @@ def main():
     resolved_min_feet_y = float(selected_cam.get("min_feet_y", args.min_feet_y)) if selected_cam and "min_feet_y" in selected_cam else args.min_feet_y
     resolved_conf = float(selected_cam.get("confidence", args.conf)) if selected_cam and "confidence" in selected_cam else args.conf
     resolved_standalone_faces = bool(selected_cam.get("allow_standalone_faces", args.standalone_faces)) if selected_cam and "allow_standalone_faces" in selected_cam else args.standalone_faces
+    resolved_is_entrance = bool(selected_cam.get("is_entrance", resolved_channel == "101")) if selected_cam else (resolved_channel == "101")
+    resolved_camera_name = selected_cam.get("name", f"Showroom Camera {resolved_channel}") if selected_cam else f"Showroom Camera {resolved_channel}"
 
     run_local_detector(
         source=resolved_source,
@@ -3993,6 +4701,8 @@ def main():
         tracker_name=resolved_tracker,
         model_type=resolved_model_type,
         rf_detr_variant=args.rf_detr_variant,
+        is_entrance=resolved_is_entrance,
+        camera_name=resolved_camera_name,
     )
 
 

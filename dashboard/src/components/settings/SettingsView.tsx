@@ -13,6 +13,7 @@ import {
   RefreshCw,
   AlertCircle,
   Video,
+  Camera,
   Sparkles,
   ToggleLeft,
   ToggleRight,
@@ -23,6 +24,7 @@ import {
   DepartmentCreatePayload,
   CameraModel,
 } from '../../services/cameraService';
+import { CameraSettingsSection } from './CameraSettingsSection';
 
 const PRESET_COLORS = [
   { name: 'Cyan', hex: '#00D7FF' },
@@ -40,7 +42,7 @@ export const SettingsView: React.FC = () => {
   const { storeHours, updateStoreHours, isStoreCurrentlyOpen, refreshDepartments } = useShowroom();
 
   // Tab State
-  const [activeTab, setActiveTab] = useState<'detection' | 'schedule'>('detection');
+  const [activeTab, setActiveTab] = useState<'cameras' | 'detection' | 'schedule'>('cameras');
 
   // Store Hours Form State
   const [openingTime, setOpeningTime] = useState(storeHours.openingTime);
@@ -241,6 +243,17 @@ export const SettingsView: React.FC = () => {
         {/* Tab Navigation */}
         <div className="flex items-center gap-1.5 p-1 bg-slate-100/90 rounded-2xl border border-slate-200">
           <button
+            onClick={() => setActiveTab('cameras')}
+            className={`px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 cursor-pointer ${
+              activeTab === 'cameras'
+                ? 'bg-white text-blue-600 shadow-sm border border-slate-200/60'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <Camera className="w-3.5 h-3.5" />
+            <span>Camera Settings</span>
+          </button>
+          <button
             onClick={() => setActiveTab('detection')}
             className={`px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 cursor-pointer ${
               activeTab === 'detection'
@@ -289,6 +302,9 @@ export const SettingsView: React.FC = () => {
           <span>{saveSuccess}</span>
         </div>
       )}
+
+      {/* TAB 0: CAMERA SETTINGS */}
+      {activeTab === 'cameras' && <CameraSettingsSection />}
 
       {/* TAB 1: EDIT DETECTION & DEPARTMENTS */}
       {activeTab === 'detection' && (

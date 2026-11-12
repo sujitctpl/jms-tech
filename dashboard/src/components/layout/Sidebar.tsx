@@ -79,7 +79,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     },
     {
       id: 'settings' as ActiveTab,
-      label: 'Store Operating Hours',
+      label: 'Settings & Cameras',
       icon: Settings,
       badge: null,
     },

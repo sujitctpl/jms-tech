@@ -6,7 +6,7 @@ This document details the end-to-end system architecture, operational data flows
 
 ## 1. High-Level Architecture Overview
 
-The system is engineered as an **Edge-AI Hybrid Architecture**. Computationally intensive deep-learning inference (object detection, multi-object tracking, neural face detection, and biometric embedding extraction) runs locally at the showroom edge near the camera network. Analytics aggregation, employee management, dynamic departments, session authentication, and data retention run on a centralized backend and modern web dashboard.
+The system is engineered as an **Edge-AI Hybrid Architecture**. Computationally intensive deep-learning inference (object detection, multi-object tracking, neural face detection, biometric embedding extraction, photo quality scoring, and zone dwell computation) runs locally at the showroom edge near the camera network. Analytics aggregation, visitor CRM tagging, dynamic camera configuration, employee management, session authentication, and data retention run on a centralized backend and modern web dashboard.
 
 ```mermaid
 graph TD
@@ -20,26 +20,29 @@ graph TD
             Embedder["Biometric Extractor\n• ArcFace ResNet50 (512-D)\n• Quality Gating & Landmark Alignment"]
             Tracker["Multi-Object Tracker\n• ByteTrack (bytetrack.yaml)\n• BoT-SORT + GMC (botsort.yaml)\n• Fallback Kalman Tracker"]
             StaffClassifier["Employee vs Visitor Classifier\n• Cosine Similarity (thresh = 0.32)\n• Temporal Voting Buffer (win = 5)"]
+            PhotoPipeline["Visitor Photo Optimization\n• Multi-Frame Best-Shot Scoring\n• Progressive Upgrades (3.5s)\n• CLAHE Backlight & HSV Attire"]
+            ZoneTracker["Visitor Zone & Dwell Tracker\n• Live Zone Dwell Accumulator\n• Reverse Exit Line Detector"]
             LineZone["Spatial Analytics Engine\n• Directional Entry-Line Crossing\n• Dynamic Department Dwell Timers"]
             MJPEG["Local MJPEG Live Stream Server"]
+            HotReload["Config Hot-Reloader\n(Watches camera_config.json mtime)"]
         end
         
         SyncQueue["Background Sync Client\n(Non-blocking Memory Queue)"]
     end
 
     subgraph Central Backend [FastAPI & Express Backend]
-        API["FastAPI Backend (:8000)\n• /api/v1/cameras (CRUD, Frame, Stream)\n• /api/v1/departments (Dynamic CRUD)\n• /api/v1/employees (Profiles, Photos, Gallery)\n• /api/v1/attendance (Punch & Daily Report)\n• /api/v1/analytics (Footfall & Heatmaps)\n• /api/v1/identity (Retention & Cleanup)"]
+        API["FastAPI Backend (:8000)\n• /api/v1/cameras (Config, CRUD, Stream Testing)\n• /api/v1/visitors (Detect, Tag, Dwell, Walk-In)\n• /api/v1/departments (Dynamic CRUD)\n• /api/v1/employees (Profiles, Photos, Gallery)\n• /api/v1/attendance (Punch & Daily Report)\n• /api/v1/analytics (Footfall & Heatmaps)\n• /api/v1/identity (Retention & Cleanup)"]
         RetentionWorker["Scheduled Retention Worker\n(14-Day Rolling Biometric Purge)"]
         AuthSrv["Express Auth Server (:5000)\n• /api/auth/login & /register\n• Admin Role-Based Access"]
         ServerWorker["Optional Server VideoWorker\n(app/workers/video_worker.py)"]
     end
 
     subgraph Persistence [PostgreSQL Database with pgvector]
-        DB[("PostgreSQL 14+ (:5432)\n• cameras & departments\n• employees & employee_attendance_logs\n• employee_daily_attendance\n• person_identities (pgvector 512)\n• visitor_tracks & footfall_events\n• detection_events & processing_runs\n• admins")]
+        DB[("PostgreSQL 14+ (:5432)\n• cameras & departments\n• employees & employee_attendance_logs\n• employee_daily_attendance\n• person_identities (pgvector 512 + Visitor CRM)\n• visitor_tracks & footfall_events\n• detection_events & processing_runs\n• admins")]
     end
 
     subgraph Client Layer [Modern Web UI]
-        UI["React 19 Dashboard (:5173)\n(Vite + TypeScript + Tailwind CSS)\n• Live CCTV Preview & Stream Playback\n• Real-Time Footfall & Peak Hours\n• Dynamic Department Management\n• Staff Attendance & Visitor Tagging\n• Section Dwell Time & Export Reports"]
+        UI["React 19 Dashboard (:5173)\n(Vite + TypeScript + Tailwind CSS)\n• Live CCTV Preview & Stream Playback\n• Dynamic Camera & AI Settings Panel\n• Visit Purpose Tagging & Zoom Lightbox\n• Real-Time Zone Dwell & Journey Analytics\n• Staff Attendance & Daily Rolls\n• Section Dwell Time & Export Reports"]
     end
 
     CCTV -->|RTSP TCP Stream| RTSP
@@ -48,9 +51,12 @@ graph TD
     FaceDet --> Embedder
     Embedder --> Tracker
     Tracker --> StaffClassifier
-    StaffClassifier --> LineZone
+    StaffClassifier --> PhotoPipeline
+    StaffClassifier --> ZoneTracker
+    ZoneTracker --> LineZone
     LineZone --> SyncQueue
-    LineZone -.->|Frame Buffer| MJPEG
+    LineZone -.->|Annotated Buffer| MJPEG
+    HotReload -.->|Zero-Downtime Reload| LineZone
 
     SyncQueue -->|HTTP REST JSON| API
     CCTV -.->|Optional Direct RTSP| ServerWorker
@@ -77,7 +83,7 @@ The edge engine supports dynamic runtime switching across detection backends:
 2. **Ultralytics YOLO (`--v1`)**: Ultra-fast convolutional detection engine (defaults to `models/yolo26s.pt`). Provides rapid inference (15–30ms per frame on modern GPUs or 50–70ms on modern multi-core CPUs).
 3. **RTMDet Support**: ONNX runtime engine optimized for high-throughput edge devices.
 
-Inference input resolution defaults to `1024x1024` pixels (`--imgsz 1024`), ensuring small faces and distant visitors entering through showroom glass doorways are detected reliably.
+Inference input resolution defaults to `960x960` or `1024x1024` pixels (`--imgsz 960`), ensuring small faces and distant visitors entering through showroom glass doorways are detected reliably.
 
 ### 2.3 Neural Face Detection & Quality Gating
 Face detection operates under a hierarchical upper-torso spatial constraint:
@@ -113,7 +119,7 @@ sequenceDiagram
     participant DB as PostgreSQL (pgvector)
     participant UI as React Dashboard
 
-    Cam->>Edge: Deliver latest 1080p frame
+    Cam->>Edge: Deliver latest frame
     Edge->>Edge: Detect Person + Extract ArcFace 512-D Embedding
     Edge->>Classifier: classify_face(track_id, embedding)
     
@@ -140,7 +146,7 @@ sequenceDiagram
         API-->>Sync: 200 OK {"punch_recorded": true}
     end
 
-    opt Visitor Crosses Entry Line
+    opt Visitor Crosses Entry Line (Entrance Camera)
         Edge->>Edge: Visitor Track #42 crosses virtual line
         Edge->>Sync: Enqueue Footfall Event ("entry", track_id: "42")
         Sync->>API: POST /api/v1/cameras/{id}/footfall
@@ -185,54 +191,223 @@ Raw detections exhibit coordinate micro-jitter due to digital sensor noise. The 
 
 ---
 
-## 5. Virtual Entry-Line Crossing & Spatial Departments
+## 5. Visitor Photo Optimization & Purpose Tagging Pipeline
 
-### 5.1 Ground-Plane Contact Calculation
+To ensure high-quality identification for showroom floor staff and front-desk receptionists tagging walk-in customers, the system employs an intelligent, multi-stage photo capture and progressive upgrade engine.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Cam as Entrance Camera (RTSP)
+    participant Edge as Edge AI Engine (local_detector.py)
+    participant Backend as FastAPI Backend (:8000)
+    participant Storage as File Storage (static/uploads)
+    participant DB as PostgreSQL (person_identities)
+    participant UI as React 19 Dashboard (Visit Purpose)
+
+    Cam->>Edge: Frame t=0: Visitor steps through glass door (distant, 48px face)
+    Edge->>Edge: Initial Detection (conf >= 0.55, q_score = 0.38)
+    Edge->>Edge: Apply CLAHE backlight lift + HSV clothing estimation ("Navy Blue Top")
+    Edge->>Backend: POST /api/v1/visitors/detect (initial snapshot @ 320x320)
+    Backend->>Storage: Save VIS-2026-1042.jpg
+    Backend->>DB: INSERT PersonIdentity (person_id, avatar_url, notes: "Appearance: Navy Blue Top")
+    Backend-->>UI: Real-Time Table Row: VIS-2026-1042 appears with initial photo & badge
+
+    Note over Edge: Visitor walks 3-5 steps closer to counter (t=1.4s, 140px face, frontal)
+    Cam->>Edge: Frame t=1.4s: Closer, crisp frontal frame
+    Edge->>Edge: Compute Quality Score (q_score = 0.82 >= 1.25 * old_score)
+    Edge->>Edge: Progressive Upgrade Triggered!
+    Edge->>Backend: POST /api/v1/visitors/detect (updated crisp snapshot @ 320x320)
+    Backend->>Storage: Overwrite VIS-2026-1042.jpg with retina quality crop (Q95)
+    Backend-->>UI: Avatar updates automatically with sharp portrait!
+
+    UI->>UI: Receptionist clicks photo thumbnail -> Opens High-Res Lightbox
+    UI->>UI: Clicks "Tag This Visitor" -> TagVisitorModal displays portrait & appearance
+    UI->>Backend: PATCH /api/v1/visitors/VIS-2026-1042/tag (purpose: "Vehicle Enquiry", staff: "Rajesh")
+    Backend->>DB: UPDATE PersonIdentity (tagging_status: "Tagged", visit_purpose: "Vehicle Enquiry")
+```
+
+### 5.1 Multi-Frame Best-Shot Quality Scoring
+Rather than committing to the very first frame where a face is detected (which is typically far away, motion-blurred, or looking sideways at the entrance door), the edge engine continuously scores every frame using a composite metric:
+
+$$Q = 0.35 \cdot S_{\text{sharpness}} + 0.25 \cdot S_{\text{resolution}} + 0.20 \cdot S_{\text{pose}} + 0.10 \cdot S_{\text{illumination}} + 0.10 \cdot S_{\text{confidence}}$$
+
+1. **Sharpness ($S_{\text{sharpness}}$)**: Evaluated via Laplacian variance $\sigma^2(\nabla^2 I)$ over the face crop. Frames with walking motion blur get low scores; crisp, stabilized frames receive maximum weight.
+2. **Resolution ($S_{\text{resolution}}$)**: Scaled by face area relative to canonical $120 \times 120\text{ px}$. Denser crops with clear biometric features are heavily prioritized.
+3. **Frontality & Pose Symmetry ($S_{\text{pose}}$)**: Evaluates roll tilt angle via eye landmarks ($\text{atan2}(\Delta y, \Delta x)$) and yaw offset from nose-to-eye horizontal center. Frontal poses receive scores close to $1.0$.
+4. **Illumination Balance ($S_{\text{illumination}}$)**: Penalizes severe silhouettes ($\text{mean lum} < 85$) and camera lens glare ($\text{mean lum} > 175$).
+
+### 5.2 Dynamic Progressive Upgrade Policy
+* **Zero-Latency Ingress**: The first valid face observation is dispatched immediately to the dashboard to avoid any delay in displaying new walk-ins.
+* **3.5-Second Walk-In Window**: During the visitor's first 3.5 seconds of trajectory, any frame with $Q \ge 1.25 \cdot Q_{\text{best}}$ (or $Q \ge Q_{\text{best}} + 0.15$) with at least $500\text{ ms}$ separation triggers a seamless progressive photo upgrade.
+
+### 5.3 Contextual Bust Framing & CLAHE Backlight Compensation
+* **Bust & Torso Framing**: To enable floor staff to instantly recognize customers from a distance, portrait crops extend beyond the face boundary:
+  $$\text{Top} = y_1 - 0.45 \cdot f_h, \quad \text{Bottom} = y_2 + 0.85 \cdot f_h, \quad \text{Sides} = x_{1,2} \pm 0.40 \cdot f_w$$
+  This captures hairstyle, collar, neck, and upper-chest attire.
+* **CLAHE Equalization**: High dynamic range backlighting from showroom glass facades is corrected in LAB color space by applying Contrast Limited Adaptive Histogram Equalization (`clipLimit = 2.2`, `tileGridSize = 8x8`) exclusively to the luminance ($L$) channel, lifting facial shadows without bleaching background highlights.
+* **Retina Standard**: Snapshots are standardized to $320 \times 320\text{ px}$ with Lanczos4 interpolation (`cv2.INTER_LANCZOS4`) and encoded at JPEG quality 95.
+
+### 5.4 Torso HSV Attire Classification
+The upper-torso region ($22\%$ to $60\%$ of total body height) is sampled in HSV color space to classify dominant attire colors (e.g. *Blue / Navy Top*, *White / Light Shirt*, *Red / Maroon Top*, *Black Attire*). This clothing tag is passed into the visitor record and rendered as a visual badge in the dashboard for instant customer association.
+
+---
+
+## 6. Real-Time Visitor Journey, Zone Dwell & Exit Tracking
+
+Beyond basic ingress counts, modern showroom management demands full visibility into customer browsing patterns, department-level interest, and total visit durations. The system implements a dedicated, non-blocking **`VisitorZoneTracker`** to monitor customer dwell and capture departure events in Indian Standard Time (IST, UTC+05:30).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Cam as CCTV Cameras (Entrance & Floor)
+    participant Edge as Edge AI Engine (VisitorZoneTracker)
+    participant Sync as Background Sync Client
+    participant API as FastAPI Backend (:8000)
+    participant DB as PostgreSQL (person_identities)
+    participant UI as React 19 Dashboard (Visit Purpose)
+
+    Cam->>Edge: Visitor #42 enters showroom (t=0)
+    Edge->>Edge: Initial Zone: "Main Showroom" (dwell = 0s)
+    
+    loop Every 4.0 Seconds (Active Trajectory)
+        Edge->>Edge: Evaluate foot/torso contact with Section Polygons
+        alt Inside "Sales Section"
+            Edge->>Edge: Increment "Sales Section" dwell (+delta_t)
+        else In General Area
+            Edge->>Edge: Increment "Main Showroom" dwell (+delta_t)
+        end
+        Edge->>Sync: send_visitor_zone_update(person_id, zone_dwell, top_zone)
+        Sync->>API: POST /api/v1/visitors/update-zone
+        API->>DB: UPDATE person_identities SET zone_dwell = ..., zone_entered = ...
+        API-->>UI: Real-Time Dwell Badges: "Sales Section: 4m 12s", "Main Showroom: 1m 30s"
+    end
+
+    Note over Cam,Edge: Visitor finishes consultation and walks toward exit door
+    Cam->>Edge: Frame t=940s: Foot crosses entry line in REVERSE (Outbound)
+    Edge->>Edge: Reverse Line Crossing Detected! (rev_crossed = True)
+    Edge->>Edge: Format Departure Time: "04:45 PM IST"
+    Edge->>Sync: send_visitor_zone_update(exit_time="04:45 PM", is_departure=True)
+    Sync->>API: POST /api/v1/visitors/update-zone
+    API->>DB: UPDATE person_identities SET exit_time = "04:45 PM"
+    API-->>UI: Dashboard updates visitor row with departure stamp & complete journey!
+```
+
+### 6.1 Dwell Accumulation & Duration Formatting
+* **Dynamic Dwell Bucketing**: For every active track, time spent inside each calibrated department polygon is accumulated. Time spent outside specific polygons is assigned to `"Main Showroom"`.
+* **Human-Readable Formatter**: Dwell seconds are formatted into concise strings:
+  $$\text{format\_duration}(s) = \begin{cases} 
+  \text{Xs}, & s < 60 \\
+  \text{Y mins}, & s \ge 60 \text{ and } s \pmod{60} = 0 \\
+  \text{Ym Zs}, & s \ge 60 \text{ and } s \pmod{60} \ne 0
+  \end{cases}$$
+* **Periodic Synchronization**: The edge client bundles the dwell breakdown and flushes updates every `sync_interval = 4.0` seconds to `/api/v1/visitors/update-zone`.
+
+### 6.2 Reverse Line Crossing & Departure Detection
+* **Directional Reversal**: An entrance line configured for ingress (`direction = "top_to_bottom"`) monitors the opposing cross-product trajectory ($y_{\text{curr}} < y_{\text{prev}}$ or reverse vector orientation).
+* **Indian Standard Time (IST) Clock**: When reverse crossing is confirmed, the departure timestamp is calculated in `Asia/Kolkata` time (`UTC+05:30`) and recorded:
+  ```python
+  exit_time = datetime.fromtimestamp(now_ts, tz=IST).strftime("%I:%M %p")
+  ```
+* **Summary Telemetry**: The final zone dwell breakdown is emitted to system logs and persisted to the visitor's database record.
+
+---
+
+## 7. Virtual Entry-Line Crossing & Spatial Departments
+
+### 7.1 Ground-Plane Contact Calculation
 To eliminate false triggers from head bobbing or gestures, line crossings are computed solely from the **bottom-center ground contact point**:
 $$\text{Point}_{\text{feet}} = \left( \frac{x_1 + x_2}{2}, \; y_2 \right)$$
 
-### 5.2 2D Intersection Geometry
+### 7.2 2D Intersection Geometry
 A track moving from position $A(x_A, y_A)$ to $B(x_B, y_B)$ crosses calibrated line segment $P_1(x_1, y_1) \to P_2(x_2, y_2)$ if:
 1. Segments $AB$ and $P_1P_2$ intersect (tested via orientation cross products):
    $$\text{ccw}(A, B, C) = (C_y - A_y) \cdot (B_x - A_x) > (B_y - A_y) \cdot (C_x - A_x)$$
 2. Vector $A \to B$ matches the configured direction (`top_to_bottom`, `bottom_to_top`, `left_to_right`, or `right_to_left`).
 
-### 5.3 Multi-Tier Duplicate Prevention
+### 7.3 Multi-Tier Duplicate Prevention
 Double counting is strictly prevented at two architectural tiers:
 * **Tier 1 (In-Memory)**: Edge engine maintains `counted_track_ids: Set[str]`. Once crossed, the tracker ID is permanently locked.
 * **Tier 2 (PostgreSQL)**: The `footfall_events` table enforces `UNIQUE(visitor_track_id)`. Duplicate requests return HTTP 200 without inserting duplicate rows.
 
-### 5.4 Dynamic Department Zones & Dwell Time
-Showroom departments (e.g. Diamond, Gold, Luxury Lounge) are configured as 2D polygonal bounding boxes:
-* Each track's foot reference point is evaluated against the zone polygon.
-* Ingress triggers department entry; continuous presence accumulates dwell duration.
-* If a tracked person is identified as staff, their presence is excluded from customer dwell metrics.
+### 7.4 Entrance vs. In-Store Floor Camera Segregation
+To support multi-camera showroom deployments without skewing aggregate analytics:
+* **Entrance Cameras (`is_entrance = True`)**: Configured at showroom entry/exit doors. These cameras process walk-in footfall counts, dispatch initial visitor profile creation, and detect reverse-line departures.
+* **In-Store Floor Cameras (`is_entrance = False`)**: Positioned over interior sales desks, jewelry showcases, or waiting lounges. These cameras continuously track customer trajectories, department dwell times, and staff interactions **without** emitting redundant walk-in footfall entries.
 
 ---
 
-## 6. Biometric Privacy & 14-Day Rolling Retention
+## 8. Dynamic Multi-Camera Management & Edge Hot-Reloading
 
-To comply with data privacy regulations (GDPR and privacy principles):
+The platform decouples camera administration from hardcoded code, providing dynamic CRUD and real-time synchronization between the React web UI, FastAPI backend, and edge detector engines.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Admin as Showroom Manager (Web UI)
+    participant UI as CameraSettingsSection.tsx
+    participant API as FastAPI Backend (:8000)
+    participant File as camera_config.json
+    participant Edge as Edge AI Engine (local_detector.py)
+
+    Admin->>UI: Adds new RTSP Channel "102" (Floor Camera)
+    UI->>API: POST /api/v1/cameras/test-stream {"stream_url": "rtsp://..."}
+    API->>API: Test OpenCV VideoCapture (probe resolution & FPS)
+    API-->>UI: {"online": true, "resolution": [1920, 1080], "fps": 25.0}
+
+    Admin->>UI: Adjusts AI confidence slider to 0.35 & clicks "Save Settings"
+    UI->>API: POST /api/v1/cameras/config {payload}
+    API->>File: Write atomically to camera_config.json
+    API->>API: Synchronize camera records in PostgreSQL
+    API-->>UI: 200 OK {"success": true, "message": "Hot-reloaded"}
+
+    Note over Edge: local_detector.py is actively processing video frames
+    Edge->>File: Check os.path.getmtime(camera_config.json)
+    Edge->>Edge: mtime > last_mtime: Trigger check_and_reload_config()
+    Edge->>Edge: Hot-reload entry lines, exclusion zones & department boxes
+    Note over Edge: New parameters applied instantly with ZERO frame drops!
+```
+
+### 8.1 Stream Pre-Flight Connectivity Verification
+Before saving a camera stream to production, the manager can verify reachability via `/api/v1/cameras/test-stream`. The backend attempts an OpenCV connection, confirms H.264/H.265 decoding, and returns the native resolution ($W \times H$) and FPS.
+
+### 8.2 Zero-Downtime Hot-Reloading
+The edge engine's `check_and_reload_config()` checks the file modification timestamp (`os.path.getmtime`) of `camera_config.json`. When configuration changes occur:
+* Updated department boundaries and entry line coordinates are re-parsed into memory.
+* Toolbar button layouts and zone geometry are recalculated.
+* Active video stream loops continue uninterrupted without needing process termination or restarts.
+
+### 8.3 Profile Archiving on Deletion
+When a camera channel is deleted via `DELETE /api/v1/cameras/channels/{channel_or_id}`:
+* The camera configuration (including custom polygonal exclusion zones, floor filters, and calibrated line coordinates) is copied into `archived_camera_profiles`.
+* The channel is deactivated in the database rather than destroyed, allowing one-click restoration if a camera is reconnected.
+
+---
+
+## 9. Biometric Privacy & 14-Day Rolling Retention
+
+To comply with global data privacy regulations (GDPR and national biometric privacy principles):
 
 ```mermaid
 flowchart TD
     Start["Daily Retention Scheduler (Runs every 24h)"] --> Query["Query person_identities where last_seen_at < NOW() - 14 Days"]
-    Query --> Check{"Found Expired Visitor Identities?"}
+    Check{"Found Expired Visitor Identities?"}
+    Query --> Check
     Check -- No --> Finish["Log: No expired biometric records found"]
     Check -- Yes --> PurgeDB["Set face_embedding = NULL\nSet is_expired = TRUE\nSet expired_at = NOW()"]
     PurgeDB --> PurgeVectors["Purge expired vectors from pgvector / HNSW index"]
-    PurgeVectors --> KeepStats["PRESERVE visitor_tracks & footfall_events\n(Aggregate analytics & counts remain intact!)"]
+    PurgeVectors --> KeepStats["PRESERVE visitor_tracks, footfall_events & visit purpose\n(Aggregate analytics & counts remain intact!)"]
     KeepStats --> ExemptStaff["EXEMPT: Registered employee embeddings remain permanently active"]
     ExemptStaff --> Report["Generate RetentionCleanupReport & Log Summary"]
 ```
 
 * **Visitor Biometric Isolation**: Face embeddings extracted from unidentified visitors are assigned an automatic 14-day rolling expiration window.
 * **Permanent Employee Exemption**: Registered staff embeddings stored in the `employees` table are permanent and exempt from the purge.
-* **Analytics Preservation**: Historical footfall counts, peak-hour distributions, and dwell durations remain fully intact when biometric embeddings are purged.
+* **Analytics Preservation**: Historical footfall counts, peak-hour distributions, visit purpose tags, and dwell durations remain fully intact when biometric embeddings are purged.
 
 ---
 
-## 7. Relational Database Schema (PostgreSQL + pgvector)
+## 10. Relational Database Schema (PostgreSQL + pgvector)
 
 ```mermaid
 erDiagram
@@ -318,6 +493,18 @@ erDiagram
         uuid id PK
         varchar person_id UK
         vector face_embedding "Vector(512) (Nulled on expiry)"
+        varchar avatar_url "Retina 320x320 portrait snapshot"
+        varchar visit_purpose "Vehicle Enquiry / Booking / Test Ride / Service"
+        varchar assigned_salesperson "Staff name"
+        varchar notes "CRM notes & appearance badge"
+        varchar visitor_type "New / Returning"
+        varchar tagging_status "Tagged / Untagged"
+        varchar gender_estimated
+        varchar age_group_estimated
+        varchar zone_entered "Primary showroom department"
+        varchar camera_source "Entrance / Floor camera"
+        varchar exit_time "Departure timestamp (e.g. 04:45 PM)"
+        varchar zone_dwell "JSON-encoded duration breakdown"
         boolean is_expired
         timestamp last_seen_at
         timestamp expired_at
@@ -377,38 +564,46 @@ erDiagram
 
 ---
 
-## 8. Summary: End-to-End Ingress Lifecycle
+## 11. Summary: End-to-End Ingress & Customer Journey Lifecycle
 
 ```
 [ Visitor / Staff steps through Showroom Entrance ]
                         │
                         ▼
-           [ CCTV RTSP TCP Stream ]
+            [ CCTV RTSP TCP Stream ]
                         │
                         ▼
       [ ThreadedRTSPReader (Zero Lag Frame Grab) ]
                         │
                         ▼
-       [ Roboflow RF-DETR / YOLO Person Detection ]
+        [ Roboflow RF-DETR / YOLO Person Detection ]
                         │
                         ▼
-       [ SCRFD / YuNet Face Detection + Quality Gating ]
+        [ SCRFD / YuNet Face Detection + Quality Gating ]
                         │
                         ▼
-    [ ArcFace 512-D L2 Normalized Embedding Extraction ]
+     [ ArcFace 512-D L2 Normalized Embedding Extraction ]
                         │
                         ▼
-  [ Cosine Similarity Matching vs Registered Staff Gallery ]
-       │                                       │
-       │ (Match >= 0.32 + Voting Lock)         │ (Unmatched / Visitor)
-       ▼                                       ▼
+   [ Cosine Similarity Matching vs Registered Staff Gallery ]
+        │                                       │
+        │ (Match >= 0.32 + Voting Lock)         │ (Unmatched / Showroom Customer)
+        ▼                                       ▼
 [ Identified as Employee ]             [ Tracked as Showroom Visitor ]
-       │                                       │
-       ├─► Exclude from footfall counts        ├─► Multi-object tracking (ByteTrack / BoT-SORT)
-       ├─► Log Attendance Punch (CHECK_IN)     ├─► Ground-plane feet reference point calculation
-       └─► Upsert Daily Attendance Roll        ├─► Directional line crossing verification
-                                               ├─► In-memory deduplication lock
-                                               ├─► Non-blocking HTTP POST to /footfall
-                                               ├─► PostgreSQL UNIQUE constraint validation
-                                               └─► Real-Time React 19 Dashboard UI updates
+        │                                       │
+        ├─► Exclude from footfall counts        ├─► Multi-object tracking (ByteTrack / BoT-SORT)
+        ├─► Log Attendance Punch (CHECK_IN)     ├─► Multi-Frame Best-Shot Quality Scoring (Laplacian + Pose)
+        └─► Upsert Daily Attendance Roll        ├─► Expanded Bust Framing (Hair + Collar + Upper Chest)
+                                                ├─► CLAHE Backlight Compensation (Shadow lifting)
+                                                ├─► Torso HSV Attire Extraction (e.g. "Blue / Navy Top")
+                                                ├─► High-DPI Snapshot Dispatch (@ 320x320 Q95)
+                                                ├─► Progressive Upgrade Window (3.5s trajectory)
+                                                ├─► Ingress: Directional entry line crossing verification
+                                                │   └─► Non-blocking HTTP POST to /visitors/detect & /footfall
+                                                ├─► Store Interior: Real-time department dwell accumulation
+                                                │   └─► Periodic HTTP POST to /visitors/update-zone (every 4s)
+                                                ├─► Receptionist UI: 1-click purpose & staff assignment
+                                                │   └─► HTTP PATCH to /visitors/{person_id}/tag
+                                                └─► Egress: Reverse line crossing detection (Exit Door)
+                                                    └─► HTTP POST to /visitors/update-zone (exit_time in IST)
 ```
