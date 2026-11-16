@@ -10,8 +10,8 @@ export const INITIAL_STORE_HOURS: StoreHoursConfig = {
   timezone: 'Asia/Kolkata (IST +5:30)',
   isOpenSunday: true,
   notes: 'Showroom open 7 days a week. Service workshop closes at 7:00 PM on Sundays.',
-  actualFirstEntryToday: '09:34 AM',
-  actualLastExitToday: '02:28 PM', // Updated in real time as visitors leave
+  actualFirstEntryToday: null,
+  actualLastExitToday: null,
 };
 
 export const INITIAL_SHOWROOM_SETTINGS: ShowroomSettings = {

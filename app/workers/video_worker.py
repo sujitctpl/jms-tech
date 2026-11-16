@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 import uuid
@@ -259,27 +260,35 @@ class VideoWorker(threading.Thread):
 
                         person.person_id = identity_manager.get_person_id(person.tracker_id)
                         if person.person_id and face_crop is not None and face_crop.size > 0:
-                            v_path = os.path.join("static", "uploads", "visitors", f"{person.person_id}.jpg")
-                            if not os.path.exists(v_path):
+                            try:
+                                os.makedirs("static/uploads/visitors", exist_ok=True)
+                                # CLAHE contrast lift for backlighting
                                 try:
-                                    os.makedirs("static/uploads/visitors", exist_ok=True)
-                                    # CLAHE contrast lift for backlighting
-                                    try:
-                                        lab = cv2.cvtColor(face_crop, cv2.COLOR_BGR2LAB)
-                                        l, a, b = cv2.split(lab)
-                                        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
-                                        l_eq = clahe.apply(l)
-                                        enhanced_face = cv2.cvtColor(cv2.merge([l_eq, a, b]), cv2.COLOR_LAB2BGR)
-                                    except Exception:
-                                        enhanced_face = face_crop
-                                    portrait_res = cv2.resize(enhanced_face, (320, 320), interpolation=cv2.INTER_LANCZOS4)
-                                    cv2.imwrite(v_path, portrait_res, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                                    rec = identity_repo.get_by_person_id(person.person_id)
-                                    if rec and not rec.avatar_url:
-                                        rec.avatar_url = f"/static/uploads/visitors/{person.person_id}.jpg"
-                                        db.commit()
+                                    lab = cv2.cvtColor(face_crop, cv2.COLOR_BGR2LAB)
+                                    l, a, b = cv2.split(lab)
+                                    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+                                    l_eq = clahe.apply(l)
+                                    enhanced_face = cv2.cvtColor(cv2.merge([l_eq, a, b]), cv2.COLOR_LAB2BGR)
                                 except Exception:
-                                    pass
+                                    enhanced_face = face_crop
+                                portrait_res = cv2.resize(enhanced_face, (320, 320), interpolation=cv2.INTER_LANCZOS4)
+                                now_epoch = int(time.time())
+                                filename = f"{person.person_id}_{now_epoch}.jpg"
+                                v_path = os.path.join("static", "uploads", "visitors", filename)
+                                cv2.imwrite(v_path, portrait_res, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                                rec = identity_repo.get_by_person_id(person.person_id)
+                                if rec:
+                                    if rec.avatar_url:
+                                        old_f = os.path.join(".", rec.avatar_url.lstrip("/").split("?")[0])
+                                        if os.path.isfile(old_f):
+                                            try:
+                                                os.remove(old_f)
+                                            except Exception:
+                                                pass
+                                    rec.avatar_url = f"/static/uploads/visitors/{filename}"
+                                    db.commit()
+                            except Exception:
+                                pass
 
                         vt = track_repo.get_or_create(
                             camera_id=self.camera_id,

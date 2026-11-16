@@ -39,12 +39,14 @@ class PersonIdentityRepository:
         self,
         embedding: np.ndarray,
         similarity_threshold: Optional[float] = None,
+        only_active: bool = False,
     ) -> Tuple[Optional[str], float]:
-        """Queries pgvector with HNSW index for the most similar active visitor face."""
+        """Queries pgvector with HNSW index for the most similar visitor face."""
         return self.vector_manager.find_best_visitor_match(
             embedding=embedding,
             similarity_threshold=similarity_threshold,
             db=self.db,
+            only_active=only_active,
         )
 
     def create_or_update(
@@ -186,6 +188,7 @@ class PersonIdentityRepository:
             self.db.query(PersonIdentity)
             .filter(
                 PersonIdentity.is_expired.is_(False),
+                PersonIdentity.exit_time.is_(None),
                 PersonIdentity.face_embedding.isnot(None),
             )
             .all()

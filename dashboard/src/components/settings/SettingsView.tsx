@@ -345,18 +345,6 @@ export const SettingsView: React.FC = () => {
               </div>
             </div>
 
-            {/* Live Sync Banner */}
-            <div className="mt-6 p-4 rounded-2xl bg-gradient-to-r from-indigo-50/80 to-blue-50/80 border border-indigo-100/90 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
-              <div className="flex items-center gap-2.5">
-                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
-                <span className="text-slate-800 font-semibold font-['Outfit']">
-                  Real-time Edge Sync: <strong className="text-indigo-950 font-bold">camera_config.json & PostgreSQL</strong>
-                </span>
-              </div>
-              <span className="text-slate-500 text-[11px]">
-                Shortcut numbers ([2], [3], etc.) are automatically assigned to CCTV top toolbar
-              </span>
-            </div>
 
             {/* Department List */}
             <div className="mt-6">

@@ -19,6 +19,7 @@ import {
   Camera,
   Sparkles,
   Building2,
+  User,
 } from 'lucide-react';
 import { AddEmployeeModal } from '../modals/AddEmployeeModal';
 import { AddEmployeePhotosModal } from '../modals/AddEmployeePhotosModal';
@@ -462,11 +463,17 @@ export const AttendanceView: React.FC = () => {
                     <td className="py-3 px-4">
                       <div className="flex items-center gap-3">
                         <div className="relative shrink-0">
-                          <img
-                            src={rec.avatarUrl || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=120&auto=format&fit=crop&q=80'}
-                            alt={rec.employeeName}
-                            className="w-9 h-9 rounded-full object-cover border border-slate-200 shadow-2xs"
-                          />
+                          {rec.avatarUrl && !rec.avatarUrl.includes('unsplash.com') ? (
+                            <img
+                              src={rec.avatarUrl}
+                              alt={rec.employeeName}
+                              className="w-9 h-9 rounded-full object-cover border border-slate-200 shadow-2xs"
+                            />
+                          ) : (
+                            <div className="w-9 h-9 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-500 font-bold text-xs shadow-2xs">
+                              {rec.employeeName ? rec.employeeName.charAt(0).toUpperCase() : <User className="w-4 h-4 text-slate-400" />}
+                            </div>
+                          )}
                           <span
                             className={`w-2.5 h-2.5 rounded-full absolute bottom-0 right-0 ring-2 ring-white ${
                               isPresent ? 'bg-emerald-500' : isLate ? 'bg-amber-500' : isOnLeave ? 'bg-blue-500' : 'bg-rose-500'

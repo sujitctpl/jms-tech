@@ -395,7 +395,9 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
                           <span className="text-slate-400 font-normal">Unassigned</span>
                         )}
                       </td>
-                      <td className="py-3 px-3 font-mono font-semibold text-slate-700">{vis.durationMinutes}m</td>
+                      <td className="py-3 px-3 font-mono font-semibold text-slate-700">
+                        {vis.durationMinutes <= 0 ? '< 1m' : `${vis.durationMinutes}m`}
+                      </td>
                       <td className="py-3 px-3 text-slate-600">
                         <span className="font-semibold text-slate-800 block">{vis.zoneEntered || 'Showroom'}</span>
                         {vis.zoneDwell && Object.keys(vis.zoneDwell).length > 0 && (

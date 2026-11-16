@@ -114,9 +114,11 @@ class PgVectorStoreManager:
         embedding: np.ndarray,
         similarity_threshold: Optional[float] = None,
         db: Optional[Session] = None,
+        only_active: bool = False,
     ) -> Tuple[Optional[str], float]:
         """
-        Queries active visitor identities using cosine similarity.
+        Queries active or historical visitor identities within the 14-day retention window using cosine similarity.
+        If only_active=True, restricts search to visitors currently active (exit_time is None).
         Returns (person_id, similarity) if similarity >= threshold, else (None, best_score).
         """
         session = db or self.db
@@ -155,9 +157,11 @@ class PgVectorStoreManager:
                     PersonIdentity.is_expired.is_(False),
                     PersonIdentity.face_embedding.isnot(None),
                 )
-                .order_by(dist_expr.asc())
-                .limit(1)
             )
+            if only_active:
+                query = query.filter(PersonIdentity.exit_time.is_(None))
+
+            query = query.order_by(dist_expr.asc()).limit(1)
 
             row = query.first()
             if not row:
@@ -171,14 +175,17 @@ class PgVectorStoreManager:
             return None, similarity
 
         # 2. SQLite / Non-PostgreSQL In-Memory Fallback (for unit tests)
-        records = (
+        query = (
             session.query(PersonIdentity.person_id, PersonIdentity.face_embedding)
             .filter(
                 PersonIdentity.is_expired.is_(False),
                 PersonIdentity.face_embedding.isnot(None),
             )
-            .all()
         )
+        if only_active:
+            query = query.filter(PersonIdentity.exit_time.is_(None))
+
+        records = query.all()
 
         if not records:
             return None, 0.0

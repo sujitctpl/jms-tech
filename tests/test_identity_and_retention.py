@@ -170,6 +170,7 @@ def test_identity_recovery_when_bytetrack_id_changes():
         similarity_threshold=0.50,
         max_attempts=5,
         cooldown_frames=0,  # 0 cooldown for fast unit test
+        min_confirmation_frames=2,
     )
 
     visitor_face = create_synthetic_face_crop(64, 64, pattern=42)

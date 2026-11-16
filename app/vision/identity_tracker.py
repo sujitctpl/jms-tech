@@ -43,6 +43,7 @@ class IdentityRecoveryManager:
         similarity_threshold: Optional[float] = None,
         max_attempts: Optional[int] = None,
         cooldown_frames: Optional[int] = None,
+        min_confirmation_frames: Optional[int] = None,
         on_matched_callback: Optional[Callable[[str, float], None]] = None,
         on_created_callback: Optional[Callable[[str, np.ndarray, float], None]] = None,
     ):
@@ -67,6 +68,9 @@ class IdentityRecoveryManager:
             cooldown_frames
             if cooldown_frames is not None
             else settings.FACE_RECOGNITION_COOLDOWN_FRAMES
+        )
+        self.min_confirmation_frames = (
+            min_confirmation_frames if min_confirmation_frames is not None else 1
         )
 
         # Callbacks for persistence layer synchronization
@@ -236,8 +240,8 @@ class IdentityRecoveryManager:
                 message=f"Uncertain similarity ({best_score:.3f}); leaving unresolved to prevent false association.",
             )
 
-        # Require at least 1 reliable face observation to create persistent identity immediately for visitor entry
-        if self.track_reliable_frames[tid] < 1:
+        # Require at least min_confirmation_frames reliable face observations before creating persistent identity
+        if self.track_reliable_frames[tid] < self.min_confirmation_frames:
             return IdentityMatchResult(
                 tracker_id=tid,
                 person_id=None,

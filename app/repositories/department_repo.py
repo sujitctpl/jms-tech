@@ -98,6 +98,19 @@ class DepartmentRepository:
         self.db.delete(dept)
         self.db.commit()
         self.sync_to_camera_config()
+
+        # Purge deleted department from in-memory edge telemetry
+        try:
+            from app.services.camera_service import _edge_telemetry
+            for cam_data in _edge_telemetry.values():
+                if isinstance(cam_data, dict):
+                    cam_data.get("section_counts", {}).pop(dept_id, None)
+                    cam_data.get("section_occupancy", {}).pop(dept_id, None)
+                    cam_data.get("section_counts", {}).pop(dept_id.lower(), None)
+                    cam_data.get("section_occupancy", {}).pop(dept_id.lower(), None)
+        except Exception:
+            pass
+
         return True
 
     def sync_to_camera_config(self, config_path: str = "camera_config.json") -> bool:
@@ -127,18 +140,12 @@ class DepartmentRepository:
                     cam_sections = []
                     for d in active_depts:
                         if d.camera_id is None or (cam_id and str(d.camera_id) == str(cam_id)):
-                            # Use DB box, or fallback to existing drawn box in camera_config, or [0, 0, 0, 0]
-                            box_val = d.box
-                            if (not box_val or box_val == [0, 0, 0, 0]) and d.id in existing_boxes:
-                                box_val = existing_boxes[d.id]
-                                # Save preserved box back to DB as well
-                                d.box = box_val
-
+                            box_val = d.box or [0, 0, 0, 0]
                             cam_sections.append({
                                 "id": d.id,
                                 "name": d.name,
                                 "color": hex_to_bgr(d.color),
-                                "box": box_val or [0, 0, 0, 0],
+                                "box": box_val,
                             })
                     cam_data["sections"] = cam_sections
 
@@ -159,9 +166,9 @@ class DepartmentRepository:
         count = self.db.query(Department).count()
         if count == 0:
             defaults = [
-                DepartmentCreate(id="sales", name="Sales Section", color="#00D7FF", box=[0, 242, 423, 618]),
-                DepartmentCreate(id="service", name="Service Section", color="#32E178", box=[430, 242, 850, 618]),
-                DepartmentCreate(id="accounts", name="Accounts Section", color="#FF8C00", box=[860, 242, 1280, 618]),
+                DepartmentCreate(id="sales", name="Sales Section", color="#00D7FF", box=[0, 0, 0, 0]),
+                DepartmentCreate(id="service", name="Service Section", color="#32E178", box=[0, 0, 0, 0]),
+                DepartmentCreate(id="accounts", name="Accounts Section", color="#FF8C00", box=[0, 0, 0, 0]),
             ]
             for d in defaults:
                 dept = Department(
@@ -174,4 +181,4 @@ class DepartmentRepository:
                 self.db.add(dept)
             self.db.commit()
             self.sync_to_camera_config()
-            logger.info("Seeded 3 default departments: Sales, Service, Accounts")
+            logger.info("Seeded 3 default departments: Sales, Service, Accounts (undrawn boxes)")

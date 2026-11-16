@@ -8,13 +8,13 @@ export const PeakHoursView: React.FC = () => {
   const [chartMode, setChartMode] = useState<'comparative' | 'stacked' | 'new_only'>('comparative');
   const [selectedHourIdx, setSelectedHourIdx] = useState<number>(8); // Default to 5:00 - 6:00 PM peak
   const TARGET_HOURLY = [8, 12, 18, 16, 12, 10, 15, 20, 25, 22, 12];
-  const selectedSlot = metrics.hourlyChartData[selectedHourIdx] || metrics.hourlyChartData[8] || {
-    hour: '05:00 - 06:00 PM',
-    visitors: 28,
-    newVisitors: 19,
-    returningVisitors: 9,
-    testRides: 6,
-    deliveries: 2,
+  const selectedSlot = metrics.hourlyChartData[selectedHourIdx] || {
+    hour: '09:00 - 10:00 AM',
+    visitors: 0,
+    newVisitors: 0,
+    returningVisitors: 0,
+    testRides: 0,
+    deliveries: 0,
   };
 
   const maxVal = Math.max(...metrics.hourlyChartData.map((d) => d.visitors), 1);
@@ -29,7 +29,7 @@ export const PeakHoursView: React.FC = () => {
             <h1 className="text-2xl font-bold font-['Outfit'] text-slate-900">Peak Hours & Footfall Analytics</h1>
             <span className="px-2.5 py-0.5 rounded-full text-xs font-bold bg-amber-100 text-amber-800 flex items-center gap-1">
               <Flame className="w-3.5 h-3.5 text-amber-600" />
-              Peak: {metrics.busiestHour}
+              Peak: {metrics.busiestHourCount > 0 ? metrics.busiestHour : 'None yet'}
             </span>
           </div>
           <p className="text-xs text-slate-500 mt-1">
@@ -54,9 +54,11 @@ export const PeakHoursView: React.FC = () => {
               </span>
               <span className="text-xs text-white/90 font-medium">• Verified Arrival Peak</span>
             </div>
-            <h2 className="text-3xl sm:text-4xl font-black font-['Outfit']">{metrics.busiestHour}</h2>
+            <h2 className="text-3xl sm:text-4xl font-black font-['Outfit']">{metrics.busiestHourCount > 0 ? metrics.busiestHour : 'No Peak Window Yet'}</h2>
             <p className="text-xs sm:text-sm text-white/90 mt-1.5 max-w-xl leading-relaxed">
-              During this window, customer footfall surges with working professionals and families seeking bike test rides and loan discussions.
+              {metrics.busiestHourCount > 0
+                ? 'During this window, customer footfall surges with visitors seeking vehicle enquiries, test rides, and discussions.'
+                : "Awaiting today's showroom visitors to establish verified footfall peak."}
             </p>
           </div>
 
@@ -70,7 +72,7 @@ export const PeakHoursView: React.FC = () => {
             <div>
               <span className="text-[11px] font-bold text-white/80 block uppercase tracking-wider">Share of Day</span>
               <span className="text-3xl sm:text-4xl font-black font-['Outfit'] text-white">
-                {totalDayTraffic > 0 ? Math.round((metrics.busiestHourCount / totalDayTraffic) * 100) : 18}%
+                {totalDayTraffic > 0 ? Math.round((metrics.busiestHourCount / totalDayTraffic) * 100) : 0}%
               </span>
               <span className="text-xs text-white/80 block font-medium">traffic concentration</span>
             </div>

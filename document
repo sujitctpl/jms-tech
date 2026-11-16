@@ -1,0 +1,16 @@
+1. Real-time person detection using RF-DETR and YOLO models
+2. Multi-object tracking with ByteTrack and BoT-SORT
+3. Biometric facial recognition using SCRFD or YuNet with ArcFace embeddings
+4. Automated staff versus visitor classification and segregation
+5. Automated employee attendance tracking with check-in, check-out, and daily hours
+6. Multi-photo employee registration and face profile enrollment
+7. Directional virtual entry-line crossing for footfall counting
+8. Visitor departure detection upon reverse entry-line crossing
+9. Exportable footfall, dwell duration, and employee attendance reports
+10. Automatic visitor clothing and appearance color tagging
+11. Visitor dwell time and customer journey tracking across showroom departments
+12. Dynamic department and showroom zone creation and management
+13. Camera role assignment separating entrance counting from floor zone tracking
+14. Web-based RTSP camera setup with pre-flight stream connectivity and resolution testing
+15. Web dashboard for real-time CCTV monitoring, analytics, and visitor logs
+16. Manual visit purpose tagging interface with high-resolution photo viewer

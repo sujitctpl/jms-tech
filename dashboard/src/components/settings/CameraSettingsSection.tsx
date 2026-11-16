@@ -281,11 +281,10 @@ export const CameraSettingsSection: React.FC = () => {
       {/* Toast Alert */}
       {saveToast && (
         <div
-          className={`p-4 rounded-2xl text-xs flex items-center gap-3 border shadow-sm animate-fadeIn ${
-            saveToast.type === 'success'
+          className={`p-4 rounded-2xl text-xs flex items-center gap-3 border shadow-sm animate-fadeIn ${saveToast.type === 'success'
               ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
               : 'bg-rose-50 border-rose-200 text-rose-900'
-          }`}
+            }`}
         >
           {saveToast.type === 'success' ? (
             <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
@@ -343,18 +342,6 @@ export const CameraSettingsSection: React.FC = () => {
           </div>
         </div>
 
-        {/* Real-time Sync Banner */}
-        <div className="p-4 rounded-2xl bg-gradient-to-r from-blue-50/70 via-indigo-50/70 to-slate-50 border border-blue-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
-          <div className="flex items-center gap-2.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
-            <span className="text-slate-800 font-semibold font-['Outfit']">
-              Live Edge Sync Active: <strong className="text-indigo-950 font-bold">camera_config.json & local_detector.py</strong>
-            </span>
-          </div>
-          <span className="text-slate-500 text-[11px]">
-            Saved adjustments take effect within 3 seconds on the Edge Detector without restarting.
-          </span>
-        </div>
 
         {/* Channel Switcher Pills */}
         <div>
@@ -380,11 +367,10 @@ export const CameraSettingsSection: React.FC = () => {
                     setSelectedChannel(ch);
                     setTestResult(null);
                   }}
-                  className={`px-4 py-2.5 rounded-2xl text-xs font-bold transition flex items-center gap-2 cursor-pointer border ${
-                    isSelected
+                  className={`px-4 py-2.5 rounded-2xl text-xs font-bold transition flex items-center gap-2 cursor-pointer border ${isSelected
                       ? 'bg-blue-600 text-white border-blue-600 shadow-md shadow-blue-500/25 scale-[1.02]'
                       : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
-                  }`}
+                    }`}
                 >
                   <Video className="w-3.5 h-3.5 opacity-80" />
                   <span>Channel [{ch}]</span>
@@ -393,9 +379,8 @@ export const CameraSettingsSection: React.FC = () => {
                   </span>
                   {isDefault && (
                     <span
-                      className={`px-1.5 py-0.5 rounded text-[9px] font-extrabold uppercase ${
-                        isSelected ? 'bg-white/20 text-white' : 'bg-blue-100 text-blue-700'
-                      }`}
+                      className={`px-1.5 py-0.5 rounded text-[9px] font-extrabold uppercase ${isSelected ? 'bg-white/20 text-white' : 'bg-blue-100 text-blue-700'
+                        }`}
                     >
                       Default
                     </span>
@@ -436,11 +421,10 @@ export const CameraSettingsSection: React.FC = () => {
                 type="button"
                 onClick={() => handleUpdateGlobal('default_channel', selectedChannel)}
                 disabled={config.default_channel === selectedChannel}
-                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${
-                  config.default_channel === selectedChannel
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${config.default_channel === selectedChannel
                     ? 'bg-emerald-100 text-emerald-800 border border-emerald-200 cursor-default'
                     : 'bg-white hover:bg-slate-100 text-slate-700 border border-slate-200'
-                }`}
+                  }`}
               >
                 {config.default_channel === selectedChannel ? (
                   <>
@@ -548,11 +532,10 @@ export const CameraSettingsSection: React.FC = () => {
             {/* Stream Test Result Display */}
             {testResult && (
               <div
-                className={`mt-3 p-3.5 rounded-2xl text-xs border flex items-start gap-2.5 animate-fadeIn ${
-                  testResult.online
+                className={`mt-3 p-3.5 rounded-2xl text-xs border flex items-start gap-2.5 animate-fadeIn ${testResult.online
                     ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
                     : 'bg-amber-50 border-amber-200 text-amber-900'
-                }`}
+                  }`}
               >
                 {testResult.online ? (
                   <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
@@ -789,7 +772,7 @@ export const CameraSettingsSection: React.FC = () => {
                   AI Person Detection Model
                 </h3>
                 <p className="text-xs text-slate-500">
-                  Select the neural network checkpoint and vision resolution for edge visitor tracking
+                  Restart, after switching the model
                 </p>
               </div>
             </div>
@@ -808,11 +791,10 @@ export const CameraSettingsSection: React.FC = () => {
                 handleUpdateGlobal('model', 'models/yolo26s.pt');
                 handleUpdateGlobal('imgsz', 1024);
               }}
-              className={`p-4 rounded-2xl border-2 transition cursor-pointer flex flex-col justify-between gap-3 ${
-                (config.model || 'models/yolo26s.pt') === 'models/yolo26s.pt'
+              className={`p-4 rounded-2xl border-2 transition cursor-pointer flex flex-col justify-between gap-3 ${(config.model || 'models/yolo26s.pt') === 'models/yolo26s.pt'
                   ? 'bg-blue-50/60 border-blue-600 shadow-xs'
                   : 'bg-white border-slate-200 hover:border-slate-300'
-              }`}
+                }`}
             >
               <div className="flex items-start justify-between">
                 <div>
@@ -829,11 +811,10 @@ export const CameraSettingsSection: React.FC = () => {
                   </p>
                 </div>
                 <div
-                  className={`w-5 h-5 rounded-full border-2 flex items-center justify-center shrink-0 mt-0.5 ${
-                    (config.model || 'models/yolo26s.pt') === 'models/yolo26s.pt'
+                  className={`w-5 h-5 rounded-full border-2 flex items-center justify-center shrink-0 mt-0.5 ${(config.model || 'models/yolo26s.pt') === 'models/yolo26s.pt'
                       ? 'border-blue-600 bg-blue-600'
                       : 'border-slate-300'
-                  }`}
+                    }`}
                 >
                   {(config.model || 'models/yolo26s.pt') === 'models/yolo26s.pt' && (
                     <span className="w-2 h-2 rounded-full bg-white" />
@@ -853,11 +834,10 @@ export const CameraSettingsSection: React.FC = () => {
                 handleUpdateGlobal('model', 'models/yolo26m.pt');
                 handleUpdateGlobal('imgsz', 1280);
               }}
-              className={`p-4 rounded-2xl border-2 transition cursor-pointer flex flex-col justify-between gap-3 ${
-                config.model === 'models/yolo26m.pt'
+              className={`p-4 rounded-2xl border-2 transition cursor-pointer flex flex-col justify-between gap-3 ${config.model === 'models/yolo26m.pt'
                   ? 'bg-indigo-50/60 border-indigo-600 shadow-xs'
                   : 'bg-white border-slate-200 hover:border-slate-300'
-              }`}
+                }`}
             >
               <div className="flex items-start justify-between">
                 <div>
@@ -874,11 +854,10 @@ export const CameraSettingsSection: React.FC = () => {
                   </p>
                 </div>
                 <div
-                  className={`w-5 h-5 rounded-full border-2 flex items-center justify-center shrink-0 mt-0.5 ${
-                    config.model === 'models/yolo26m.pt'
+                  className={`w-5 h-5 rounded-full border-2 flex items-center justify-center shrink-0 mt-0.5 ${config.model === 'models/yolo26m.pt'
                       ? 'border-indigo-600 bg-indigo-600'
                       : 'border-slate-300'
-                  }`}
+                    }`}
                 >
                   {config.model === 'models/yolo26m.pt' && (
                     <span className="w-2 h-2 rounded-full bg-white" />
@@ -898,7 +877,7 @@ export const CameraSettingsSection: React.FC = () => {
         <div className="pt-4 border-t border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="text-xs text-slate-500 flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-emerald-500" />
-            <span>Changes save directly to <strong>camera_config.json</strong> & database and take effect automatically.</span>
+            <span>Changes save directly and take effect automatically across all showroom cameras.</span>
           </div>
 
           <button

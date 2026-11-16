@@ -120,7 +120,7 @@ class EmployeeAttendanceRepository:
                     employee_id=emp_obj.id,
                     date=today,
                     first_check_in=now,
-                    last_check_out=now,
+                    last_check_out=None,
                     total_work_hours=0.0,
                     is_late=is_late,
                     late_minutes=round(late_mins, 1),
@@ -130,7 +130,7 @@ class EmployeeAttendanceRepository:
                 )
             else:
                 daily.first_check_in = now
-                daily.last_check_out = now
+                daily.last_check_out = None
                 daily.is_late = is_late
                 daily.late_minutes = round(late_mins, 1)
                 daily.is_early_departure = False
@@ -146,10 +146,9 @@ class EmployeeAttendanceRepository:
                 status,
             )
         else:
-            # Subsequent sighting -> update last_check_out and calculate work duration
+            # Subsequent sighting -> update work duration and only check-out if explicitly CHECK_OUT
             first_in = ensure_tz_aware(daily.first_check_in)
             if first_in and now >= first_in:
-                daily.last_check_out = now
                 work_seconds = (now - first_in).total_seconds()
                 daily.total_work_hours = round(max(0.0, work_seconds / 3600.0), 2)
 
@@ -162,6 +161,9 @@ class EmployeeAttendanceRepository:
                 else:
                     daily.is_early_departure = False
                     daily.early_departure_minutes = 0.0
+
+                if event_type == "CHECK_OUT":
+                    daily.last_check_out = now
 
                 # Evaluate overall status
                 if daily.total_work_hours >= 7.0:

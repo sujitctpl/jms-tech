@@ -70,6 +70,7 @@ interface ShowroomContextType {
     newVisitorPct: number;
     returningVisitorPct: number;
     comparisonYesterdayPct: number;
+    yesterdayVisitors: number;
     employeesTotal: number;
     employeesPresent: number;
     employeesAbsent: number;
@@ -125,9 +126,16 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     if (!saved) return [];
     try {
       const parsed: VisitorRecord[] = JSON.parse(saved);
-      // Auto-purge any records containing stock Unsplash photos
-      const hasUnsplash = parsed.some((v) => v.avatarUrl && v.avatarUrl.includes('unsplash.com'));
-      if (hasUnsplash || parsed.some((v) => v.id.startsWith('vis-10') || v.id.startsWith('vis-11'))) {
+      const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
+      // Auto-purge any stale records from previous days, stock Unsplash photos, or mock test IDs
+      const hasStaleOrMock = parsed.some(
+        (v) =>
+          (v.avatarUrl && v.avatarUrl.includes('unsplash.com')) ||
+          (v.date && v.date !== todayStr) ||
+          v.id.startsWith('vis-10') ||
+          v.id.startsWith('vis-11')
+      );
+      if (hasStaleOrMock) {
         localStorage.removeItem('capermint_visitors');
         localStorage.removeItem('jms_visitors');
         return [];
@@ -201,24 +209,31 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           const data = await res.json();
           if (isMounted && data.records && Array.isArray(data.records)) {
             const todayStr = new Date().toISOString().split('T')[0];
-            const mapped: AttendanceRecord[] = data.records.map((r: any, idx: number) => ({
-              id: `att-${r.employee_id}-${r.date || todayStr}-${idx}`,
-              employeeId: r.employee_id,
-              employeeName: r.name,
-              role: r.designation,
-              department: r.department,
-              avatarUrl: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=120&auto=format&fit=crop&q=80',
-              date: r.date || todayStr,
-              checkInTime: r.first_check_in
-                ? new Date(r.first_check_in).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })
-                : null,
-              checkOutTime: r.last_check_out
-                ? new Date(r.last_check_out).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })
-                : null,
-              status: r.status === 'PRESENT' ? 'Present' : r.status === 'LATE' ? 'Late' : r.status === 'HALF_DAY' ? 'Present' : 'Absent',
-              workHours: r.total_work_hours || 0,
-              method: 'CCTV AI Check-in',
-            }));
+            const mapped: AttendanceRecord[] = data.records.map((r: any, idx: number) => {
+              // Employee has checked out only if last_check_out exists and is distinct from first_check_in
+              const isSameAsCheckIn = r.first_check_in && r.last_check_out &&
+                Math.abs(new Date(r.last_check_out).getTime() - new Date(r.first_check_in).getTime()) < 120000;
+              const hasCheckedOut = Boolean(r.last_check_out && !isSameAsCheckIn);
+
+              return {
+                id: `att-${r.employee_id}-${r.date || todayStr}-${idx}`,
+                employeeId: r.employee_id,
+                employeeName: r.name,
+                role: r.designation,
+                department: r.department,
+                avatarUrl: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=120&auto=format&fit=crop&q=80',
+                date: r.date || todayStr,
+                checkInTime: r.first_check_in
+                  ? new Date(r.first_check_in).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })
+                  : null,
+                checkOutTime: hasCheckedOut
+                  ? new Date(r.last_check_out).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })
+                  : null,
+                status: r.status === 'PRESENT' ? 'Present' : r.status === 'LATE' ? 'Late' : r.status === 'HALF_DAY' ? 'Present' : 'Absent',
+                workHours: r.total_work_hours || 0,
+                method: 'CCTV AI Check-in',
+              };
+            });
             setAttendance(mapped);
           }
         }
@@ -239,7 +254,15 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   const [storeHours, setStoreHours] = useState<StoreHoursConfig>(() => {
     const saved = localStorage.getItem('capermint_store_hours') || localStorage.getItem('jms_store_hours');
-    return saved ? JSON.parse(saved) : INITIAL_STORE_HOURS;
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (parsed.actualFirstEntryToday === '09:34 AM') parsed.actualFirstEntryToday = null;
+        if (parsed.actualLastExitToday === '02:28 PM') parsed.actualLastExitToday = null;
+        return parsed;
+      } catch {}
+    }
+    return INITIAL_STORE_HOURS;
   });
 
   const [showroomSettings, setShowroomSettings] = useState<ShowroomSettings>(() => {
@@ -297,6 +320,31 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       console.warn('LocalStorage save failed for store hours:', e);
     }
   }, [storeHours]);
+
+  // Synchronize actual first entry and last exit based on genuine visitor entries for today
+  useEffect(() => {
+    const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
+    const todayVis = visitors.filter((v) => !v.date || v.date === todayStr);
+    if (todayVis.length === 0) {
+      setStoreHours((prev) => {
+        if (prev.actualFirstEntryToday || prev.actualLastExitToday) {
+          return { ...prev, actualFirstEntryToday: null, actualLastExitToday: null };
+        }
+        return prev;
+      });
+    } else {
+      const sortedByTime = [...todayVis].filter((v) => v.firstSeenTime);
+      const firstEntry = sortedByTime.length > 0 ? sortedByTime[sortedByTime.length - 1].firstSeenTime : null;
+      const exited = todayVis.filter((v) => v.exitTime);
+      const lastExit = exited.length > 0 ? exited[0].exitTime : null;
+      setStoreHours((prev) => {
+        if (prev.actualFirstEntryToday !== firstEntry || prev.actualLastExitToday !== lastExit) {
+          return { ...prev, actualFirstEntryToday: firstEntry, actualLastExitToday: lastExit };
+        }
+        return prev;
+      });
+    }
+  }, [visitors]);
 
   useEffect(() => {
     try {
@@ -388,6 +436,15 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       console.warn('Failed to clear visitors on backend:', e);
     }
     setVisitors([]);
+    setStoreHours((prev) => ({
+      ...prev,
+      actualFirstEntryToday: null,
+      actualLastExitToday: null,
+    }));
+    setSectionCounts({ sales: 0, accounts: 0 });
+    setSectionOccupancy({ sales: 0, accounts: 0 });
+    setStaffDepartmentDwell({});
+    setLastSyncedFootfall(0);
     localStorage.removeItem('capermint_visitors');
     localStorage.removeItem('jms_visitors');
   };
@@ -664,6 +721,25 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       const data = await cameraService.listDepartments();
       if (data && Array.isArray(data)) {
         setDepartments(data);
+        const validIds = new Set(data.filter((d) => d.is_active !== false).map((d) => d.id.toLowerCase()));
+        setSectionCounts((prev) => {
+          const next: Record<string, number> = {};
+          for (const [k, v] of Object.entries(prev)) {
+            if (validIds.has(k.toLowerCase())) {
+              next[k] = v;
+            }
+          }
+          return next as any;
+        });
+        setSectionOccupancy((prev) => {
+          const next: Record<string, number> = {};
+          for (const [k, v] of Object.entries(prev)) {
+            if (validIds.has(k.toLowerCase())) {
+              next[k] = v;
+            }
+          }
+          return next as any;
+        });
       }
     } catch (e) {
       console.warn('[ShowroomContext] Failed to load departments:', e);
@@ -687,11 +763,31 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         const data = await cameraService.getFootfall();
         if (!isMounted || !data) return;
 
+        const activeIds = new Set(departments.filter((d) => d.is_active !== false).map((d) => d.id.toLowerCase()));
+
         if (data.section_counts) {
-          setSectionCounts((prev) => ({ ...prev, ...data.section_counts }));
+          setSectionCounts((prev) => {
+            const next: Record<string, number> = {};
+            const source = { ...prev, ...data.section_counts };
+            for (const [k, v] of Object.entries(source)) {
+              if (activeIds.size === 0 || activeIds.has(k.toLowerCase())) {
+                next[k] = v;
+              }
+            }
+            return next as any;
+          });
         }
         if (data.section_occupancy) {
-          setSectionOccupancy((prev) => ({ ...prev, ...data.section_occupancy }));
+          setSectionOccupancy((prev) => {
+            const next: Record<string, number> = {};
+            const source = { ...prev, ...data.section_occupancy };
+            for (const [k, v] of Object.entries(source)) {
+              if (activeIds.size === 0 || activeIds.has(k.toLowerCase())) {
+                next[k] = v;
+              }
+            }
+            return next as any;
+          });
         }
         if (data.staff_dwell) {
           setStaffDepartmentDwell(data.staff_dwell);
@@ -727,18 +823,32 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   // Dynamic analytics calculations
   const metrics = useMemo(() => {
+    // Current IST date strings
+    const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
+    const yesterdayObj = new Date();
+    yesterdayObj.setDate(yesterdayObj.getDate() - 1);
+    const yesterdayStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(yesterdayObj);
+
+    // Active visitors filtered by active dateFilter
+    let activeVisitors = visitors;
+    if (dateFilter === 'today') {
+      activeVisitors = visitors.filter((v) => !v.date || v.date === todayStr);
+    } else if (dateFilter === 'yesterday') {
+      activeVisitors = visitors.filter((v) => v.date === yesterdayStr);
+    }
+
     // Total visitors
-    const totalVisitors = visitors.length;
-    const newVisitors = visitors.filter((v) => v.visitorType === 'New').length;
-    const returningVisitors = visitors.filter((v) => v.visitorType === 'Returning').length;
+    const totalVisitors = activeVisitors.length;
+    const newVisitors = activeVisitors.filter((v) => v.visitorType === 'New').length;
+    const returningVisitors = activeVisitors.filter((v) => v.visitorType === 'Returning').length;
     const newVisitorPct = totalVisitors > 0 ? Math.round((newVisitors / totalVisitors) * 100) : 0;
     const returningVisitorPct = totalVisitors > 0 ? Math.round((returningVisitors / totalVisitors) * 100) : 0;
 
-    // Comparison with yesterday (safely guarded against division by zero/NaN)
-    const yTotal = YESTERDAY_METRICS.totalVisitors;
+    // Real yesterday count & comparison
+    const yesterdayVisitors = visitors.filter((v) => v.date === yesterdayStr).length;
     let comparisonYesterdayPct = 0;
-    if (yTotal > 0) {
-      comparisonYesterdayPct = Math.round(((totalVisitors - yTotal) / yTotal) * 100);
+    if (yesterdayVisitors > 0) {
+      comparisonYesterdayPct = Math.round(((totalVisitors - yesterdayVisitors) / yesterdayVisitors) * 100);
     } else if (totalVisitors > 0) {
       comparisonYesterdayPct = 100;
     } else {
@@ -753,46 +863,88 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     const employeesOnLeave = attendance.filter((a) => a.status === 'On Leave').length;
     const employeesOnDuty = attendance.filter((a) => a.status === 'Present' || a.status === 'Late').length;
 
-    // Peak hours calculation
-    const hourlyMap: Record<string, number> = {};
-    TODAY_HOURLY_FOOTFALL.forEach((slot) => {
-      hourlyMap[slot.hour] = slot.visitors;
+    // Real-time hourly footfall distribution across 11 contiguous bins [09:00 - 20:00]
+    const BASE_HOURLY_SLOTS = [
+      { hour: '09:00 - 10:00 AM', startH: 9, endH: 10 },
+      { hour: '10:00 - 11:00 AM', startH: 10, endH: 11 },
+      { hour: '11:00 - 12:00 PM', startH: 11, endH: 12 },
+      { hour: '12:00 - 01:00 PM', startH: 12, endH: 13 },
+      { hour: '01:00 - 02:00 PM', startH: 13, endH: 14 },
+      { hour: '02:00 - 03:00 PM', startH: 14, endH: 15 },
+      { hour: '03:00 - 04:00 PM', startH: 15, endH: 16 },
+      { hour: '04:00 - 05:00 PM', startH: 16, endH: 17 },
+      { hour: '05:00 - 06:00 PM', startH: 17, endH: 18 },
+      { hour: '06:00 - 07:00 PM', startH: 18, endH: 19 },
+      { hour: '07:00 - 08:00 PM', startH: 19, endH: 20 },
+    ];
+
+    const hourlyChartData: HourlyFootfall[] = BASE_HOURLY_SLOTS.map((s) => ({
+      hour: s.hour,
+      visitors: 0,
+      newVisitors: 0,
+      returningVisitors: 0,
+      testRides: 0,
+      deliveries: 0,
+    }));
+
+    activeVisitors.forEach((v) => {
+      if (!v.firstSeenTime) return;
+      let hour24 = -1;
+      const match = v.firstSeenTime.match(/(\d+):(\d+)\s*(AM|PM)?/i);
+      if (match) {
+        let h = parseInt(match[1], 10);
+        const ampm = match[3]?.toUpperCase();
+        if (ampm === 'PM' && h < 12) h += 12;
+        if (ampm === 'AM' && h === 12) h = 0;
+        hour24 = h;
+      }
+      if (hour24 >= 0) {
+        const slotIdx = BASE_HOURLY_SLOTS.findIndex((s) => hour24 >= s.startH && hour24 < s.endH);
+        const targetIdx = slotIdx !== -1 ? slotIdx : (hour24 < 9 ? 0 : BASE_HOURLY_SLOTS.length - 1);
+        hourlyChartData[targetIdx].visitors += 1;
+        if (v.visitorType === 'Returning') {
+          hourlyChartData[targetIdx].returningVisitors += 1;
+        } else {
+          hourlyChartData[targetIdx].newVisitors += 1;
+        }
+        if (v.visitPurpose === 'Test Ride') {
+          hourlyChartData[targetIdx].testRides += 1;
+        } else if (v.visitPurpose === 'Vehicle Delivery') {
+          hourlyChartData[targetIdx].deliveries += 1;
+        }
+      }
     });
 
-    let busiestHour = TODAY_HOURLY_FOOTFALL[8].hour; // default "05:00 - 06:00 PM"
-    let busiestHourCount = TODAY_HOURLY_FOOTFALL[8].visitors;
+    let busiestHour = 'N/A';
+    let busiestHourCount = 0;
 
-    TODAY_HOURLY_FOOTFALL.forEach((slot) => {
+    hourlyChartData.forEach((slot) => {
       if (slot.visitors > busiestHourCount) {
         busiestHour = slot.hour;
         busiestHourCount = slot.visitors;
       }
     });
 
-    // Morning, Afternoon, Evening breakdown
-    // Morning: 9 AM - 1 PM (slots 0, 1, 2, 3)
-    const morningTraffic = TODAY_HOURLY_FOOTFALL.slice(0, 4).reduce((sum, s) => sum + s.visitors, 0);
-    // Afternoon: 1 PM - 5 PM (slots 4, 5, 6, 7)
-    const afternoonTraffic = TODAY_HOURLY_FOOTFALL.slice(4, 8).reduce((sum, s) => sum + s.visitors, 0);
-    // Evening: 5 PM - 8 PM (slots 8, 9, 10)
-    const eveningTraffic = TODAY_HOURLY_FOOTFALL.slice(8, 11).reduce((sum, s) => sum + s.visitors, 0);
+    const morningTraffic = hourlyChartData.slice(0, 4).reduce((sum, s) => sum + s.visitors, 0);
+    const afternoonTraffic = hourlyChartData.slice(4, 8).reduce((sum, s) => sum + s.visitors, 0);
+    const eveningTraffic = hourlyChartData.slice(8, 11).reduce((sum, s) => sum + s.visitors, 0);
 
     // Duration calculation for completed visits
-    const finishedVisits = visitors.filter((v) => v.exitTime !== null && v.durationMinutes > 0);
+    const finishedVisits = activeVisitors.filter((v) => v.exitTime !== null && v.durationMinutes > 0);
     const durations = finishedVisits.map((v) => v.durationMinutes).sort((a, b) => a - b);
 
     const avgDurationMinutes =
-      durations.length > 0 ? Math.round(durations.reduce((sum, d) => sum + d, 0) / durations.length) : 26;
+      durations.length > 0 ? Math.round(durations.reduce((sum, d) => sum + d, 0) / durations.length) : 0;
 
-    let medianDurationMinutes = 22;
+    let medianDurationMinutes = 0;
     if (durations.length > 0) {
       const mid = Math.floor(durations.length / 2);
       medianDurationMinutes =
         durations.length % 2 !== 0 ? durations[mid] : Math.round((durations[mid - 1] + durations[mid]) / 2);
     }
 
-    const shortestDurationMinutes = durations.length > 0 ? durations[0] : 8;
-    const longestDurationMinutes = durations.length > 0 ? durations[durations.length - 1] : 74;
+    const shortestDurationMinutes = durations.length > 0 ? durations[0] : 0;
+    const longestDurationMinutes = durations.length > 0 ? durations[durations.length - 1] : 0;
 
     // Duration distribution buckets
     const bucketCounts = {
@@ -811,43 +963,43 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       else bucketCounts['60+ mins']++;
     });
 
-    const totalFinished = Math.max(finishedVisits.length, 1);
+    const totalFinished = finishedVisits.length;
     const durationDistribution: DurationDistribution[] = [
       {
         range: '< 10 mins (Quick inquiry)',
         count: bucketCounts['< 10 mins'],
-        percentage: Math.round((bucketCounts['< 10 mins'] / totalFinished) * 100),
-        avgConversion: 12,
+        percentage: totalFinished > 0 ? Math.round((bucketCounts['< 10 mins'] / totalFinished) * 100) : 0,
+        avgConversion: 0,
       },
       {
         range: '10 - 20 mins (Product look)',
         count: bucketCounts['10 - 20 mins'],
-        percentage: Math.round((bucketCounts['10 - 20 mins'] / totalFinished) * 100),
-        avgConversion: 28,
+        percentage: totalFinished > 0 ? Math.round((bucketCounts['10 - 20 mins'] / totalFinished) * 100) : 0,
+        avgConversion: 0,
       },
       {
         range: '20 - 40 mins (Discussion/Demo)',
         count: bucketCounts['20 - 40 mins'],
-        percentage: Math.round((bucketCounts['20 - 40 mins'] / totalFinished) * 100),
-        avgConversion: 54,
+        percentage: totalFinished > 0 ? Math.round((bucketCounts['20 - 40 mins'] / totalFinished) * 100) : 0,
+        avgConversion: 0,
       },
       {
         range: '40 - 60 mins (Test ride/Finance)',
         count: bucketCounts['40 - 60 mins'],
-        percentage: Math.round((bucketCounts['40 - 60 mins'] / totalFinished) * 100),
-        avgConversion: 78,
+        percentage: totalFinished > 0 ? Math.round((bucketCounts['40 - 60 mins'] / totalFinished) * 100) : 0,
+        avgConversion: 0,
       },
       {
         range: '60+ mins (Booking/Delivery)',
         count: bucketCounts['60+ mins'],
-        percentage: Math.round((bucketCounts['60+ mins'] / totalFinished) * 100),
-        avgConversion: 92,
+        percentage: totalFinished > 0 ? Math.round((bucketCounts['60+ mins'] / totalFinished) * 100) : 0,
+        avgConversion: 0,
       },
     ];
 
     // Visit purpose distribution
-    const taggedVisits = visitors.filter((v) => v.visitPurpose !== null);
-    const untaggedCount = visitors.filter((v) => !v.visitPurpose).length;
+    const taggedVisits = activeVisitors.filter((v) => v.visitPurpose !== null);
+    const untaggedCount = activeVisitors.filter((v) => !v.visitPurpose).length;
     const taggedCount = taggedVisits.length;
 
     const purposeCounts: Record<VisitPurpose, number> = {
@@ -884,6 +1036,7 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       newVisitorPct,
       returningVisitorPct,
       comparisonYesterdayPct,
+      yesterdayVisitors,
       employeesTotal,
       employeesPresent,
       employeesAbsent,
@@ -901,13 +1054,13 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       longestDurationMinutes,
       untaggedCount,
       taggedCount,
-      hourlyChartData: TODAY_HOURLY_FOOTFALL,
+      hourlyChartData,
       durationDistribution,
       purposeDistribution,
       sectionCounts,
       sectionOccupancy,
     };
-  }, [visitors, attendance, sectionCounts, sectionOccupancy]);
+  }, [visitors, attendance, sectionCounts, sectionOccupancy, dateFilter]);
 
   // Export functions
   const exportVisitorsCSV = () => {

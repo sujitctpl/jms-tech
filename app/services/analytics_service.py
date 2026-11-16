@@ -35,14 +35,21 @@ class AnalyticsService:
         )
 
         from app.services.camera_service import _edge_telemetry
+        from app.repositories.department_repo import DepartmentRepository
+
+        active_depts = DepartmentRepository(self.db).list_departments(only_active=True)
+        active_dept_keys = {d.id.lower() for d in active_depts} if active_depts else None
+
         sec_counts: dict = {}
         sec_occupancy: dict = {}
         staff_dwell: dict = {}
         for cam_telemetry in _edge_telemetry.values():
             for sec_name, count in cam_telemetry.get("section_counts", {}).items():
-                sec_counts[sec_name] = sec_counts.get(sec_name, 0) + count
+                if active_dept_keys is None or sec_name.lower() in active_dept_keys:
+                    sec_counts[sec_name] = sec_counts.get(sec_name, 0) + count
             for sec_name, occ in cam_telemetry.get("section_occupancy", {}).items():
-                sec_occupancy[sec_name] = sec_occupancy.get(sec_name, 0) + occ
+                if active_dept_keys is None or sec_name.lower() in active_dept_keys:
+                    sec_occupancy[sec_name] = sec_occupancy.get(sec_name, 0) + occ
             for emp_id, dwell_data in cam_telemetry.get("staff_dwell", {}).items():
                 staff_dwell[emp_id] = dwell_data
 

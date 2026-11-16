@@ -26,6 +26,7 @@ import {
   LineChart,
   ShieldCheck,
   PlusCircle,
+  User,
 } from 'lucide-react';
 import { ActiveTab } from '../layout/Sidebar';
 import { VisitorRecord } from '../../types';
@@ -246,7 +247,11 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             </div>
             <div className="mt-3 flex items-center text-xs text-emerald-700 font-bold gap-1 bg-emerald-50 px-2 py-0.5 rounded-lg border border-emerald-200/60 w-fit">
               <ArrowUpRight className="w-3.5 h-3.5" />
-              <span>+{isNaN(metrics.comparisonYesterdayPct) ? 0 : Math.abs(metrics.comparisonYesterdayPct)}% vs yesterday</span>
+              <span>
+                {metrics.totalVisitors > 0
+                  ? `${metrics.comparisonYesterdayPct >= 0 ? `+${metrics.comparisonYesterdayPct}%` : `${metrics.comparisonYesterdayPct}%`} vs yesterday`
+                  : '0% vs yesterday'}
+              </span>
             </div>
           </div>
 
@@ -298,11 +303,15 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             </div>
             <div className="flex items-baseline gap-2">
               <span className="text-3xl sm:text-4xl font-extrabold text-slate-900 font-['Outfit'] tracking-tight">
-                {isNaN(metrics.comparisonYesterdayPct) ? '+0%' : (metrics.comparisonYesterdayPct >= 0 ? `+${metrics.comparisonYesterdayPct}%` : `${metrics.comparisonYesterdayPct}%`)}
+                {metrics.totalVisitors > 0
+                  ? (metrics.comparisonYesterdayPct >= 0 ? `+${metrics.comparisonYesterdayPct}%` : `${metrics.comparisonYesterdayPct}%`)
+                  : '0%'}
               </span>
-              <span className="text-xs font-semibold text-slate-600">(0 y&apos;day)</span>
+              <span className="text-xs font-semibold text-slate-600">({metrics.yesterdayVisitors ?? 0} y&apos;day)</span>
             </div>
-            <p className="text-[11px] text-slate-600 font-medium mt-3">Steady day-over-day showroom growth</p>
+            <p className="text-[11px] text-slate-600 font-medium mt-3">
+              {metrics.totalVisitors === 0 ? "Awaiting today's showroom footfall" : "Steady day-over-day showroom growth"}
+            </p>
           </div>
         </div>
 
@@ -347,16 +356,11 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
               const activeConfiguredDepts = (departments || []).filter((d) => d.is_active !== false);
               const activeDeptIds = activeConfiguredDepts.map((d) => d.id);
 
-              // 2. Base fallback if departments not loaded yet
-              const baseKeys = activeDeptIds.length > 0 ? activeDeptIds : ['ai_department', 'bde', 'marketing'];
-
-              // 3. Merge active configured department IDs + any sections that have telemetry counts
-              const displaySectionKeys = Array.from(
-                new Set([
-                  ...baseKeys,
-                  ...allTelemetryKeys,
-                ])
-              );
+              // 2. Strictly display active configured departments from Settings & Cameras.
+              // Fallback to telemetry keys only if departments are still loading.
+              const displaySectionKeys = activeDeptIds.length > 0
+                ? activeDeptIds
+                : (allTelemetryKeys.length > 0 ? allTelemetryKeys : ['sales', 'accounts']);
 
               const getSectionTheme = (index: number) => {
                 const themes = [
@@ -518,7 +522,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             const totalObs = metrics.hourlyChartData.reduce((acc, d) => acc + d.visitors, 0);
             const meanVal = (totalObs / (metrics.hourlyChartData.length || 1)).toFixed(1);
             const sortedVals = [...metrics.hourlyChartData.map((d) => d.visitors)].sort((a, b) => a - b);
-            const medianVal = sortedVals[Math.floor(sortedVals.length / 2)] || 13;
+            const medianVal = sortedVals.length > 0 ? (sortedVals[Math.floor(sortedVals.length / 2)] || 0) : 0;
             const variance =
               metrics.hourlyChartData.reduce((acc, d) => acc + Math.pow(d.visitors - Number(meanVal), 2), 0) /
               (metrics.hourlyChartData.length || 1);
@@ -546,7 +550,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                   <span className="text-[10px] font-bold uppercase text-slate-600 block">Peak Mode Window</span>
                   <span className="font-extrabold text-red-600 text-sm font-['Outfit'] flex items-center gap-1">
                     <Flame className="w-3.5 h-3.5 text-red-500 animate-pulse" />
-                    17:00 - 18:00 (f=28)
+                    {metrics.busiestHourCount > 0 ? `${metrics.busiestHour} (f=${metrics.busiestHourCount})` : 'None yet'}
                   </span>
                 </div>
               </div>
@@ -731,7 +735,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 </span>
                 <span className="flex items-center gap-1.5 font-semibold text-red-600">
                   <span className="w-3 h-3 rounded-xs bg-gradient-to-t from-red-600 to-amber-400 inline-block shadow-2xs" />
-                  Peak Frequency Bin (17:00 - 18:00)
+                  Peak Frequency Bin ({metrics.busiestHourCount > 0 ? metrics.busiestHour : 'None'})
                 </span>
               </div>
               <span className="text-[11px] text-slate-500 font-mono">
@@ -816,11 +820,17 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                         <td className="py-3 px-3.5">
                           <div className="flex items-center gap-2.5">
                             <div className="relative shrink-0">
-                              <img
-                                src={att.avatarUrl || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=120&auto=format&fit=crop&q=80'}
-                                alt={att.employeeName}
-                                className="w-8 h-8 rounded-full object-cover border border-slate-200 shadow-2xs"
-                              />
+                              {att.avatarUrl && !att.avatarUrl.includes('unsplash.com') ? (
+                                <img
+                                  src={att.avatarUrl}
+                                  alt={att.employeeName}
+                                  className="w-8 h-8 rounded-full object-cover border border-slate-200 shadow-2xs"
+                                />
+                              ) : (
+                                <div className="w-8 h-8 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-500 font-bold text-xs shadow-2xs">
+                                  {att.employeeName ? att.employeeName.charAt(0).toUpperCase() : <User className="w-3.5 h-3.5 text-slate-400" />}
+                                </div>
+                              )}
                               <span
                                 className={`w-2 h-2 rounded-full absolute bottom-0 right-0 ring-1 ring-white ${
                                   isPresent ? 'bg-emerald-500' : isLate ? 'bg-amber-500' : 'bg-rose-500'
@@ -921,8 +931,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
               </div>
               <div className="flex items-baseline justify-between mt-3">
                 <div>
-                  <h3 className="text-2xl font-black font-['Outfit']">{metrics.busiestHour}</h3>
-                  <p className="text-xs text-white/90 mt-0.5">Evening commuter & test ride peak</p>
+                  <h3 className="text-2xl font-black font-['Outfit']">{metrics.busiestHourCount > 0 ? metrics.busiestHour : '—'}</h3>
+                  <p className="text-xs text-white/90 mt-0.5">{metrics.busiestHourCount > 0 ? 'Peak customer arrival window' : 'No visitor footfall recorded today'}</p>
                 </div>
                 <div className="text-right">
                   <span className="text-3xl sm:text-4xl font-black font-['Outfit']">{metrics.busiestHourCount}</span>
@@ -932,56 +942,59 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             </div>
 
             {/* Day-Part Distribution */}
-            <div className="space-y-3">
-              <p className="text-xs font-bold uppercase tracking-wider text-slate-600">
-                Day-Part Footfall Distribution
-              </p>
+            {(() => {
+              const totalTraffic = metrics.morningTraffic + metrics.afternoonTraffic + metrics.eveningTraffic;
+              const morningPct = totalTraffic > 0 ? Math.round((metrics.morningTraffic / totalTraffic) * 100) : 0;
+              const afternoonPct = totalTraffic > 0 ? Math.round((metrics.afternoonTraffic / totalTraffic) * 100) : 0;
+              const eveningPct = totalTraffic > 0 ? Math.round((metrics.eveningTraffic / totalTraffic) * 100) : 0;
 
-              {/* Morning */}
-              <div className="p-3 bg-slate-50/80 rounded-2xl border border-slate-200/80 flex items-center justify-between text-xs hover:bg-white hover:shadow-2xs transition">
-                <div>
-                  <span className="font-bold text-slate-800 font-['Outfit']">Morning (9:00 AM - 1:00 PM)</span>
-                  <p className="text-[10px] text-slate-500 mt-0.5">Service drop-offs & early corporate visits</p>
-                </div>
-                <div className="text-right">
-                  <span className="font-bold text-slate-900 font-mono text-sm">{metrics.morningTraffic}</span>
-                  <span className="text-[10px] text-slate-500 block font-semibold">
-                    {Math.round((metrics.morningTraffic / (metrics.morningTraffic + metrics.afternoonTraffic + metrics.eveningTraffic)) * 100)}%
-                  </span>
-                </div>
-              </div>
+              return (
+                <div className="space-y-3">
+                  <p className="text-xs font-bold uppercase tracking-wider text-slate-600">
+                    Day-Part Footfall Distribution
+                  </p>
 
-              {/* Afternoon */}
-              <div className="p-3 bg-slate-50/80 rounded-2xl border border-slate-200/80 flex items-center justify-between text-xs hover:bg-white hover:shadow-2xs transition">
-                <div>
-                  <span className="font-bold text-slate-800 font-['Outfit']">Afternoon (1:00 PM - 5:00 PM)</span>
-                  <p className="text-[10px] text-slate-500 mt-0.5">Spares buyers & casual walk-ins</p>
-                </div>
-                <div className="text-right">
-                  <span className="font-bold text-slate-900 font-mono text-sm">{metrics.afternoonTraffic}</span>
-                  <span className="text-[10px] text-slate-500 block font-semibold">
-                    {Math.round((metrics.afternoonTraffic / (metrics.morningTraffic + metrics.afternoonTraffic + metrics.eveningTraffic)) * 100)}%
-                  </span>
-                </div>
-              </div>
+                  {/* Morning */}
+                  <div className="p-3 bg-slate-50/80 rounded-2xl border border-slate-200/80 flex items-center justify-between text-xs hover:bg-white hover:shadow-2xs transition">
+                    <div>
+                      <span className="font-bold text-slate-800 font-['Outfit']">Morning (9:00 AM - 1:00 PM)</span>
+                      <p className="text-[10px] text-slate-500 mt-0.5">Service drop-offs & early corporate visits</p>
+                    </div>
+                    <div className="text-right">
+                      <span className="font-bold text-slate-900 font-mono text-sm">{metrics.morningTraffic}</span>
+                      <span className="text-[10px] text-slate-500 block font-semibold">{morningPct}%</span>
+                    </div>
+                  </div>
 
-              {/* Evening */}
-              <div className="p-3 bg-red-50/70 rounded-2xl border border-red-200/80 flex items-center justify-between text-xs hover:bg-white hover:shadow-2xs transition">
-                <div>
-                  <span className="font-bold text-red-950 font-['Outfit'] flex items-center gap-1.5">
-                    <span>Evening (5:00 PM - 8:00 PM)</span>
-                    <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
-                  </span>
-                  <p className="text-[10px] text-red-700 mt-0.5">Family visits, test rides & delivery ceremonies</p>
+                  {/* Afternoon */}
+                  <div className="p-3 bg-slate-50/80 rounded-2xl border border-slate-200/80 flex items-center justify-between text-xs hover:bg-white hover:shadow-2xs transition">
+                    <div>
+                      <span className="font-bold text-slate-800 font-['Outfit']">Afternoon (1:00 PM - 5:00 PM)</span>
+                      <p className="text-[10px] text-slate-500 mt-0.5">Spares buyers & casual walk-ins</p>
+                    </div>
+                    <div className="text-right">
+                      <span className="font-bold text-slate-900 font-mono text-sm">{metrics.afternoonTraffic}</span>
+                      <span className="text-[10px] text-slate-500 block font-semibold">{afternoonPct}%</span>
+                    </div>
+                  </div>
+
+                  {/* Evening */}
+                  <div className="p-3 bg-red-50/70 rounded-2xl border border-red-200/80 flex items-center justify-between text-xs hover:bg-white hover:shadow-2xs transition">
+                    <div>
+                      <span className="font-bold text-red-950 font-['Outfit'] flex items-center gap-1.5">
+                        <span>Evening (5:00 PM - 8:00 PM)</span>
+                        <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                      </span>
+                      <p className="text-[10px] text-red-700 mt-0.5">Family visits, test rides & delivery ceremonies</p>
+                    </div>
+                    <div className="text-right">
+                      <span className="font-bold text-red-950 font-mono text-sm">{metrics.eveningTraffic}</span>
+                      <span className="text-[10px] text-red-700 block font-bold">{eveningPct}%</span>
+                    </div>
+                  </div>
                 </div>
-                <div className="text-right">
-                  <span className="font-bold text-red-950 font-mono text-sm">{metrics.eveningTraffic}</span>
-                  <span className="text-[10px] text-red-700 block font-bold">
-                    {Math.round((metrics.eveningTraffic / (metrics.morningTraffic + metrics.afternoonTraffic + metrics.eveningTraffic)) * 100)}%
-                  </span>
-                </div>
-              </div>
-            </div>
+              );
+            })()}
           </div>
 
           <p className="mt-4 text-[11px] text-slate-500 pt-3 border-t border-slate-100">
@@ -1197,13 +1210,33 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 <div className="grid grid-cols-2 gap-3 mt-2 text-xs">
                   <div>
                     <span className="text-blue-700 text-[11px]">First Recorded Entry:</span>
-                    <p className="font-extrabold text-slate-900 font-mono text-base mt-0.5">{storeHours.actualFirstEntryToday || '09:34 AM'}</p>
-                    <span className="text-[10px] text-emerald-700 font-bold bg-emerald-100/80 px-1.5 py-0.5 rounded mt-1 inline-block">+4m after opening</span>
+                    <p className="font-extrabold text-slate-900 font-mono text-base mt-0.5">
+                      {storeHours.actualFirstEntryToday || '—'}
+                    </p>
+                    {storeHours.actualFirstEntryToday ? (
+                      <span className="text-[10px] text-emerald-700 font-bold bg-emerald-100/80 px-1.5 py-0.5 rounded mt-1 inline-block">
+                        Recorded at gate
+                      </span>
+                    ) : (
+                      <span className="text-[10px] text-slate-400 mt-1 inline-block">
+                        Awaiting entries
+                      </span>
+                    )}
                   </div>
                   <div>
                     <span className="text-blue-700 text-[11px]">Latest Recorded Exit:</span>
-                    <p className="font-extrabold text-slate-900 font-mono text-base mt-0.5">{storeHours.actualLastExitToday || 'Active'}</p>
-                    <span className="text-[10px] text-blue-700 font-bold bg-blue-100/80 px-1.5 py-0.5 rounded mt-1 inline-block">Tracked at gate</span>
+                    <p className="font-extrabold text-slate-900 font-mono text-base mt-0.5">
+                      {storeHours.actualLastExitToday || (metrics.totalVisitors > 0 ? 'Active on floor' : '—')}
+                    </p>
+                    {storeHours.actualLastExitToday ? (
+                      <span className="text-[10px] text-blue-700 font-bold bg-blue-100/80 px-1.5 py-0.5 rounded mt-1 inline-block">
+                        Recorded at gate
+                      </span>
+                    ) : (
+                      <span className="text-[10px] text-slate-400 mt-1 inline-block">
+                        {metrics.totalVisitors > 0 ? 'Visitors inside' : 'No exits yet'}
+                      </span>
+                    )}
                   </div>
                 </div>
               </div>
@@ -1304,11 +1337,17 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                             className="relative group/cctv shrink-0 cursor-pointer overflow-hidden rounded-xl border border-slate-700/80 bg-slate-950 shadow-xs hover:border-emerald-500 transition-all w-11 h-11"
                             title="Click to view full CCTV camera detection snapshot"
                           >
-                            <img
-                              src={vis.avatarUrl || 'https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?w=160&auto=format&fit=crop&q=80'}
-                              alt={vis.visitorId}
-                              className="w-full h-full object-cover object-top contrast-[1.05] brightness-95 group-hover/cctv:scale-105 transition-transform"
-                            />
+                            {vis.avatarUrl ? (
+                              <img
+                                src={vis.avatarUrl}
+                                alt={vis.visitorId}
+                                className="w-full h-full object-cover object-top contrast-[1.05] brightness-95 group-hover/cctv:scale-105 transition-transform"
+                              />
+                            ) : (
+                              <div className="w-full h-full flex items-center justify-center bg-slate-800 text-slate-400">
+                                <User className="w-5 h-5 text-slate-400" />
+                              </div>
+                            )}
                             {/* CCTV Reticle & Corner Box */}
                             <div className="absolute inset-0.5 border border-emerald-400/40 rounded-lg pointer-events-none" />
                             <div className="absolute top-0.5 left-1 bg-black/80 px-1 py-0.2 rounded text-[7px] font-mono font-bold text-emerald-400 leading-tight">
@@ -1419,11 +1458,18 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             <div className="p-5 sm:p-6 space-y-4">
               {/* Clear CCTV Snapshot Frame */}
               <div className="relative rounded-2xl overflow-hidden border border-slate-800 bg-black flex items-center justify-center h-64 sm:h-72 group shadow-inner">
-                <img
-                  src={inspectedVisitor.avatarUrl || 'https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?w=600&auto=format&fit=crop&q=80'}
-                  alt={inspectedVisitor.visitorId}
-                  className="w-full h-full object-cover object-top contrast-[1.05] brightness-95"
-                />
+                {inspectedVisitor.avatarUrl ? (
+                  <img
+                    src={inspectedVisitor.avatarUrl}
+                    alt={inspectedVisitor.visitorId}
+                    className="w-full h-full object-cover object-top contrast-[1.05] brightness-95"
+                  />
+                ) : (
+                  <div className="w-full h-full flex flex-col items-center justify-center text-slate-500 gap-2">
+                    <Camera className="w-10 h-10 text-slate-600" />
+                    <span className="text-xs">No Snapshot Captured</span>
+                  </div>
+                )}
 
                 {/* CCTV Top Status Overlay */}
                 <div className="absolute top-2.5 inset-x-3 flex items-center justify-between text-[10px] font-mono text-emerald-400 bg-black/75 px-2.5 py-1 rounded border border-emerald-400/20 pointer-events-none">

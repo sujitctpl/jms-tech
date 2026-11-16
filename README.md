@@ -184,7 +184,9 @@ jms/
 │       └── visitors/                    # 320x320 retina visitor portrait crops
 ├── alembic/                             # Database migration scripts
 ├── local_detector.py                    # Standalone Local Edge AI Video Processing Engine
-├── start_detector.bat                   # 1-Click Windows Batch Launcher for Edge Detector
+├── start_detector.bat                   # 1-Click Windows Batch Launcher for Single-Camera Detector
+├── run_multi_camera.bat                 # Concurrent Multi-Camera Launcher for Windows CMD
+├── run_multi_camera.ps1                 # Concurrent Multi-Camera Launcher for PowerShell
 ├── build_exe.py                         # PyInstaller standalone EXE compiler
 ├── bytetrack.yaml                       # ByteTrack tracker configuration
 ├── botsort.yaml                         # BoT-SORT tracker configuration
@@ -320,8 +322,8 @@ Copy `camera_config.example.json` to `camera_config.json` (or configure via the 
 }
 ```
 
-### Starting the Detector
-On Windows, you can start the detector with a single click using:
+### Starting the Detector (Single Camera)
+On Windows, you can start the detector for your default channel with a single click using:
 ```bash
 start_detector.bat
 ```
@@ -341,6 +343,93 @@ python local_detector.py --channel 101 --headless
 # Select BoT-SORT tracker with Global Motion Compensation
 python local_detector.py --channel 101 --tracker botsort
 ```
+
+---
+
+### Running Multiple Cameras Simultaneously
+
+To process multiple camera feeds concurrently with independent preview windows on your desktop:
+
+#### Option 1: Via Windows Batch Launcher
+```cmd
+# Launch Camera 101 (Entrance) and Camera 201 (Floor) concurrently:
+run_multi_camera.bat 101 201
+
+# Or run interactively to choose presets:
+run_multi_camera.bat
+```
+
+#### Option 2: Via PowerShell Launcher
+```powershell
+# Launch Channels 101 and 201 in parallel:
+.\run_multi_camera.ps1 101, 201
+
+# Launch all 4 channels:
+.\run_multi_camera.ps1 101, 201, 301, 401
+```
+
+#### Option 3: Via Separate Terminal Tabs
+You can open separate terminal windows and run:
+```powershell
+# Terminal 1:
+python local_detector.py --channel 101 --imgsz 640
+
+# Terminal 2:
+python local_detector.py --channel 201 --imgsz 640
+```
+
+Each process creates a dedicated desktop window:
+- `Capermint Edge AI Detector - Cam 101`
+- `Capermint Edge AI Detector - Cam 201`
+
+---
+
+### Multi-Camera Person & Visitor Re-Identification Flow
+
+The platform features seamless cross-camera handover between entrance and interior floor cameras:
+
+```mermaid
+flowchart TD
+    subgraph Entrance ["Camera 101 (Main Glass Entrance - is_entrance: true)"]
+        E1["Person crosses Entrance Line"] --> E2["SCRFD Face Detection + ArcFace 512-D Embedding"]
+        E2 --> E3{"Staff or Visitor?"}
+        E3 -->|Employee| E4["Staff Attendance Checked In"]
+        E3 -->|Visitor| E5["Mint Persistent ID (e.g. VIS-2026-1043)"]
+        E5 --> E6["Save Face Vector & Portrait to PostgreSQL `person_identities`"]
+    end
+
+    subgraph CentralDB ["Central Database & Vector Store"]
+        E6 --> DB[("PostgreSQL + pgvector Gallery")]
+    end
+
+    subgraph Interior ["Camera 201 (Floor / Sections - is_entrance: false)"]
+        I1["Same person enters Camera 201 view"] --> I2["Detect Face & Extract 512-D Embedding"]
+        I2 --> I3{"Cosine Match against Database?"}
+        DB -.->|Query Active Embeddings| I3
+        I3 -->|Staff Match| I4["Tagged as STAFF [Name] #ID<br/>Logs Section Dwell Time"]
+        I3 -->|Visitor Match >= 0.55| I5["Matched to VIS-2026-1043<br/>Links Track & Updates Zone Dwell"]
+        I5 --> I6["POST /api/v1/visitors/update-zone<br/>Footfall count is NOT duplicated"]
+    end
+```
+
+1. **Entrance Camera (Channel 101, `is_entrance: true`)**:
+   - Manages the virtual entry line crossing.
+   - When a new customer enters, their 512-D ArcFace embedding and full-body portrait are registered in PostgreSQL (`person_identities` table) under a persistent ID (e.g., `VIS-2026-1043`).
+   - If an employee enters, their attendance check-in is punched and visitor registration is suppressed.
+2. **Interior Floor Camera (Channel 201, `is_entrance: false`)**:
+   - Runs neural detection and face embedding extraction locally.
+   - Queries the active showroom visitor gallery via `visitor_vector_store.find_best_visitor_match()`.
+   - When cosine similarity is $\ge 0.55$, the track is automatically linked to `VIS-2026-1043`.
+   - The HUD label updates to `Person #ID | VIS-2026-1043 | [Zone Name]`.
+   - `VisitorZoneTracker` sends periodic zone dwell updates to `/api/v1/visitors/update-zone` without incrementing walk-in footfall counts.
+
+---
+
+### Multi-Process GPU & Runtime Optimizations
+
+- **VRAM Memory Capping (`torch.cuda.set_per_process_memory_fraction`)**: Automatically restricts each detector process to $42\%$ of available VRAM (~$1.7\text{ GB}$ on a 4GB GTX 1650), preventing CUDA out-of-memory errors and PCIe paging thrashing when multiple cameras run in parallel.
+- **Anti-Freeze Windows Message Pump**: Calls `cv2.waitKey(10)` during stream-wait cycles so Windows always services the GUI message queue, preventing windows from turning into "Not Responding" state.
+- **Resilient RTSP Auto-Reconnection**: Detects consecutive dropped frames ($> 1.5\text{s}$) and automatically cycles the RTSP TCP socket without crashing or freezing.
 
 ### Detector CLI Arguments Reference
 | Flag | Description | Default |

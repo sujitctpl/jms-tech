@@ -11,6 +11,9 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.logging import logger
 from app.db.models.person_identity import PersonIdentity
+from app.db.models.footfall_event import FootfallEvent
+from app.db.models.visitor_track import VisitorTrack
+from app.db.models.processing_run import ProcessingRun
 from app.repositories.employee_attendance_repo import EmployeeAttendanceRepository
 from app.repositories.employee_repo import EmployeeRepository
 from app.repositories.person_identity_repo import PersonIdentityRepository
@@ -74,13 +77,6 @@ class VisitorService:
         # Resolve departure / exit time
         exit_time_val = getattr(record, "exit_time", None)
 
-        # Safety: If exit_time was prematurely set to arrival time and person was seen recently,
-        # they are genuinely still browsing inside the showroom!
-        if exit_time_val and last_seen_ist:
-            is_active_recently = (now_ist - last_seen_ist).total_seconds() < 900
-            if exit_time_val == first_seen_str and is_active_recently:
-                exit_time_val = None
-
         if not exit_time_val and created_ist:
             # If the visit is from a previous calendar date (in IST), departure was when last seen
             if created_ist.date() < now_ist.date():
@@ -91,14 +87,31 @@ class VisitorService:
                     exit_time_val = last_seen_str
 
         # Calculate duration in minutes (till exit if departed, or till now if active inside)
-        duration = 1
+        duration = 0
         if created_ist:
-            if exit_time_val and last_seen_ist:
-                end_time = last_seen_ist
+            end_time = None
+            if exit_time_val:
+                try:
+                    # Parse exit time string into today's datetime in IST
+                    t_struct = datetime.strptime(exit_time_val.strip(), "%I:%M %p").time()
+                    end_time = datetime.combine(created_ist.date(), t_struct, tzinfo=IST)
+                    if end_time < created_ist:
+                        # If exit was within the same minute as entry (e.g. 5 seconds later)
+                        if exit_time_val == first_seen_str:
+                            end_time = created_ist
+                        elif last_seen_ist and last_seen_ist >= created_ist:
+                            end_time = last_seen_ist
+                except Exception:
+                    end_time = last_seen_ist or now_ist
+            elif last_seen_ist:
+                # Active inside if seen within 15 mins, otherwise departed when last seen
+                is_active = (now_ist - last_seen_ist).total_seconds() <= 900
+                end_time = now_ist if is_active else last_seen_ist
             else:
                 end_time = now_ist
+
             delta_sec = max(0.0, (end_time - created_ist).total_seconds())
-            duration = max(1, int(round(delta_sec / 60.0)))
+            duration = int(round(delta_sec / 60.0))
 
         # Parse and resolve zone dwell breakdown
         zone_dwell_dict: Dict[str, str] = {}
@@ -114,10 +127,26 @@ class VisitorService:
             primary_z = record.zone_entered or "Main Showroom"
             zone_dwell_dict = {primary_z: f"{duration} mins"}
 
+        # Dynamic cache-busting timestamp on avatarUrl so browsers NEVER serve stale cached images
+        avatar_url_res = record.avatar_url
+        if avatar_url_res:
+            mtime = 0
+            try:
+                clean_path = avatar_url_res.lstrip("/").split("?")[0]
+                if os.path.exists(clean_path):
+                    mtime = int(os.path.getmtime(clean_path))
+            except Exception:
+                pass
+            if not mtime:
+                ts_dt = record.last_seen_at or record.created_at
+                mtime = int(ts_dt.timestamp()) if ts_dt else int(datetime.now(timezone.utc).timestamp())
+            base_url = avatar_url_res.split("?")[0]
+            avatar_url_res = f"{base_url}?t={mtime}"
+
         return VisitorResponse(
             id=str(record.id),
             visitorId=record.person_id,
-            avatarUrl=record.avatar_url,
+            avatarUrl=avatar_url_res,
             firstSeenTime=first_seen_str,
             lastSeenTime=last_seen_str,
             exitTime=exit_time_val,
@@ -177,21 +206,49 @@ class VisitorService:
         record = None
         if payload.person_id:
             record = self.repo.get_by_person_id(payload.person_id)
+        now_utc = datetime.now(timezone.utc)
         if not record and payload.tracker_id:
-            record = (
+            cand = (
                 self.db.query(PersonIdentity)
                 .filter(
                     PersonIdentity.notes.like(f"%Tracker #{payload.tracker_id}%"),
                     PersonIdentity.is_expired.is_(False),
+                    PersonIdentity.exit_time.is_(None),
                 )
-                .order_by(PersonIdentity.created_at.desc())
+                .order_by(PersonIdentity.last_seen_at.desc())
                 .first()
             )
+            if cand and cand.last_seen_at:
+                time_diff = (now_utc - cand.last_seen_at).total_seconds()
+                if time_diff < 45.0:
+                    record = cand
+
+        # Fallback for store exit: if tracker ID was reset on 180-deg turnaround (e.g. #2 became #6)
+        if not record and payload.exit_time:
+            active_cand = (
+                self.db.query(PersonIdentity)
+                .filter(
+                    PersonIdentity.is_expired.is_(False),
+                    PersonIdentity.exit_time.is_(None),
+                )
+                .order_by(PersonIdentity.last_seen_at.desc())
+                .first()
+            )
+            if active_cand and active_cand.last_seen_at:
+                # Any active customer who entered today (within 12 hours)
+                time_diff = (now_utc - active_cand.last_seen_at).total_seconds()
+                if time_diff < 43200.0:
+                    record = active_cand
+                    logger.info(
+                        "Resolved entrance exit event to active showroom visitor %s (Tracker swapped on turnaround).",
+                        record.person_id,
+                    )
+
         if not record:
             return None
-
-        now_utc = datetime.now(timezone.utc)
         record.last_seen_at = now_utc
+        if payload.tracker_id and f"Tracker #{payload.tracker_id}" not in (record.notes or ""):
+            record.notes = f"{record.notes} | Tracker #{payload.tracker_id}" if record.notes else f"Tracker #{payload.tracker_id}"
         if payload.current_zone:
             record.zone_entered = payload.current_zone
         if payload.exit_time:
@@ -211,9 +268,20 @@ class VisitorService:
         return self._to_visitor_response(record)
 
     def clear_all_visitors(self) -> dict:
-        """Deletes all visitor records and cleans up stored visitor snapshots on disk."""
+        """Deletes all visitor records, footfall events, tracks, and cleans up stored visitor snapshots on disk."""
+        footfall_count = self.db.query(FootfallEvent).delete()
+        track_count = self.db.query(VisitorTrack).delete()
+        run_count = self.db.query(ProcessingRun).delete()
         count = self.db.query(PersonIdentity).delete()
         self.db.commit()
+
+        # Clear edge telemetry in-memory cache
+        try:
+            from app.services.camera_service import _edge_telemetry
+            _edge_telemetry.clear()
+        except Exception:
+            pass
+
         vis_dir = os.path.join("static", "uploads", "visitors")
         deleted_files = 0
         if os.path.exists(vis_dir):
@@ -228,8 +296,10 @@ class VisitorService:
         return {
             "status": "SUCCESS",
             "deleted_count": count,
+            "deleted_tracks": track_count,
+            "deleted_footfall": footfall_count,
             "deleted_files": deleted_files,
-            "message": "All visitor records and face snapshots cleared successfully.",
+            "message": "All visitor records, footfall events, tracks, and face snapshots cleared successfully.",
         }
 
     def create_walk_in(self, payload: WalkInCreateRequest) -> VisitorResponse:
@@ -295,18 +365,25 @@ class VisitorService:
         # ---------------------------------------------------------------------
         existing_rec = None
         if req.person_id:
-            existing_rec = self.repo.get_by_person_id(req.person_id)
+            cand = self.repo.get_by_person_id(req.person_id)
+            if cand and cand.exit_time is None and not cand.is_expired:
+                existing_rec = cand
         if not existing_rec and req.tracker_id:
-            # Check if this active track was already logged in the last 60 seconds
-            existing_rec = (
+            # Only match the exact same track if it was active within the last 30 seconds and hasn't departed
+            cand = (
                 self.db.query(PersonIdentity)
                 .filter(
                     PersonIdentity.notes.like(f"%Tracker #{req.tracker_id}%"),
                     PersonIdentity.is_expired.is_(False),
+                    PersonIdentity.exit_time.is_(None),
                 )
-                .order_by(PersonIdentity.created_at.desc())
+                .order_by(PersonIdentity.last_seen_at.desc())
                 .first()
             )
+            if cand and cand.last_seen_at:
+                time_diff = (now_utc - cand.last_seen_at).total_seconds()
+                if time_diff < 30.0:
+                    existing_rec = cand
 
         if existing_rec:
             existing_rec.last_seen_at = now_utc
@@ -322,7 +399,15 @@ class VisitorService:
                 try:
                     os.makedirs("static/uploads/visitors", exist_ok=True)
                     avatar_img = cv2.resize(face_img, (320, 320), interpolation=cv2.INTER_LANCZOS4)
-                    filename = f"{existing_rec.person_id}.jpg"
+                    now_epoch = int(datetime.now(timezone.utc).timestamp())
+                    filename = f"{existing_rec.person_id}_{now_epoch}.jpg"
+                    if existing_rec.avatar_url:
+                        old_f = os.path.join(".", existing_rec.avatar_url.lstrip("/").split("?")[0])
+                        if os.path.isfile(old_f):
+                            try:
+                                os.remove(old_f)
+                            except Exception:
+                                pass
                     filepath = os.path.join("static", "uploads", "visitors", filename)
                     cv2.imwrite(filepath, avatar_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     existing_rec.avatar_url = f"/static/uploads/visitors/{filename}"
@@ -401,17 +486,64 @@ class VisitorService:
         # ---------------------------------------------------------------------
         matched_person_id = None
         matched_similarity = 0.0
+        is_active_session = False
+        is_returning_customer = False
+        past_record = None
+
+        now_ist = datetime.now(IST)
 
         if embedding is not None:
-            # Calibrated operating threshold for ArcFace CCTV feature vectors
-            calibrated_threshold = float(getattr(settings, "FACE_SIMILARITY_THRESHOLD", 0.32))
-            matched_person_id, matched_similarity = self.repo.find_best_match(
+            visitor_reid_thresh = float(getattr(settings, "VISITOR_REID_THRESHOLD", 0.55))
+
+            # Step 2A: Check for an ongoing active visit inside the showroom TODAY
+            active_pid, active_sim = self.repo.find_best_match(
                 embedding=embedding,
-                similarity_threshold=calibrated_threshold,
+                similarity_threshold=visitor_reid_thresh,
+                only_active=True,
             )
+            if active_pid:
+                cand = self.repo.get_by_person_id(active_pid)
+                if cand and not cand.is_expired and cand.exit_time is None:
+                    cand_ist = to_ist(cand.created_at)
+                    if cand_ist and cand_ist.date() == now_ist.date():
+                        matched_person_id = active_pid
+                        matched_similarity = active_sim
+                        is_active_session = True
+                    else:
+                        # Stale visit from a previous calendar day: close it out
+                        c_last_ist = to_ist(cand.last_seen_at) or cand_ist
+                        cand.exit_time = c_last_ist.strftime("%I:%M %p") if c_last_ist else "Exited"
+                        self.db.add(cand)
+                        self.db.commit()
+
+            # Step 2B: If not currently active today, check 14-day history for returning customer
+            if not is_active_session:
+                history_pid, history_sim = self.repo.find_best_match(
+                    embedding=embedding,
+                    similarity_threshold=visitor_reid_thresh,
+                    only_active=False,
+                )
+                if history_pid:
+                    history_cand = self.repo.get_by_person_id(history_pid)
+                    if history_cand and not history_cand.is_expired:
+                        hist_ist = to_ist(history_cand.created_at)
+                        # A visit from a previous day OR with an exit_time marked indicates a returning customer
+                        if (hist_ist and hist_ist.date() < now_ist.date()) or history_cand.exit_time is not None:
+                            is_returning_customer = True
+                            past_record = history_cand
+                            if not history_cand.exit_time:
+                                h_last_ist = to_ist(history_cand.last_seen_at) or hist_ist
+                                history_cand.exit_time = h_last_ist.strftime("%I:%M %p") if h_last_ist else "Exited"
+                                self.db.add(history_cand)
+                                self.db.commit()
+                        else:
+                            matched_person_id = history_pid
+                            matched_similarity = history_sim
+                            is_active_session = True
 
         # Extended recency safety net: Match visitors active in the showroom today (within 2 hours)
-        if not matched_person_id and embedding is not None:
+        # ONLY if biometric match is genuinely high (sim >= 0.55)
+        if not is_active_session and not is_returning_customer and embedding is not None:
             recent_identities = (
                 self.db.query(PersonIdentity)
                 .filter(
@@ -431,16 +563,21 @@ class VisitorService:
                     rec_norm = (rec_emb / norm_r).astype(np.float32) if norm_r > 0 else rec_emb
                     sim = float(np.dot(norm_emb, rec_norm))
                     time_diff = (now_utc - rec.last_seen_at).total_seconds()
-                    # 2-hour active window with relaxed cross-camera CCTV similarity threshold
-                    if time_diff < 7200.0 and sim >= 0.28:
-                        matched_person_id = rec.person_id
-                        matched_similarity = sim
+                    if time_diff < 7200.0 and sim >= 0.55:
+                        rec_ist = to_ist(rec.created_at)
+                        if rec_ist and rec_ist.date() == now_ist.date() and rec.exit_time is None:
+                            matched_person_id = rec.person_id
+                            matched_similarity = sim
+                            is_active_session = True
+                        elif (rec_ist and rec_ist.date() < now_ist.date()) or rec.exit_time is not None:
+                            is_returning_customer = True
+                            past_record = rec
                         break
 
         # Interior Camera Safety Net: Interior cameras (Floor, Display Area, Service Desk)
         # should NEVER mint new store walk-ins if an active customer is already in the showroom
         is_cam_entrance = getattr(req, "is_entrance", True)
-        if not matched_person_id and not is_cam_entrance:
+        if not is_active_session and not is_returning_customer and not is_cam_entrance:
             active_visitor = (
                 self.db.query(PersonIdentity)
                 .filter(
@@ -451,29 +588,41 @@ class VisitorService:
                 .first()
             )
             if active_visitor:
+                act_ist = to_ist(active_visitor.created_at)
                 time_since_seen = (now_utc - active_visitor.last_seen_at).total_seconds()
-                if time_since_seen < 3600.0:
+                if act_ist and act_ist.date() == now_ist.date() and time_since_seen < 3600.0:
                     matched_person_id = active_visitor.person_id
                     matched_similarity = 0.85
+                    is_active_session = True
                     logger.info(
                         "Interior camera %s associated detection with active showroom visitor %s (suppressing duplicate).",
                         req.camera_name,
                         matched_person_id,
                     )
 
-        # Case A: Existing visitor recognized (disappeared & reappeared on camera 1 or camera 2)
-        if matched_person_id:
+        # Case A: Existing visitor recognized active in showroom (disappeared & reappeared on camera 1 or camera 2)
+        if is_active_session and matched_person_id:
             record = self.repo.get_by_person_id(matched_person_id)
-            if record:
+            if record and not record.is_expired:
                 record.last_seen_at = now_utc
                 if req.camera_name:
                     record.camera_source = req.camera_name
                 if req.zone:
                     record.zone_entered = req.zone
+                if req.tracker_id and f"Tracker #{req.tracker_id}" not in (record.notes or ""):
+                    record.notes = f"{record.notes} | Tracker #{req.tracker_id}" if record.notes else f"Tracker #{req.tracker_id}"
                 if face_img is not None and face_img.size > 0:
                     try:
                         os.makedirs("static/uploads/visitors", exist_ok=True)
-                        filename = f"{record.person_id}.jpg"
+                        now_epoch = int(datetime.now(timezone.utc).timestamp())
+                        filename = f"{record.person_id}_{now_epoch}.jpg"
+                        if record.avatar_url:
+                            old_f = os.path.join(".", record.avatar_url.lstrip("/").split("?")[0])
+                            if os.path.isfile(old_f):
+                                try:
+                                    os.remove(old_f)
+                                except Exception:
+                                    pass
                         filepath = os.path.join("static", "uploads", "visitors", filename)
                         cv2.imwrite(filepath, face_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
                         record.avatar_url = f"/static/uploads/visitors/{filename}"
@@ -484,7 +633,7 @@ class VisitorService:
                 self.db.refresh(record)
 
                 logger.info(
-                    "Visitor RE-IDENTIFIED: %s across cameras (similarity %.3f). Maintained same ID.",
+                    "Visitor RE-IDENTIFIED (Active): %s across cameras (similarity %.3f). Maintained active visit.",
                     matched_person_id,
                     matched_similarity,
                 )
@@ -494,11 +643,11 @@ class VisitorService:
                     person_id=matched_person_id,
                     is_new=False,
                     visitor=self._to_visitor_response(record),
-                    message=f"Visitor {matched_person_id} re-identified across camera feeds. ID preserved.",
+                    message=f"Visitor {matched_person_id} active in showroom. Presence updated.",
                 )
 
         # ---------------------------------------------------------------------
-        # 3. New Customer Arrival -> Mint ID, Save Crisp Snapshot, Add to Visit Purpose
+        # 3. New or Returning Customer Arrival -> Mint ID, Save Crisp Snapshot, Add to Visit Purpose
         # ---------------------------------------------------------------------
         total_count = self.db.query(PersonIdentity).count()
         new_person_id = f"VIS-2026-{1040 + total_count + 1}"
@@ -508,7 +657,8 @@ class VisitorService:
         if face_img is not None and face_img.size > 0:
             try:
                 os.makedirs("static/uploads/visitors", exist_ok=True)
-                filename = f"{new_person_id}.jpg"
+                now_epoch = int(datetime.now(timezone.utc).timestamp())
+                filename = f"{new_person_id}_{now_epoch}.jpg"
                 filepath = os.path.join("static", "uploads", "visitors", filename)
                 cv2.imwrite(filepath, face_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
                 avatar_url = f"/static/uploads/visitors/{filename}"
@@ -520,7 +670,9 @@ class VisitorService:
             avatar_url = None
 
         note_text = f"AI Face Detection walk-in (Tracker #{req.tracker_id or 'auto'})"
-        if getattr(req, "appearance", None):
+        if is_returning_customer and past_record:
+            note_text = f"Returning customer (previously {past_record.person_id}) | Tracker #{req.tracker_id or 'auto'}"
+        elif getattr(req, "appearance", None):
             note_text = f"Appearance: {req.appearance} | Tracker #{req.tracker_id or 'auto'}"
 
         new_record = self.repo.create_or_update(
@@ -532,6 +684,8 @@ class VisitorService:
             zone_entered=req.zone or "Main Showroom",
             notes=note_text,
         )
+        new_record.visitor_type = "Returning" if is_returning_customer else "New"
+        new_record.exit_time = None
 
         if getattr(req, "zone_dwell", None):
             new_record.zone_dwell = json.dumps(req.zone_dwell)
@@ -542,18 +696,33 @@ class VisitorService:
             self.db.commit()
             self.db.refresh(new_record)
 
-        logger.info(
-            "New Customer Registered: %s with face snapshot saved to %s.",
-            new_person_id,
-            avatar_url,
-        )
-
-        return VisitorDetectResponse(
-            status="VISITOR_CREATED",
-            is_employee=False,
-            person_id=new_person_id,
-            is_new=True,
-            visitor=self._to_visitor_response(new_record),
-            message=f"New visitor {new_person_id} registered and added to Visit Purpose queue.",
-        )
+        if is_returning_customer:
+            logger.info(
+                "Returning Customer Registered: %s (previously %s) with face snapshot saved to %s.",
+                new_person_id,
+                past_record.person_id if past_record else "known",
+                avatar_url,
+            )
+            return VisitorDetectResponse(
+                status="VISITOR_CREATED",
+                is_employee=False,
+                person_id=new_person_id,
+                is_new=False,
+                visitor=self._to_visitor_response(new_record),
+                message=f"Returning visitor {new_person_id} registered and added to Visit Purpose queue.",
+            )
+        else:
+            logger.info(
+                "New Customer Registered: %s with face snapshot saved to %s.",
+                new_person_id,
+                avatar_url,
+            )
+            return VisitorDetectResponse(
+                status="VISITOR_CREATED",
+                is_employee=False,
+                person_id=new_person_id,
+                is_new=True,
+                visitor=self._to_visitor_response(new_record),
+                message=f"New visitor {new_person_id} registered and added to Visit Purpose queue.",
+            )
 

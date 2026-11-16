@@ -70,10 +70,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static files directory for profile pictures and media assets
+# Mount static files directory for profile pictures and media assets (with zero-cache headers)
 os.makedirs("static/uploads/employees", exist_ok=True)
 os.makedirs("static/uploads/visitors", exist_ok=True)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+class NoCacheStaticFiles(StaticFiles):
+    """StaticFiles provider with strict no-cache headers for live AI snapshot feeds."""
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+
+
+app.mount("/static", NoCacheStaticFiles(directory="static"), name="static")
 
 # Centralized health check endpoint (using path constant from routes.py)
 @app.get(HEALTH, tags=["Health"], summary="Check whether the API is running")

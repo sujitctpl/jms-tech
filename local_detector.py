@@ -20,6 +20,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.core.config import settings
+from app.vision.cross_camera_tracker import CrossCameraTracker
 
 # Indian Standard Time (UTC+05:30)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -1450,8 +1451,24 @@ class VisitorZoneTracker:
         """Triggered when a visitor physically walks out through the entrance door in reverse."""
         tid_str = str(track_id)
         session = self.sessions.pop(tid_str, None)
+
+        # If track ID switched when the person turned around (e.g. Tracker #2 became Tracker #6),
+        # match with the most recently active session within the last 60 seconds.
+        if not session and self.sessions:
+            recent_tids = sorted(
+                self.sessions.keys(),
+                key=lambda k: self.sessions[k].get("last_seen_ts", 0),
+                reverse=True,
+            )
+            for cand_tid in recent_tids:
+                cand_sess = self.sessions[cand_tid]
+                if (now_ts - cand_sess.get("last_seen_ts", 0)) < 60.0:
+                    session = self.sessions.pop(cand_tid)
+                    print(f"[*] Turnaround detected: matched exit track #{track_id} to recent active session #{cand_tid}")
+                    break
+
         if session:
-            self.last_sync_times.pop(tid_str, None)
+            self.last_sync_times.pop(str(session.get("track_id", tid_str)), None)
             self._sync_session(session, now_ts, is_departure=True)
         else:
             pid = self.track_to_pid.get(track_id)
@@ -1482,7 +1499,7 @@ class VisitorZoneTracker:
 
         exit_time = None
         if is_departure:
-            exit_time = datetime.fromtimestamp(session["last_seen_ts"], tz=IST).strftime("%I:%M %p")
+            exit_time = datetime.fromtimestamp(now_ts, tz=IST).strftime("%I:%M %p")
             disp_id = pid or f"#{session['track_id']}"
             dwell_desc = ", ".join([f"{z}: {t}" for z, t in formatted_dwell.items()])
             print(
@@ -1585,9 +1602,11 @@ class ZoneManager:
         self.person_section_dwell: Dict[Tuple[int, str], int] = {}
         self.track_positions: Dict[int, Tuple[float, float]] = {}  # obj_id -> prev feet (x, y)
         self.section_occupants: Dict[str, list] = {s["id"]: [] for s in self.sections}
+        self.active_visitor_visited_depts: Set[str] = set()
 
         # Visual Flash Timers
         self.line_flash_timer = 0
+        self.exit_flash_timer = 0
         self.section_flash_timers: Dict[str, int] = {s["id"]: 0 for s in self.sections}
 
         # Interactive Drawing State
@@ -1598,6 +1617,7 @@ class ZoneManager:
         self.status_msg = "CLICK & DRAG TO DRAW ENTRY LINE OR SELECT A DEPARTMENT TOOL ABOVE"
         self.status_timer = 250
         self.dept_tracker: Optional[Any] = None
+        self.show_boxes: bool = True
 
         # Dynamic Toolbar button layout (computes dynamic department buttons)
         self.btn_sections: List[Tuple[int, int, int, int, dict]] = []
@@ -1692,24 +1712,20 @@ class ZoneManager:
             cam_data = cams.get(self.camera_channel, {})
             sections_cfg = cam_data.get("sections")
             if sections_cfg is not None and isinstance(sections_cfg, list):
-                # Preserve drawn boxes in memory if config box is empty [0, 0, 0, 0]
-                mem_boxes = {s["id"]: s["box"] for s in self.sections if s.get("box") and s["box"] != [0, 0, 0, 0]}
                 new_sections = []
                 for s in sections_cfg:
                     if isinstance(s, dict):
                         sid = str(s.get("id", "section"))
                         s_box = [int(s["box"][0]), int(s["box"][1]), int(s["box"][2]), int(s["box"][3])] if ("box" in s and len(s["box"]) == 4) else [0, 0, 0, 0]
-                        if s_box == [0, 0, 0, 0] and sid in mem_boxes:
-                            s_box = mem_boxes[sid]
                         new_sections.append({
                             "id": sid,
                             "name": str(s.get("name", "Section")),
                             "color": tuple(s.get("color", [0, 215, 255])),
                             "box": s_box,
                         })
-                old_ids = [s["id"] for s in self.sections]
-                new_ids = [s["id"] for s in new_sections]
-                if old_ids != new_ids or len(self.sections) != len(new_sections):
+                old_state = [(s["id"], s.get("box", [0, 0, 0, 0])) for s in self.sections]
+                new_state = [(s["id"], s.get("box", [0, 0, 0, 0])) for s in new_sections]
+                if old_state != new_state:
                     self.sections = new_sections
                     for s in self.sections:
                         self.section_totals.setdefault(s["id"], 0)
@@ -1748,6 +1764,7 @@ class ZoneManager:
         self.attendance_total = 0
         self.counted_attendance_ids.clear()
         self.counted_person_ids.clear()
+        self.active_visitor_visited_depts.clear()
         self.person_visited_sections.clear()
         self.counted_person_sections.clear()
         self.person_section_dwell.clear()
@@ -1920,7 +1937,7 @@ class ZoneManager:
             # 1. Check Entry Line Crossing
             pid = self.track_identities.get(obj_id)
             is_already_counted = (obj_id in self.counted_attendance_ids) or (pid and pid in self.counted_person_ids)
-            if has_entry_line and not is_already_counted:
+            if has_entry_line:
                 prev_pos = self.track_positions.get(obj_id)
                 if prev_pos is not None:
                     # Sensitive displacement filter of 1.5px to reliably capture slow/smooth crossings
@@ -1930,43 +1947,34 @@ class ZoneManager:
                         cp_curr = self._cross_product(p1, p2, curr_pos)
 
                         crossed = False
+                        rev_crossed = False
                         if direction == "forward":
                             crossed = (cp_prev >= 0 and cp_curr < 0) or (cp_prev > 0 and cp_curr <= 0)
+                            rev_crossed = (cp_prev <= 0 and cp_curr > 0) or (cp_prev < 0 and cp_curr >= 0)
                         elif direction == "backward":
                             crossed = (cp_prev <= 0 and cp_curr > 0) or (cp_prev < 0 and cp_curr >= 0)
+                            rev_crossed = (cp_prev >= 0 and cp_curr < 0) or (cp_prev > 0 and cp_curr <= 0)
                         elif direction == "top_to_bottom":
                             crossed = (curr_pos[1] >= prev_pos[1]) or (cp_prev >= 0 and cp_curr < 0)
+                            rev_crossed = (curr_pos[1] <= prev_pos[1]) or (cp_prev <= 0 and cp_curr > 0)
                         elif direction == "bottom_to_top":
                             crossed = (curr_pos[1] <= prev_pos[1]) or (cp_prev <= 0 and cp_curr > 0)
+                            rev_crossed = (curr_pos[1] >= prev_pos[1]) or (cp_prev >= 0 and cp_curr < 0)
                         else:  # "both" (bidirectional entry)
                             crossed = True
+                            rev_crossed = False
 
-                        if crossed:
+                        if crossed and not is_already_counted:
                             self.line_flash_timer = 25
                             new_attendance_crossings.append(obj_id)
-            elif has_entry_line and (obj_id in self.counted_attendance_ids):
-                # Reverse crossing: person walked back out, re-arm for next entry
-                prev_pos = self.track_positions.get(obj_id)
-                if prev_pos is not None and self._segments_intersect(p1, p2, prev_pos, curr_pos):
-                    cp_prev = self._cross_product(p1, p2, prev_pos)
-                    cp_curr = self._cross_product(p1, p2, curr_pos)
-                    rev_crossed = False
-                    if direction == "forward":
-                        rev_crossed = (cp_prev <= 0 and cp_curr > 0)
-                    elif direction == "backward":
-                        rev_crossed = (cp_prev >= 0 and cp_curr < 0)
-                    elif direction == "top_to_bottom":
-                        rev_crossed = (curr_pos[1] < prev_pos[1])
-                    elif direction == "bottom_to_top":
-                        rev_crossed = (curr_pos[1] > prev_pos[1])
-                    elif direction == "both":
-                        rev_crossed = True
-                    if rev_crossed:
-                        self.counted_attendance_ids.discard(obj_id)
-                        if pid and pid in self.counted_person_ids:
-                            self.counted_person_ids.discard(pid)
-                        if getattr(self, "visitor_tracker", None) and self.is_entrance:
-                            self.visitor_tracker.record_visitor_exit(obj_id, time.time())
+                        elif rev_crossed:
+                            self.exit_flash_timer = 25
+                            self.active_visitor_visited_depts.clear()
+                            self.counted_attendance_ids.discard(obj_id)
+                            if pid and pid in self.counted_person_ids:
+                                self.counted_person_ids.discard(pid)
+                            if getattr(self, "visitor_tracker", None) and self.is_entrance:
+                                self.visitor_tracker.record_visitor_exit(obj_id, time.time())
 
             self.track_positions[obj_id] = curr_pos
 
@@ -1985,8 +1993,16 @@ class ZoneManager:
                         self.person_section_dwell[dwell_key] = self.person_section_dwell.get(dwell_key, 0) + 1
                         # Require at least 3 consecutive frames (~0.12s) to register genuine entry
                         if self.person_section_dwell[dwell_key] >= 3:
-                            if sid not in visited:
+                            # 1 visit per person during their showroom visit:
+                            # Avoid incrementing again if this person or active visitor already visited this department
+                            already_visited = (
+                                (sid in visited)
+                                or (sid in self.active_visitor_visited_depts)
+                                or (pid and pid in self.counted_person_sections.get(pid, set()))
+                            )
+                            if not already_visited:
                                 visited.add(sid)
+                                self.active_visitor_visited_depts.add(sid)
                                 if pid:
                                     self.counted_person_sections.setdefault(pid, set()).add(sid)
                                 self.section_totals[sid] = self.section_totals.get(sid, 0) + 1
@@ -1995,18 +2011,12 @@ class ZoneManager:
                     else:
                         if dwell_key in self.person_section_dwell:
                             self.person_section_dwell[dwell_key] = 0
-                        # Re-arm visit if person has been outside this section for >= 15 frames (~0.6s)
-                        if sid in visited:
-                            outside_key = (obj_id, f"{sid}_outside")
-                            outside_cnt = self.person_section_dwell.get(outside_key, 0) + 1
-                            self.person_section_dwell[outside_key] = outside_cnt
-                            if outside_cnt >= 15:
-                                visited.discard(sid)
-                                self.person_section_dwell.pop(outside_key, None)
 
         # Decrement flash timers
         if self.line_flash_timer > 0:
             self.line_flash_timer -= 1
+        if getattr(self, "exit_flash_timer", 0) > 0:
+            self.exit_flash_timer -= 1
         for sid in list(self.section_flash_timers.keys()):
             if self.section_flash_timers[sid] > 0:
                 self.section_flash_timers[sid] -= 1
@@ -2042,10 +2052,26 @@ class ZoneManager:
                     self.clear_all()
                     return
 
-            # Clicked on video area: start drawing
+            # Clicked on video area: start drawing with left mouse button
             self.is_mouse_down = True
             self.mouse_start = (x, y)
             self.mouse_current = (x, y)
+
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            # Right-click a department button on top bar to clear only that department's box
+            if 8 <= y <= 46:
+                for i, (bx1, by1, bx2, by2, sec) in enumerate(self.btn_sections):
+                    if bx1 <= x <= bx2:
+                        sec_id = sec["id"]
+                        found_sec = next((s for s in self.sections if s["id"] == sec_id), None)
+                        if found_sec:
+                            found_sec["box"] = [0, 0, 0, 0]
+                        self.status_msg = f"[*] Cleared box for {sec['name']}"
+                        self.status_timer = 150
+                        print(f"[*] Cleared box for {sec['name']}")
+                        self.save_to_config()
+                        self._sync_box_to_backend(sec_id, [0, 0, 0, 0])
+                        return
 
         elif event == cv2.EVENT_MOUSEMOVE and self.is_mouse_down:
             self.mouse_current = (x, y)
@@ -2104,9 +2130,11 @@ class ZoneManager:
         self.entry_line = None
         for s in self.sections:
             s["box"] = [0, 0, 0, 0]
+            self._sync_box_to_backend(s["id"], [0, 0, 0, 0])
         self.attendance_total = 0
         self.counted_attendance_ids.clear()
         self.counted_person_ids.clear()
+        self.active_visitor_visited_depts.clear()
         self.person_visited_sections.clear()
         self.counted_person_sections.clear()
         self.person_section_dwell.clear()
@@ -2183,7 +2211,7 @@ class ZoneManager:
         h, w = frame.shape[:2]
 
         # 1. Zero-Lag In-Place ROI Blending for User-Drawn Departments
-        if self.sections:
+        if self.sections and getattr(self, "show_boxes", True):
             for s in self.sections:
                 x1, y1, x2, y2 = s["box"]
                 if (x2 - x1) <= 15 or (y2 - y1) <= 15:
@@ -2220,18 +2248,31 @@ class ZoneManager:
             p2 = tuple(self.entry_line["p2"])
             direction = self.entry_line.get("direction", "forward")
             is_flashing = self.line_flash_timer > 0
-            line_color = (0, 255, 128) if is_flashing else (0, 215, 255)
-            line_thickness = 4 if is_flashing else 2
+            is_exit_flashing = getattr(self, "exit_flash_timer", 0) > 0
+            if is_exit_flashing:
+                line_color = (0, 165, 255)  # Orange for Exit
+                line_thickness = 4
+            elif is_flashing:
+                line_color = (0, 255, 128)  # Bright Green for Entry
+                line_thickness = 4
+            else:
+                line_color = (0, 215, 255)  # Cyan default
+                line_thickness = 2
 
             # Background drop-shadow line for contrast on any floor
             cv2.line(frame, p1, p2, (15, 23, 42), line_thickness + 2)
             cv2.line(frame, p1, p2, line_color, line_thickness)
 
             # Draw True Perpendicular Direction Arrow & High-Visibility Badge
-            ZoneManager._draw_entry_arrow(frame, p1, p2, direction, is_flashing, self.attendance_total)
+            ZoneManager._draw_entry_arrow(frame, p1, p2, direction, is_flashing or is_exit_flashing, self.attendance_total)
 
             dir_display = "BOTH" if direction == "both" else direction.upper()
-            line_label = f"*** ENTRY: {self.attendance_total} (+1) ***" if is_flashing else f"ENTRY LINE [{dir_display}] | Entry: {self.attendance_total}  (Press [D] to flip)"
+            if is_exit_flashing:
+                line_label = "*** VISITOR EXITED STORE ***"
+            elif is_flashing:
+                line_label = f"*** ENTRY: {self.attendance_total} (+1) ***"
+            else:
+                line_label = f"ENTRY LINE [{dir_display}] | Entry: {self.attendance_total}  (Press [D] to flip)"
             (lw, lh), _ = cv2.getTextSize(line_label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
             lx = max(10, min(p1[0], p2[0]) + 10)
             ly = max(75, min(p1[1], p2[1]) - 10)
@@ -2354,6 +2395,7 @@ class ThreadedRTSPReader:
             self.is_opened = True
 
     def _grab_loop(self):
+        failed_count = 0
         while not self.stop_event.is_set():
             if not self.cap or not self.cap.isOpened():
                 time.sleep(0.5)
@@ -2361,28 +2403,40 @@ class ThreadedRTSPReader:
             try:
                 ret, frame = self.cap.read()
             except Exception:
-                break
+                ret, frame = False, None
             if self.stop_event.is_set():
                 break
             if not ret or frame is None:
+                failed_count += 1
                 # Video file loop
                 if isinstance(self.source, str) and not self.source.startswith("rtsp://"):
                     try:
                         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     except Exception:
                         pass
+                elif isinstance(self.source, str) and self.source.startswith("rtsp://"):
+                    # Auto-reconnect after ~1.5s of consecutive dropped frames
+                    if failed_count > 100:
+                        failed_count = 0
+                        try:
+                            self.cap.release()
+                        except Exception:
+                            pass
+                        time.sleep(0.3)
+                        self._connect()
                 time.sleep(0.01)
                 continue
+            failed_count = 0
             with self.lock:
                 self.latest_frame = frame
 
     def read_latest(self) -> Tuple[bool, Optional[np.ndarray]]:
         with self.lock:
             if self.latest_frame is not None:
-                try:
-                    return True, self.latest_frame.copy()
-                except Exception:
-                    return True, self.latest_frame
+                # Hand over frame reference directly (cap.read allocates a new ndarray for every frame)
+                f = self.latest_frame
+                self.latest_frame = None
+                return True, f
             return False, None
 
     def release(self):
@@ -2936,6 +2990,11 @@ def run_local_detector(
     device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
+        try:
+            # Reserve max 42% VRAM (~1.7GB on 4GB GTX 1650) to allow concurrent camera processes without OOM
+            torch.cuda.set_per_process_memory_fraction(0.42, 0)
+        except Exception:
+            pass
     print(f"[*] Compute Device : {device.upper()} ({device_name})")
 
     def is_in_exclusion(bx1: float, by1: float, bx2: float, by2: float) -> bool:
@@ -3105,6 +3164,7 @@ def run_local_detector(
     )
     employee_dept_tracker = EmployeeDepartmentTracker(log_interval=10.0, exit_debounce=2.0)
     zone_manager.dept_tracker = employee_dept_tracker
+    cross_cam_tracker = CrossCameraTracker()
     sync_client = DashboardSyncClient(
         base_url=api_url,
         camera_id=camera_id,
@@ -3135,12 +3195,15 @@ def run_local_detector(
         blur_threshold=settings.FACE_BLUR_THRESHOLD,
     )
     sim_thresh = similarity_thresh if similarity_thresh is not None else settings.FACE_SIMILARITY_THRESHOLD
-    visitor_vector_store = PgVectorStoreManager(db=db_session, similarity_threshold=sim_thresh)
+    # Employee recognition keeps sim_thresh (0.32) for high recall against enrolled staff
+    # Visitor re-identification uses strict 0.55 so distinct customers are minted separate IDs
+    visitor_sim_thresh = 0.55
+    visitor_vector_store = PgVectorStoreManager(db=db_session, similarity_threshold=visitor_sim_thresh)
     employee_vector_store = PgVectorStoreManager(db=db_session, similarity_threshold=sim_thresh)
     identity_manager = IdentityRecoveryManager(
         embedder=face_embedder,
         vector_store=visitor_vector_store,
-        similarity_threshold=sim_thresh,
+        similarity_threshold=visitor_sim_thresh,
         max_attempts=5,
         cooldown_frames=6,
     )
@@ -3219,13 +3282,39 @@ def run_local_detector(
         while True:
             ret, frame = reader.read_latest()
             if not ret or frame is None:
-                time.sleep(0.01)
+                if not headless:
+                    # Pump Windows GUI event loop so OpenCV window never gets marked as 'Not Responding'
+                    k = cv2.waitKey(10) & 0xFF
+                    if k in (ord('q'), ord('Q'), 27):
+                        break
+                else:
+                    time.sleep(0.01)
                 continue
 
-            # Keep pristine clean frame for high-res body portrait extraction (before any HUD drawing)
-            clean_frame = frame.copy()
-
             frame_counter += 1
+
+            # On-demand clean frame cache for crisp portrait crops (avoids redundant 2.64MB allocations per frame)
+            clean_frame = None
+
+            def get_clean_frame() -> np.ndarray:
+                nonlocal clean_frame
+                if clean_frame is None:
+                    try:
+                        clean_frame = frame.copy()
+                    except (MemoryError, Exception):
+                        clean_frame = frame
+                return clean_frame
+
+            # Periodic memory compaction every 150 frames (~5-6s) to prevent Windows heap fragmentation
+            if frame_counter % 150 == 0:
+                import gc
+                gc.collect(1)
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
             # Check for dynamic dashboard updates to camera_config.json every 90 frames (~3s)
             if frame_counter % 90 == 0:
@@ -3761,7 +3850,7 @@ def run_local_detector(
 
                                 # Full-body high-clarity visitor snapshot extraction from pristine clean frame
                                 try:
-                                    body_crop = extract_visitor_body_crop(clean_frame, (x1, y1, x2, y2))
+                                    body_crop = extract_visitor_body_crop(get_clean_frame(), (x1, y1, x2, y2))
                                     if body_crop is not None and body_crop.size > 0:
                                         q_score = compute_face_photo_quality(
                                             face_crop=face_crop,
@@ -3810,7 +3899,7 @@ def run_local_detector(
                                             if ret_enc:
                                                 import base64
                                                 b64_crop = base64.b64encode(buf_enc).decode('utf-8')
-                                                clothing_color = estimate_torso_appearance(clean_frame, (x1, y1, x2, y2))
+                                                clothing_color = estimate_torso_appearance(get_clean_frame(), (x1, y1, x2, y2))
                                                 cur_sec_match = zone_manager.find_section_for_box((x1, y1, x2, y2))
                                                 cur_sec_zone = cur_sec_match[1] if cur_sec_match else "Main Showroom"
                                                 track_emb = identity_manager.track_embeddings.get(str(obj_id))
@@ -3942,16 +4031,35 @@ def run_local_detector(
                     emp_display = employee_names.get(emp_id, emp_id)
                     visible_staff_this_frame.add(emp_id)
 
+                    # Cross-camera synchronization: Maintain unified track ID & continuous arrival timer
+                    global_track_id, global_first_ts = cross_cam_tracker.get_or_register_staff(
+                        emp_id=emp_id,
+                        emp_name=emp_display,
+                        local_track_id=obj_id,
+                        local_start_ts=track_start_times.get(obj_id, now_ts),
+                        camera_channel=camera_channel,
+                        now_ts=now_ts,
+                    )
+                    display_id = global_track_id if global_track_id is not None else obj_id
+                    staff_timer_str = timer_str
+                    if global_first_ts is not None:
+                        s_dwell = max(0.0, now_ts - global_first_ts)
+                        s_tot = int(s_dwell)
+                        s_h = s_tot // 3600
+                        s_m = (s_tot % 3600) // 60
+                        s_s = s_tot % 60
+                        staff_timer_str = f"{s_h}:{s_m:02d}:{s_s:02d}" if s_h > 0 else f"{s_m:02d}:{s_s:02d}"
+
                     # Update employee department dwell and live timer
                     staff_dept = zone_manager.find_section_for_box((x1, y1, x2, y2))
-                    employee_dept_tracker.update_employee_presence(emp_id, emp_display, staff_dept, now_ts, track_id=str(obj_id))
+                    employee_dept_tracker.update_employee_presence(emp_id, emp_display, staff_dept, now_ts, track_id=str(display_id))
 
                     dwell_info = employee_dept_tracker.get_active_dwell_info(emp_id, now_ts)
                     if dwell_info:
                         d_name, d_dig, _ = dwell_info
-                        main_label = f"STAFF [{emp_display}] #{obj_id} | In {d_name}: {d_dig} | {timer_str}"
+                        main_label = f"STAFF [{emp_display}] #{display_id} | In {d_name}: {d_dig} | {staff_timer_str}"
                     else:
-                        main_label = f"STAFF [{emp_display}] #{obj_id} | {timer_str}"
+                        main_label = f"STAFF [{emp_display}] #{display_id} | {staff_timer_str}"
                     body_color = (0, 215, 255)  # Vivid Golden Yellow for verified showroom staff
                     cv2.rectangle(frame, (ix1, iy1), (ix2, iy2), body_color, 2)
                 else:
@@ -3959,21 +4067,42 @@ def run_local_detector(
                     employee_dept_tracker.update_unconfirmed_track(str(obj_id), cand_dept, now_ts)
                     pid_val = identity_manager.get_person_id(obj_id)
                     visitor_zone_tracker.update_visitor_zone(obj_id, cand_dept, now_ts, person_id=pid_val)
+
+                    display_id = obj_id
+                    vis_timer_str = timer_str
+                    if pid_val:
+                        v_global_id, v_first_ts = cross_cam_tracker.get_or_register_visitor(
+                            person_id=pid_val,
+                            local_track_id=obj_id,
+                            local_start_ts=track_start_times.get(obj_id, now_ts),
+                            camera_channel=camera_channel,
+                            now_ts=now_ts,
+                        )
+                        if v_global_id is not None:
+                            display_id = v_global_id
+                        if v_first_ts is not None:
+                            v_dwell = max(0.0, now_ts - v_first_ts)
+                            v_tot = int(v_dwell)
+                            v_h = v_tot // 3600
+                            v_m = (v_tot % 3600) // 60
+                            v_s = v_tot % 60
+                            vis_timer_str = f"{v_h}:{v_m:02d}:{v_s:02d}" if v_h > 0 else f"{v_m:02d}:{v_s:02d}"
+
                     pid_desc = f" | {pid_val}" if pid_val else " | PID: Unresolved"
                     zone_desc = f" | {cand_dept[1]}" if cand_dept else ""
-                    main_label = f"Person #{obj_id}{pid_desc}{zone_desc} | {timer_str}"
+                    main_label = f"Person #{display_id}{pid_desc}{zone_desc} | {vis_timer_str}"
 
                     # Guaranteed Photo Capture: ONLY for confirmed visitors who crossed the entry line
                     if obj_id in confirmed_visitor_tracks and obj_id not in notified_track_ids and (now_ts - track_start_times.get(obj_id, now_ts)) >= 0.25:
                         notified_track_ids.add(obj_id)
                         try:
-                            body_portrait = extract_visitor_body_crop(clean_frame, (x1, y1, x2, y2))
+                            body_portrait = extract_visitor_body_crop(get_clean_frame(), (x1, y1, x2, y2))
                             if body_portrait is not None and body_portrait.size > 0:
                                 ret_b, buf_b = cv2.imencode('.jpg', body_portrait, [cv2.IMWRITE_JPEG_QUALITY, 95])
                                 if ret_b:
                                     import base64
                                     b64_b = base64.b64encode(buf_b).decode('utf-8')
-                                    clothing = estimate_torso_appearance(clean_frame, (x1, y1, x2, y2))
+                                    clothing = estimate_torso_appearance(get_clean_frame(), (x1, y1, x2, y2))
                                     z_name = cand_dept[1] if cand_dept else "Main Showroom"
                                     track_emb = identity_manager.track_embeddings.get(str(obj_id))
                                     if track_emb is None and isinstance(obj_id, int):
@@ -4094,7 +4223,7 @@ def run_local_detector(
                     if port_img is None:
                         c_box = tracked_objects.get(cid, cdata.get("box"))
                         if c_box is not None:
-                            port_img = extract_visitor_body_crop(clean_frame, c_box)
+                            port_img = extract_visitor_body_crop(get_clean_frame(), c_box)
 
                     if port_img is not None and port_img.size > 0:
                         try:
@@ -4103,7 +4232,7 @@ def run_local_detector(
                                 import base64
                                 b64_v = base64.b64encode(buf_v).decode('utf-8')
                                 c_box_now = tracked_objects.get(cid, cdata.get("box"))
-                                clothing = estimate_torso_appearance(clean_frame, c_box_now) if c_box_now else "Walk-in Visitor"
+                                clothing = estimate_torso_appearance(get_clean_frame(), c_box_now) if c_box_now else "Walk-in Visitor"
                                 sec_m = zone_manager.find_section_for_box(c_box_now) if c_box_now else None
                                 z_name = sec_m[1] if sec_m else "Main Showroom"
                                 track_emb = identity_manager.track_embeddings.get(str(cid))
@@ -4325,7 +4454,7 @@ def run_local_detector(
                 stats_text = (
                     f"{hw_tag} FPS: {fps:.1f}  |  "
                     f"Visitors: {zone_manager.attendance_total}{sec_str}{staff_hud_str}  |  "
-                    f"Keys: [1] Line{sec_shortcut_str} [D] Flip Dir  [C] Reset  [R] Clear"
+                    f"Keys: [1] Line{sec_shortcut_str} [D] Flip Dir  [B] Box  [C] Reset  [R] Clear"
                 )
                 cv2.putText(frame, stats_text, (15, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 225, 255), 1, cv2.LINE_AA)
 
@@ -4348,6 +4477,12 @@ def run_local_detector(
                     print(f"[*] Tool switched to: [{s['name']}]")
             elif key in (ord('d'), ord('D')):
                 zone_manager.flip_direction()
+            elif key in (ord('b'), ord('B')):
+                zone_manager.show_boxes = not getattr(zone_manager, "show_boxes", True)
+                state_str = "SHOWN" if zone_manager.show_boxes else "HIDDEN"
+                zone_manager.status_msg = f"[*] Department overlay boxes: {state_str} (Press [B] to toggle)"
+                zone_manager.status_timer = 140
+                print(f"[*] Department overlay boxes: {state_str}")
             elif key in (ord('c'), ord('C')):
                 zone_manager.reset_counts()
             elif key in (ord('r'), ord('R'), ord('x'), ord('X')):
