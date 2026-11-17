@@ -60,6 +60,61 @@ const getSvgPath = (pts: { x: number; y: number }[]): string => {
   return d;
 };
 
+// Interactive Info (i) Tooltip/Popover for Dashboard Metric Cards
+const MetricInfoTooltip: React.FC<{
+  title: string;
+  description: string;
+  alignRight?: boolean;
+}> = ({ title, description, alignRight = false }) => {
+  const [isPinned, setIsPinned] = useState(false);
+
+  return (
+    <div className="relative inline-flex items-center group/info">
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          setIsPinned(!isPinned);
+        }}
+        className="p-1 rounded-full text-slate-400 hover:text-slate-700 hover:bg-slate-200/60 transition-colors focus:outline-none"
+        title={title}
+        aria-label={`Information about ${title}`}
+      >
+        <Info className="w-3.5 h-3.5" />
+      </button>
+
+      {/* Floating Explanatory Popover */}
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className={`absolute z-50 ${
+          alignRight ? 'right-0' : 'left-0'
+        } top-full mt-1.5 w-60 p-3 bg-slate-900/95 backdrop-blur-md text-white rounded-2xl shadow-xl border border-slate-700 text-left transition-all duration-150 pointer-events-auto ${
+          isPinned ? 'block' : 'hidden group-hover/info:block'
+        }`}
+      >
+        <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-slate-800">
+          <span className="text-xs font-bold font-['Outfit'] text-white flex items-center gap-1.5">
+            <Info className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+            <span>{title}</span>
+          </span>
+          {isPinned && (
+            <button
+              type="button"
+              onClick={() => setIsPinned(false)}
+              className="text-slate-400 hover:text-white p-0.5 rounded"
+            >
+              <X className="w-3 h-3" />
+            </button>
+          )}
+        </div>
+        <p className="text-[11px] text-slate-300 mt-2 leading-relaxed">
+          {description}
+        </p>
+      </div>
+    </div>
+  );
+};
+
 export const OverviewView: React.FC<OverviewViewProps> = ({
   onNavigateTab,
   onTagVisitor,
@@ -171,6 +226,38 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
         </div>
       </div>
 
+      {/* 🚨 CRITICAL UNATTENDED WAITING CUTOFF BREACH ALERT (> 15 MINS) */}
+      {metrics.waitingBreachCount > 0 && (
+        <div className="bg-gradient-to-r from-red-600 via-rose-600 to-red-700 text-white rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 shadow-lg shadow-red-600/25 border-2 border-red-400 animate-pulse">
+          <div className="flex items-start gap-3.5">
+            <div className="p-2.5 bg-white/20 text-white rounded-xl shrink-0 mt-0.5 border border-white/30">
+              <AlertTriangle className="w-6 h-6 text-white" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-white text-red-700">
+                  Critical SLA Breach (&gt; 15 Mins)
+                </span>
+                <span className="w-2.5 h-2.5 rounded-full bg-white animate-ping" />
+              </div>
+              <h2 className="text-base font-extrabold font-['Outfit'] mt-1">
+                {metrics.waitingBreachCount} Customer{metrics.waitingBreachCount > 1 ? 's' : ''} Waiting Unassisted for Over 15 Minutes!
+              </h2>
+              <p className="text-xs text-red-100 mt-0.5">
+                Immediate showroom floor action required: No salesperson is near the visitor, and they are outside any department desk.
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => onNavigateTab('visitors')}
+            className="px-4 py-2.5 bg-white hover:bg-red-50 text-red-700 hover:text-red-800 text-xs font-bold rounded-xl shadow-md transition-all shrink-0 active:scale-[0.98] flex items-center gap-1.5"
+          >
+            <span>Dispatch Sales Rep Now</span>
+            <ChevronRight className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
       {/* Untagged Alert Banner if any exist */}
       {metrics.untaggedCount > 0 && (
         <div className="bg-gradient-to-r from-amber-50 to-orange-50/60 border border-amber-200/90 rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs animate-fadeIn">
@@ -234,7 +321,13 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
           {/* Total Visitors Today */}
           <div className="p-5 rounded-2xl bg-gradient-to-br from-blue-50/70 via-slate-50/40 to-white border border-blue-200/70 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-200 group">
             <div className="flex items-center justify-between mb-3">
-              <span className="text-xs font-bold text-blue-900 uppercase tracking-wider">Total Visitors Today</span>
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs font-bold text-blue-900 uppercase tracking-wider">Total Visitors Today</span>
+                <MetricInfoTooltip
+                  title="Total Visitors Today"
+                  description="Total distinct customer walk-ins detected entering the showroom today during operational hours."
+                />
+              </div>
               <div className="p-2 rounded-xl bg-blue-100/70 text-blue-700 border border-blue-200/60 group-hover:scale-110 transition-transform">
                 <Users className="w-4 h-4" />
               </div>
@@ -258,7 +351,13 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
           {/* New Visitors */}
           <div className="p-5 rounded-2xl bg-gradient-to-br from-emerald-50/70 via-slate-50/40 to-white border border-emerald-200/70 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-200 group">
             <div className="flex items-center justify-between mb-3">
-              <span className="text-xs font-bold text-emerald-950 uppercase tracking-wider">New Visitors</span>
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs font-bold text-emerald-950 uppercase tracking-wider">New Visitors</span>
+                <MetricInfoTooltip
+                  title="New Visitors"
+                  description="First-time customers entering the showroom with no prior biometric record in the 14-day history."
+                />
+              </div>
               <div className="p-2 rounded-xl bg-emerald-100/70 text-emerald-700 border border-emerald-200/60 group-hover:scale-110 transition-transform">
                 <Sparkles className="w-4 h-4" />
               </div>
@@ -277,7 +376,13 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
           {/* Returning Visitors */}
           <div className="p-5 rounded-2xl bg-gradient-to-br from-indigo-50/70 via-slate-50/40 to-white border border-indigo-200/70 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-200 group">
             <div className="flex items-center justify-between mb-3">
-              <span className="text-xs font-bold text-indigo-950 uppercase tracking-wider">Returning Visitors</span>
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs font-bold text-indigo-950 uppercase tracking-wider">Returning Visitors</span>
+                <MetricInfoTooltip
+                  title="Returning Visitors"
+                  description="Repeat customers who previously visited the showroom (for follow-ups, test rides, or delivery)."
+                />
+              </div>
               <div className="p-2 rounded-xl bg-indigo-100/70 text-indigo-700 border border-indigo-200/60 group-hover:scale-110 transition-transform">
                 <UserCheck className="w-4 h-4" />
               </div>
@@ -296,7 +401,14 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
           {/* Comparison with Yesterday */}
           <div className="p-5 rounded-2xl bg-gradient-to-br from-amber-50/70 via-slate-50/40 to-white border border-amber-200/70 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-200 group">
             <div className="flex items-center justify-between mb-3">
-              <span className="text-xs font-bold text-amber-950 uppercase tracking-wider">Day-over-Day</span>
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs font-bold text-amber-950 uppercase tracking-wider">Day-over-Day</span>
+                <MetricInfoTooltip
+                  title="Day-over-Day Footfall Growth"
+                  description="Percentage comparison of today's customer footfall relative to total visitors yesterday."
+                  alignRight={true}
+                />
+              </div>
               <div className="p-2 rounded-xl bg-amber-100/70 text-amber-700 border border-amber-200/60 group-hover:scale-110 transition-transform">
                 <TrendingUp className="w-4 h-4" />
               </div>

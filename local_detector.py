@@ -1356,9 +1356,10 @@ class VisitorZoneTracker:
       with the backend CRM and Tag Visitor modal card.
     - Automatically marks departure time and zone breakdown when visitors leave the camera view.
     """
-    def __init__(self, sync_client: Optional[Any] = None, sync_interval: float = 4.0):
+    def __init__(self, sync_client: Optional[Any] = None, sync_interval: float = 4.0, waiting_cutoff_seconds: float = 900.0):
         self.sync_client = sync_client
         self.sync_interval = float(sync_interval)
+        self.waiting_cutoff_seconds = float(waiting_cutoff_seconds)
         # track_key -> session dict
         self.sessions: Dict[str, dict] = {}
         self.track_to_pid: Dict[int, str] = {}
@@ -1389,6 +1390,7 @@ class VisitorZoneTracker:
         current_dept: Optional[Tuple[str, str]],
         now_ts: float,
         person_id: Optional[str] = None,
+        is_employee_nearby: bool = False,
     ) -> None:
         if person_id:
             self.track_to_pid[track_id] = str(person_id)
@@ -1396,6 +1398,15 @@ class VisitorZoneTracker:
 
         tid_str = str(track_id)
         zone_name = current_dept[1] if current_dept else "Main Showroom"
+        is_in_dept = (current_dept is not None)
+
+        # -------------------------------------------------------------------
+        # 2-Parameter Waiting Time Logic:
+        # 1. No employee within defined radius (is_employee_nearby is False)
+        # 2. Visitor is NOT in any department box (is_in_dept is False)
+        # Both conditions must be True for the waiting timer to accumulate.
+        # -------------------------------------------------------------------
+        is_waiting_now = (not is_employee_nearby) and (not is_in_dept)
 
         if tid_str not in self.sessions:
             self.sessions[tid_str] = {
@@ -1406,6 +1417,9 @@ class VisitorZoneTracker:
                 "current_zone": zone_name,
                 "zone_dwell": {zone_name: 0.0},
                 "last_log_ts": now_ts,
+                "waiting_seconds": 0.0,
+                "is_waiting": is_waiting_now,
+                "waiting_breach": False,
             }
         else:
             session = self.sessions[tid_str]
@@ -1422,14 +1436,33 @@ class VisitorZoneTracker:
                 if zone_name not in session["zone_dwell"]:
                     session["zone_dwell"][zone_name] = 0.0
 
+            # Accumulate waiting time if BOTH conditions hold true
+            session["is_waiting"] = is_waiting_now
+            if is_waiting_now:
+                session["waiting_seconds"] = session.get("waiting_seconds", 0.0) + delta
+                if session["waiting_seconds"] >= self.waiting_cutoff_seconds:
+                    if not session.get("waiting_breach"):
+                        session["waiting_breach"] = True
+                        disp_id = pid or f"#{track_id}"
+                        print(
+                            f"[🚨 UNATTENDED SLA BREACH > 15m] Visitor {disp_id} has been waiting unassisted for "
+                            f"{self.format_duration(session['waiting_seconds'])}! Immediate staff assistance needed!"
+                        )
+
             # Log dwell every 10 seconds
             if now_ts - session.get("last_log_ts", 0.0) >= 10.0:
                 session["last_log_ts"] = now_ts
                 z_time = session["zone_dwell"].get(zone_name, 0.0)
                 disp_id = pid or f"#{track_id}"
+                w_sec = session.get("waiting_seconds", 0.0)
+                w_status = (
+                    f" | ⏱️ WAITING: {self.format_duration(w_sec)}"
+                    if is_waiting_now
+                    else f" | [ATTENDED - Waited: {self.format_duration(w_sec)}]"
+                )
                 print(
                     f"[⏱️ VISITOR IN ZONE] Visitor {disp_id} in '{zone_name}' | "
-                    f"Time spent in zone: {self.format_duration(z_time)}"
+                    f"Time spent in zone: {self.format_duration(z_time)}{w_status}"
                 )
 
         # Sync to backend periodically
@@ -1437,6 +1470,17 @@ class VisitorZoneTracker:
         if (now_ts - last_sync) >= self.sync_interval:
             self.last_sync_times[tid_str] = now_ts
             self._sync_session(self.sessions[tid_str], now_ts, is_departure=False)
+
+    def get_waiting_info(self, track_id: int) -> Tuple[int, bool, bool, str]:
+        """Returns (waiting_seconds, is_waiting, waiting_breach, formatted_str)."""
+        tid_str = str(track_id)
+        session = self.sessions.get(tid_str)
+        if not session:
+            return (0, False, False, "0s")
+        w_sec = int(round(session.get("waiting_seconds", 0.0)))
+        is_w = bool(session.get("is_waiting", False))
+        is_breach = bool(session.get("waiting_breach", False) or (w_sec >= self.waiting_cutoff_seconds))
+        return (w_sec, is_w, is_breach, self.format_duration(w_sec))
 
     def on_visitor_lost(self, track_id: int, now_ts: float) -> None:
         tid_str = str(track_id)
@@ -1507,12 +1551,19 @@ class VisitorZoneTracker:
                 f"Zone dwell breakdown: {dwell_desc}"
             )
 
+        w_sec = int(round(session.get("waiting_seconds", 0.0)))
+        is_w = bool(session.get("is_waiting", False))
+        is_breach = bool(session.get("waiting_breach", False) or (w_sec >= self.waiting_cutoff_seconds))
+
         payload = {
             "person_id": pid,
             "tracker_id": tid_str,
             "current_zone": top_zone,
             "zone_dwell": formatted_dwell,
             "exit_time": exit_time,
+            "waiting_seconds": w_sec,
+            "is_waiting": is_w,
+            "waiting_breach": is_breach,
         }
         self.sync_client.send_visitor_zone_update(payload)
 
@@ -2957,6 +3008,7 @@ def run_local_detector(
     rf_detr_variant: str = "medium",
     is_entrance: bool = False,
     camera_name: str = "Showroom Camera",
+    waiting_cutoff_seconds: float = 900.0,
 ):
     print("=" * 70)
     print("  CAPERMINT SHOWROOM INTELLIGENCE - LOCAL AI EDGE DETECTOR")
@@ -3171,7 +3223,12 @@ def run_local_detector(
         camera_name=camera_name,
         is_entrance=is_entrance,
     )
-    visitor_zone_tracker = VisitorZoneTracker(sync_client=sync_client, sync_interval=4.0)
+    waiting_cutoff_sec = float(waiting_cutoff_seconds or 900.0)
+    visitor_zone_tracker = VisitorZoneTracker(
+        sync_client=sync_client,
+        sync_interval=4.0,
+        waiting_cutoff_seconds=waiting_cutoff_sec,
+    )
     zone_manager.visitor_tracker = visitor_zone_tracker
 
     # Face Embedding & Identity Recovery System (ArcFace + pgvector + 14-Day Retention)
@@ -3639,6 +3696,33 @@ def run_local_detector(
             matched_faces_count = 0
             embeddings_extracted_this_frame = 0 
             visible_staff_this_frame: Set[str] = set()
+
+            # Pre-collect active confirmed staff boxes for perspective-aware ground-plane proximity checks
+            active_staff_boxes = []
+            for tid, box in tracked_objects.items():
+                if employee_recognizer.is_track_employee(str(tid)):
+                    active_staff_boxes.append(box)
+
+            def is_staff_near_box(v_box, staff_boxes, radius_m=2.2):
+                if not staff_boxes:
+                    return False
+                vx1, vy1, vx2, vy2 = v_box
+                v_feet_x = (vx1 + vx2) * 0.5
+                v_feet_y = vy2
+                v_h = max(15.0, vy2 - vy1)
+                for (sx1, sy1, sx2, sy2) in staff_boxes:
+                    s_feet_x = (sx1 + sx2) * 0.5
+                    s_feet_y = sy2
+                    s_h = max(15.0, sy2 - sy1)
+                    avg_h = (v_h + s_h) * 0.5
+                    px_per_m = max(1.0, avg_h / 1.70)
+                    dx = v_feet_x - s_feet_x
+                    dy = v_feet_y - s_feet_y
+                    dist_m = math.hypot(dx, dy) / px_per_m
+                    if dist_m <= radius_m:
+                        return True
+                return False
+
             for obj_id, (x1, y1, x2, y2) in tracked_objects.items():
                 ix1, iy1, ix2, iy2 = int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))
                 box_w = max(1, ix2 - ix1)
@@ -4061,12 +4145,21 @@ def run_local_detector(
                     else:
                         main_label = f"STAFF [{emp_display}] #{display_id} | {staff_timer_str}"
                     body_color = (0, 215, 255)  # Vivid Golden Yellow for verified showroom staff
+                    badge_bg = (15, 23, 42)
+                    badge_border = (0, 215, 255)
+                    is_breach = False
                     cv2.rectangle(frame, (ix1, iy1), (ix2, iy2), body_color, 2)
                 else:
                     cand_dept = zone_manager.find_section_for_box((x1, y1, x2, y2))
                     employee_dept_tracker.update_unconfirmed_track(str(obj_id), cand_dept, now_ts)
                     pid_val = identity_manager.get_person_id(obj_id)
-                    visitor_zone_tracker.update_visitor_zone(obj_id, cand_dept, now_ts, person_id=pid_val)
+
+                    # Ground-plane perspective proximity to nearest staff
+                    is_emp_near = is_staff_near_box((x1, y1, x2, y2), active_staff_boxes, radius_m=2.2)
+                    visitor_zone_tracker.update_visitor_zone(
+                        obj_id, cand_dept, now_ts, person_id=pid_val, is_employee_nearby=is_emp_near
+                    )
+                    w_sec, is_waiting, is_breach, w_fmt = visitor_zone_tracker.get_waiting_info(obj_id)
 
                     display_id = obj_id
                     vis_timer_str = timer_str
@@ -4090,7 +4183,34 @@ def run_local_detector(
 
                     pid_desc = f" | {pid_val}" if pid_val else " | PID: Unresolved"
                     zone_desc = f" | {cand_dept[1]}" if cand_dept else ""
-                    main_label = f"Person #{display_id}{pid_desc}{zone_desc} | {vis_timer_str}"
+
+                    if is_breach:
+                        body_color = (0, 0, 255)  # 🚨 BRIGHT RED BOX (Cutoff > 15m Breached!)
+                        badge_bg = (0, 0, 180)    # Red header badge
+                        badge_border = (0, 0, 255)
+                        main_label = f"🚨 UNATTENDED > 15m [{w_fmt}] #{display_id}{pid_desc}"
+                    elif is_waiting and w_sec >= 300:
+                        body_color = (0, 140, 255)  # Amber warning (5-15 mins)
+                        badge_bg = (15, 23, 42)
+                        badge_border = (0, 140, 255)
+                        main_label = f"⚠️ WAITING [{w_fmt}] #{display_id}{pid_desc}"
+                    elif is_waiting:
+                        body_color = (0, 240, 110)  # Emerald Green
+                        badge_bg = (15, 23, 42)
+                        badge_border = (0, 240, 110)
+                        main_label = f"⏱️ WAITING [{w_fmt}] #{display_id}{pid_desc}"
+                    elif w_sec > 10:
+                        body_color = (0, 240, 110)
+                        badge_bg = (15, 23, 42)
+                        badge_border = (0, 240, 110)
+                        main_label = f"Person #{display_id}{pid_desc} | Waited {w_fmt} | {vis_timer_str}"
+                    else:
+                        body_color = (0, 240, 110)
+                        badge_bg = (15, 23, 42)
+                        badge_border = (0, 240, 110)
+                        main_label = f"Person #{display_id}{pid_desc}{zone_desc} | {vis_timer_str}"
+
+                    cv2.rectangle(frame, (ix1, iy1), (ix2, iy2), body_color, 3 if is_breach else 2)
 
                     # Guaranteed Photo Capture: ONLY for confirmed visitors who crossed the entry line
                     if obj_id in confirmed_visitor_tracks and obj_id not in notified_track_ids and (now_ts - track_start_times.get(obj_id, now_ts)) >= 0.25:
@@ -4148,10 +4268,10 @@ def run_local_detector(
                     by_bot = iy1 + badge_h
                     text_y = iy1 + 15
 
-                # Draw high-contrast sleek dark badge
-                badge_border = (255, 30, 220) if face_tag else body_color
-                cv2.rectangle(frame, (ix1, by_top), (ix1 + badge_w, by_bot), (15, 23, 42), -1)
-                cv2.rectangle(frame, (ix1, by_top), (ix1 + badge_w, by_bot), badge_border, 1)
+                # Draw high-contrast sleek dark badge (or RED badge if SLA breach)
+                badge_border_final = (255, 30, 220) if face_tag else badge_border
+                cv2.rectangle(frame, (ix1, by_top), (ix1 + badge_w, by_bot), badge_bg, -1)
+                cv2.rectangle(frame, (ix1, by_top), (ix1 + badge_w, by_bot), badge_border_final, 2 if (not is_staff and is_breach) else 1)
 
                 # Draw ID and Timer (white)
                 cv2.putText(
@@ -4804,6 +4924,11 @@ def main():
     resolved_standalone_faces = bool(selected_cam.get("allow_standalone_faces", args.standalone_faces)) if selected_cam and "allow_standalone_faces" in selected_cam else args.standalone_faces
     resolved_is_entrance = bool(selected_cam.get("is_entrance", resolved_channel == "101")) if selected_cam else (resolved_channel == "101")
     resolved_camera_name = selected_cam.get("name", f"Showroom Camera {resolved_channel}") if selected_cam else f"Showroom Camera {resolved_channel}"
+    resolved_cutoff = (
+        float(selected_cam.get("waiting_cutoff_seconds", config.get("waiting_cutoff_seconds", 900.0)))
+        if selected_cam
+        else float(config.get("waiting_cutoff_seconds", 900.0))
+    )
 
     run_local_detector(
         source=resolved_source,
@@ -4838,6 +4963,7 @@ def main():
         rf_detr_variant=args.rf_detr_variant,
         is_entrance=resolved_is_entrance,
         camera_name=resolved_camera_name,
+        waiting_cutoff_seconds=resolved_cutoff,
     )
 
 

@@ -67,6 +67,18 @@ Detailed architectural flows, mathematical models, and sequence diagrams are doc
   - **`VisitorZoneTracker`**: Continuously tracks customer movement and accumulates dwell time across custom departments (e.g. Sales Section, Luxury Lounge, Diamond Counter) and the general showroom floor (`Main Showroom`).
   - **Live Dwell Formatting & Periodic Sync**: Synchronizes formatted durations (e.g. `12m 45s`, `35s`) with FastAPI backend (`POST /api/v1/visitors/update-zone`) every 4.0 seconds.
   - **Directional Reverse Exit Detection**: Crossing the entrance line in reverse detects visitor departure in Indian Standard Time (IST, UTC+05:30), logs final dwell breakdown across all visited zones, and persists departure time to CRM.
+- **Visitor Waiting Timer & Unattended SLA Breach Monitoring**:
+  - **Perspective-Calibrated Staff Proximity Filter (`is_staff_near_box`)**: Dynamically measures ground-plane distance in meters between visitor feet and staff feet using bounding box height scaling ($\text{Scale}_{\text{px/m}} = \frac{\bar{h}}{1.70}$). A visitor within $2.2\text{ m}$ is considered actively attended.
+  - **2-Parameter Unattended Logic**: Customer waiting time accumulates only when the visitor is **unassisted** (no staff within $2.2\text{ m}$) **and outside any designated department counter box**.
+  - **Three-Tier Visual HUD Alerting**:
+    - **Normal Waiting ($< 5\text{ mins}$)**: Neon Emerald Green bounding box `(0, 240, 110)` with `⏱️ WAITING [MMm SSs]`.
+    - **Amber Warning ($5\text{ to }15\text{ mins}$)**: Amber border `(0, 140, 255)` with `⚠️ WAITING [MMm SSs]` to alert floor staff.
+    - **Critical SLA Breach ($> 15\text{ mins}$ / $900\text{s}$)**: Bright Red alert box `(0, 0, 255)` and red badge `🚨 UNATTENDED > 15m [MMm SSs]` with immediate console alarm.
+  - **Dashboard SLA Breach & Waiting Badges**: Live counters, waiting duration pills, and unattended alerts surfaced across `OverviewView`, `VisitorsView`, and `VisitPurposeView`.
+- **Dynamic Multi-Camera Handover & Cross-Camera Re-Identification**:
+  - **CrossCameraTracker & Global Identity Synchronization**: Coordinates tracks between entrance cameras (`is_entrance: true`) and interior section cameras (`is_entrance: false`) via `.cross_camera_state.json`.
+  - **ArcFace Cosine Matching ($\ge 0.55$)**: Re-identifies customers moving from entrance to floor sections without creating duplicate footfall counts.
+  - **Isolated GPU VRAM Allocation**: Automatic memory fraction limit ($42\%$) ensures multi-camera instances run concurrently on 4GB consumer GPUs without OOM errors.
 - **Dynamic Camera Configuration & Edge Hot-Reloading**:
   - **Full Web UI Management**: Configure RTSP feeds, camera names, confidence thresholds, and entry lines directly in the React Dashboard via `CameraSettingsSection.tsx`.
   - **Pre-Flight Stream Testing**: Dedicated `/api/v1/cameras/test-stream` endpoint opens OpenCV streams on demand to verify connectivity, resolution ($W\times H$), and framerate (FPS) before deployment.
@@ -149,6 +161,7 @@ jms/
 │   ├── vision/                          # Server-side vision pipeline & stream readers
 │   │   ├── detector.py                  # RF-DETR & YOLO model wrapper
 │   │   ├── tracker.py                   # Multi-object tracker integration
+│   │   ├── cross_camera_tracker.py      # Cross-camera entity coordination & global ID state
 │   │   ├── face_embedder.py             # ArcFace 512-D embedding extractor
 │   │   ├── employee_recognizer.py       # Biometric matching & voting manager
 │   │   └── vector_store.py              # pgvector search manager
@@ -182,6 +195,12 @@ jms/
 │   └── uploads/
 │       ├── employees/                   # Registered employee gallery photos
 │       └── visitors/                    # 320x320 retina visitor portrait crops
+├── tests/                               # Comprehensive Automated Test Suites
+│   ├── test_waiting_timer.py            # Unit tests for waiting timer & SLA breach
+│   ├── test_cross_camera_tracker.py     # Cross-camera tracking & re-ID tests
+│   ├── test_returning_visitor.py        # Returning visitor recognition tests
+│   └── test_identity_and_retention.py   # 14-day retention & biometric purge tests
+├── .cross_camera_state.json             # Cross-camera persistent state registry
 ├── alembic/                             # Database migration scripts
 ├── local_detector.py                    # Standalone Local Edge AI Video Processing Engine
 ├── start_detector.bat                   # 1-Click Windows Batch Launcher for Single-Camera Detector
@@ -457,6 +476,52 @@ flowchart TD
 | `--head-fallback` | Enable synthetic anatomical head box fallback when face is turned away | `False` |
 | `--headless` | Run as background service without local OpenCV window | `False` |
 | `--api-url` | Base URL of FastAPI backend for syncing events | `'http://127.0.0.1:8000'` |
+| `waiting_cutoff_seconds` | Configurable in `camera_config.json`: Cutoff SLA threshold in seconds (e.g. `900.0` for 15 mins) | `900.0` |
+
+---
+
+### Visitor Waiting Timer & SLA Breach Monitoring Pipeline
+
+```mermaid
+flowchart LR
+    A["Customer in Showroom"] --> B{"Inside Calibrated<br/>Department Box?"}
+    B -- Yes --> C["Dwell Accumulates to Zone<br/>(Attended / In Consultation)"]
+    B -- No --> D{"Showroom Staff<br/>Within 2.2m Proximity?"}
+    D -- Yes --> C
+    D -- No --> E["Customer Marked Unattended<br/>(⏱️ Waiting Timer Starts)"]
+    E --> F{"Waiting Duration?"}
+    F -- "< 5 mins" --> G["🟢 Emerald Green Box<br/>⏱️ WAITING [MMm SSs]"]
+    F -- "5 to 15 mins" --> H["🟠 Amber Warning Box<br/>⚠️ WAITING [MMm SSs]"]
+    F -- "> 15 mins (SLA Breach)" --> I["🚨 Bright Red Alert Box<br/>🚨 UNATTENDED > 15m"]
+    I --> J["Console Alert Alarm +<br/>CRM & Dashboard SLA Breach Badge"]
+```
+
+- **Perspective Proximity Math**:
+  $$\text{dist\_m} = \frac{\sqrt{(x_v - x_s)^2 + (y_v - y_s)^2}}{\max(1.0, \; \bar{h} / 1.70)}$$
+- **Automatic Reset**: As soon as a registered employee steps within $2.2\text{ m}$ of the customer or the customer enters a department zone, the active waiting state pauses and transitions back to attended.
+
+---
+
+### Automated Testing Suite
+
+The repository includes end-to-end automated test suites for all major vision and intelligence subsystems:
+
+```bash
+# Run all tests
+pytest tests/ -v
+
+# Run Waiting Timer & SLA Breach unit test
+pytest tests/test_waiting_timer.py -v
+
+# Run Cross-Camera Tracking test
+pytest tests/test_cross_camera_tracker.py -v
+
+# Run Returning Visitor identification test
+pytest tests/test_returning_visitor.py -v
+
+# Run Biometric Retention & Purge test
+pytest tests/test_identity_and_retention.py -v
+```
 
 ---
 

@@ -152,6 +152,31 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
         </div>
       )}
 
+      {/* 🚨 CRITICAL UNATTENDED WAITING CUTOFF BREACH ALERT (> 15 MINS) */}
+      {metrics.waitingBreachCount > 0 && (
+        <div className="bg-gradient-to-r from-red-600 via-rose-600 to-red-700 text-white rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 shadow-lg shadow-red-600/25 border-2 border-red-400 animate-pulse">
+          <div className="flex items-start gap-3.5">
+            <div className="p-2.5 bg-white/20 text-white rounded-xl shrink-0 mt-0.5 border border-white/30">
+              <Users className="w-6 h-6 text-white" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-white text-red-700">
+                  Critical SLA Breach (&gt; 15 Mins)
+                </span>
+                <span className="w-2.5 h-2.5 rounded-full bg-white animate-ping" />
+              </div>
+              <h2 className="text-base font-extrabold font-['Outfit'] mt-1">
+                {metrics.waitingBreachCount} Visitor{metrics.waitingBreachCount > 1 ? 's' : ''} Left Unattended for &gt; 15 Mins!
+              </h2>
+              <p className="text-xs text-red-100 mt-0.5">
+                These visitors are outside any department desk and no staff member has approached them.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* KPI Cards Strip */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 sm:gap-4">
         <div className="p-4 sm:p-5 bg-white rounded-3xl border border-slate-200/80 shadow-[0_4px_24px_-4px_rgba(15,23,42,0.06)] hover:shadow-md transition group">
@@ -296,7 +321,11 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
                     <tr
                       key={vis.id}
                       className={`hover:bg-slate-50/80 transition-colors ${
-                        !isTagged ? 'bg-amber-50/25' : ''
+                        vis.waitingBreach
+                          ? 'bg-red-50/80 border-l-4 border-l-red-600'
+                          : !isTagged
+                          ? 'bg-amber-50/25'
+                          : ''
                       }`}
                     >
                       <td className="py-3 px-4">
@@ -344,9 +373,19 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
                       <td className="py-3 px-3 font-mono">
                         {vis.exitTime ? (
                           <span className="text-slate-700 font-medium">{vis.exitTime}</span>
+                        ) : vis.waitingBreach ? (
+                          <span className="px-2.5 py-1 rounded-full text-[10px] font-black bg-red-100 text-red-700 border border-red-300 flex items-center gap-1.5 animate-pulse whitespace-nowrap">
+                            <span className="w-1.5 h-1.5 rounded-full bg-red-600 animate-ping" />
+                            Unattended {vis.waitingFormatted} (SLA Breach)
+                          </span>
+                        ) : vis.isWaiting ? (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-200 flex items-center gap-1 whitespace-nowrap">
+                            <Clock className="w-3 h-3 text-amber-600" />
+                            Waiting {vis.waitingFormatted}
+                          </span>
                         ) : (
                           <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 animate-pulse border border-emerald-200">
-                            Inside
+                            Inside (Attended)
                           </span>
                         )}
                       </td>

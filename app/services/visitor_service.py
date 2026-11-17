@@ -143,6 +143,14 @@ class VisitorService:
             base_url = avatar_url_res.split("?")[0]
             avatar_url_res = f"{base_url}?t={mtime}"
 
+        # Resolve waiting time metrics
+        waiting_sec = int(getattr(record, "waiting_seconds", 0) or 0)
+        is_waiting = bool(getattr(record, "is_waiting", False) or False)
+        waiting_breach = bool(getattr(record, "waiting_breach", False) or (waiting_sec >= 900))
+        w_mins = waiting_sec // 60
+        w_secs = waiting_sec % 60
+        waiting_formatted = f"{w_mins}m {w_secs:02d}s" if w_mins > 0 else f"{w_secs}s"
+
         return VisitorResponse(
             id=str(record.id),
             visitorId=record.person_id,
@@ -163,6 +171,10 @@ class VisitorService:
             confidenceScore=0.96,
             cameraSource=record.camera_source or "Entrance Camera",
             zoneDwell=zone_dwell_dict,
+            waitingSeconds=waiting_sec,
+            isWaiting=is_waiting,
+            waitingBreach=waiting_breach,
+            waitingFormatted=waiting_formatted,
         )
 
     def list_visitors(
@@ -255,6 +267,12 @@ class VisitorService:
             record.exit_time = payload.exit_time
         if payload.zone_dwell:
             record.zone_dwell = json.dumps(payload.zone_dwell)
+        if payload.waiting_seconds is not None:
+            record.waiting_seconds = payload.waiting_seconds
+        if payload.is_waiting is not None:
+            record.is_waiting = payload.is_waiting
+        if payload.waiting_breach is not None:
+            record.waiting_breach = payload.waiting_breach
 
         if payload.notes_append:
             if not record.notes:
@@ -416,6 +434,12 @@ class VisitorService:
             if getattr(req, "appearance", None):
                 if not existing_rec.notes or "AI Face Detection" in existing_rec.notes:
                     existing_rec.notes = f"Appearance: {req.appearance} | Tracker #{req.tracker_id or 'auto'}"
+            if getattr(req, "waiting_seconds", None) is not None:
+                existing_rec.waiting_seconds = req.waiting_seconds
+            if getattr(req, "is_waiting", None) is not None:
+                existing_rec.is_waiting = req.is_waiting
+            if getattr(req, "waiting_breach", None) is not None:
+                existing_rec.waiting_breach = req.waiting_breach
             self.db.add(existing_rec)
             self.db.commit()
             self.db.refresh(existing_rec)
@@ -691,7 +715,17 @@ class VisitorService:
             new_record.zone_dwell = json.dumps(req.zone_dwell)
         if getattr(req, "exit_time", None):
             new_record.exit_time = req.exit_time
-        if getattr(req, "zone_dwell", None) or getattr(req, "exit_time", None):
+        if getattr(req, "waiting_seconds", None) is not None:
+            new_record.waiting_seconds = req.waiting_seconds
+        if getattr(req, "is_waiting", None) is not None:
+            new_record.is_waiting = req.is_waiting
+        if getattr(req, "waiting_breach", None) is not None:
+            new_record.waiting_breach = req.waiting_breach
+        if (
+            getattr(req, "zone_dwell", None)
+            or getattr(req, "exit_time", None)
+            or getattr(req, "waiting_seconds", None) is not None
+        ):
             self.db.add(new_record)
             self.db.commit()
             self.db.refresh(new_record)

@@ -311,6 +311,68 @@ sequenceDiagram
   ```
 * **Summary Telemetry**: The final zone dwell breakdown is emitted to system logs and persisted to the visitor's database record.
 
+### 6.3 Staff Proximity Detection & Ground-Plane Proximity Engine
+To distinguish whether a browsing customer is receiving assistance or waiting unattended, the edge vision pipeline computes real-time ground-plane spatial proximity between visitors and showroom staff (`is_staff_near_box`):
+1. **Perspective-Calibrated Ground Contact**:
+   The feet contact points of the visitor $(x_v, y_v)$ and employee $(x_s, y_s)$ are extracted from bottom-center coordinates:
+   $$\mathbf{P}_{\text{feet}} = \left( \frac{x_1 + x_2}{2}, \; y_2 \right)$$
+2. **Perspective Pixel-to-Meter Scaling**:
+   Because camera perspective distorts pixel distances depending on distance from the lens, average bounding box height $\bar{h} = \frac{h_v + h_s}{2}$ serves as an adaptive reference scale calibrated to a standard human height ($1.70\text{ m}$):
+   $$\text{Scale}_{\text{px/m}} = \max\left(1.0, \; \frac{\bar{h}}{1.70}\right)$$
+3. **Proximity Radius Gating**:
+   Euclidean ground distance in meters is calculated:
+   $$d_m = \frac{\sqrt{(x_v - x_s)^2 + (y_v - y_s)^2}}{\text{Scale}_{\text{px/m}}}$$
+   If $d_m \le \text{radius\_m}$ (default $2.2\text{ m}$), the visitor is marked as actively engaged (`is_employee_nearby = True`).
+
+### 6.4 Visitor Waiting Timer & 15-Minute Unattended SLA Breach Pipeline
+Showroom customer experience hinges on prompt staff engagement. The platform implements a strict **2-Parameter Unattended Waiting Logic** evaluated every frame:
+
+$$\text{is\_waiting\_now} = (\neg \text{is\_employee\_nearby}) \land (\neg \text{is\_in\_dept})$$
+
+* **Condition 1**: No registered employee is within the $2.2\text{ m}$ perspective radius.
+* **Condition 2**: The visitor has not entered any designated department counter box (e.g., Sales Section, Consultation Desk).
+
+When both conditions hold true, `waiting_seconds` accumulates continuously.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Attended: Enters Department Box OR Staff Within 2.2m
+    Attended --> WaitingNormal: Leaves Dept AND No Staff Nearby (t < 5m)
+    
+    state WaitingNormal {
+        [*] --> EmeraldGreen: 0s - 300s (0-5 mins)
+        EmeraldGreen: Bounding Box: Neon Green (0, 240, 110)
+        EmeraldGreen: Label: ⏱️ WAITING [MMm SSs] #ID
+    }
+
+    WaitingNormal --> AmberWarning: t >= 300s (5-15 mins)
+    state AmberWarning {
+        [*] --> Amber: 300s - 900s (5-15 mins)
+        Amber: Bounding Box: Amber Warning (0, 140, 255)
+        Amber: Label: ⚠️ WAITING [MMm SSs] #ID
+    }
+
+    AmberWarning --> SLABreach: t >= 900s (Cutoff > 15m Breached!)
+    state SLABreach {
+        [*] --> BrightRed: > 900s (> 15 mins)
+        BrightRed: Bounding Box: High-Alert Bright Red (0, 0, 255)
+        BrightRed: Label: 🚨 UNATTENDED > 15m [MMm SSs] #ID
+        BrightRed: Header Badge: Solid Red (0, 0, 180)
+        BrightRed: Console Alarm: [🚨 UNATTENDED SLA BREACH > 15m]
+    }
+
+    WaitingNormal --> Attended: Staff Approaches (< 2.2m) OR Enters Dept
+    AmberWarning --> Attended: Staff Approaches (< 2.2m) OR Enters Dept
+    SLABreach --> Attended: Staff Approaches (< 2.2m) OR Enters Dept
+```
+
+* **Three-Tier Visual HUD Alerts**:
+  1. **Normal Waiting ($< 5\text{ mins}$)**: Neon Emerald Green bounding box `(0, 240, 110)` with `⏱️ WAITING [MMm SSs]` timer.
+  2. **Elevated Warning ($5\text{ to }15\text{ mins}$)**: High-contrast Amber border `(0, 140, 255)` with `⚠️ WAITING [MMm SSs]` warning.
+  3. **Critical SLA Breach ($> 15\text{ mins}$ / $900\text{s}$)**: Bright Red alert box `(0, 0, 255, thickness=3)` and red header badge `🚨 UNATTENDED > 15m [MMm SSs]`.
+* **Telemetry Synchronization**:
+  `waiting_seconds`, `is_waiting`, and `waiting_breach` are synced every $4.0\text{s}$ via `/api/v1/visitors/update-zone` and stored in PostgreSQL `person_identities`. The React web dashboard renders live waiting counters and SLA breach warning badges in `OverviewView`, `VisitorsView`, and `VisitPurposeView`.
+
 ---
 
 ## 7. Virtual Entry-Line Crossing & Spatial Departments
@@ -381,6 +443,47 @@ The edge engine's `check_and_reload_config()` checks the file modification times
 When a camera channel is deleted via `DELETE /api/v1/cameras/channels/{channel_or_id}`:
 * The camera configuration (including custom polygonal exclusion zones, floor filters, and calibrated line coordinates) is copied into `archived_camera_profiles`.
 * The channel is deactivated in the database rather than destroyed, allowing one-click restoration if a camera is reconnected.
+
+### 8.4 Multi-Camera Tracking & Cross-Camera Re-Identification Pipeline
+Showroom installations span multiple cameras (e.g. Channel 101 at Main Entrance, Channel 201 at Sales & Display Lounge, Channel 301 at Service Desk). The platform employs `CrossCameraTracker` and an atomic cross-process state repository (`.cross_camera_state.json`) to guarantee seamless identity handover across independent detector processes:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CamEntrance as Camera 101 (Entrance)
+    participant EdgeEnt as local_detector (Cam 101)
+    participant DB as PostgreSQL + pgvector
+    participant State as CrossCameraTracker (.cross_camera_state.json)
+    participant EdgeFloor as local_detector (Cam 201)
+    participant CamFloor as Camera 201 (Floor / Lounge)
+    participant UI as React Dashboard
+
+    CamEntrance->>EdgeEnt: Customer enters front door
+    EdgeEnt->>EdgeEnt: Crosses entry line -> Extracts ArcFace 512-D Embedding
+    EdgeEnt->>DB: POST /api/v1/visitors/detect -> Mints VIS-2026-1043
+    EdgeEnt->>State: register_entity(entity_type="visitor", entity_id="VIS-2026-1043", camera="101")
+    State-->>State: Assigns global_track_id=1, persists to .cross_camera_state.json
+    EdgeEnt->>DB: Enqueue footfall count increment (Entrance count + 1)
+    DB-->>UI: Footfall counter updates to 43
+
+    Note over EdgeEnt,EdgeFloor: Visitor walks into Section / Display Area (Leaves Cam 101 view)
+    CamFloor->>EdgeFloor: Frame: Same customer observed browsing display case
+    EdgeFloor->>EdgeFloor: Detects Person & extracts ArcFace 512-D vector
+    EdgeFloor->>DB: Vector similarity search against active day visitors
+    DB-->>EdgeFloor: Biometric Match found: VIS-2026-1043 (Cosine Sim >= 0.55)
+    EdgeFloor->>State: update_seen("visitor", "VIS-2026-1043", camera="201")
+    State-->>EdgeFloor: Returns global_track_id=1 (Unified Identity Preserved)
+    EdgeFloor->>EdgeFloor: HUD displays: Person #Global-1 | VIS-2026-1043 | Lounge
+    EdgeFloor->>DB: POST /api/v1/visitors/update-zone (Zone dwell accumulated)
+    Note over EdgeFloor,DB: Footfall count is strictly PRESERVED (NO double counting!)
+```
+
+1. **Persistent Cross-Camera State (`.cross_camera_state.json`)**:
+   Tracks global identities across processes with atomic lock-free JSON serialization, storing `entity_type` (`staff` or `visitor`), `entity_id`, `global_track_id`, `first_seen_ts`, `last_seen_ts`, `first_camera`, and `last_camera`.
+2. **GPU Memory Isolation (`set_per_process_memory_fraction = 0.42`)**:
+   When launching multi-camera pipelines via `run_multi_camera.bat` or `run_multi_camera.ps1`, each detector process is allocated a capped memory fraction ($42\%$), allowing simultaneous execution of Cam 101 and Cam 201 on consumer GPUs without CUDA out-of-memory crashes.
+3. **No Redundant Ingress Counters**:
+   In-store floor cameras (`is_entrance: false`) suppress footfall creation and solely contribute to visitor dwell tracking, staff interaction analysis, and waiting status monitoring.
 
 ---
 
@@ -505,6 +608,9 @@ erDiagram
         varchar camera_source "Entrance / Floor camera"
         varchar exit_time "Departure timestamp (e.g. 04:45 PM)"
         varchar zone_dwell "JSON-encoded duration breakdown"
+        integer waiting_seconds "Accumulated unattended dwell (seconds)"
+        boolean is_waiting "Active waiting flag (no staff within 2.2m & not in dept)"
+        boolean waiting_breach "SLA breach flag (waiting > 15m / 900s)"
         boolean is_expired
         timestamp last_seen_at
         timestamp expired_at
@@ -602,6 +708,12 @@ erDiagram
                                                 │   └─► Non-blocking HTTP POST to /visitors/detect & /footfall
                                                 ├─► Store Interior: Real-time department dwell accumulation
                                                 │   └─► Periodic HTTP POST to /visitors/update-zone (every 4s)
+                                                ├─► Proximity & Waiting Engine: Ground-plane staff distance (2.2m)
+                                                │   ├─► Unattended & outside dept: Accumulate waiting timer
+                                                │   ├─► HUD Alerts: Green (<5m) ➔ Amber (5-15m) ➔ Red (>15m)
+                                                │   └─► SLA Breach: 🚨 UNATTENDED > 15m alert to CRM & Dashboard
+                                                ├─► Cross-Camera Handover: State sync across entrance & floor feeds
+                                                │   └─► Atomic .cross_camera_state.json maintains persistent identity
                                                 ├─► Receptionist UI: 1-click purpose & staff assignment
                                                 │   └─► HTTP PATCH to /visitors/{person_id}/tag
                                                 └─► Egress: Reverse line crossing detection (Exit Door)

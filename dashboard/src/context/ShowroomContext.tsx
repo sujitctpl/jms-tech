@@ -93,6 +93,9 @@ interface ShowroomContextType {
     purposeDistribution: PurposeDistribution[];
     sectionCounts: { sales: number; accounts: number; [key: string]: number };
     sectionOccupancy: { sales: number; accounts: number; [key: string]: number };
+    unattendedWaitingCount: number;
+    waitingBreachCount: number;
+    breachVisitors: VisitorRecord[];
   };
 
   // Section Tracking
@@ -422,6 +425,10 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           confidenceScore: v.confidenceScore || 0.96,
           cameraSource: v.cameraSource || 'Entrance Camera',
           zoneDwell: v.zoneDwell || { [v.zoneEntered || 'Main Showroom']: `${v.durationMinutes || 1} mins` },
+          waitingSeconds: v.waitingSeconds || 0,
+          isWaiting: Boolean(v.isWaiting),
+          waitingBreach: Boolean(v.waitingBreach || (v.waitingSeconds && v.waitingSeconds >= 900)),
+          waitingFormatted: v.waitingFormatted || (v.waitingSeconds ? `${Math.floor(v.waitingSeconds / 60)}m ${v.waitingSeconds % 60}s` : '0s'),
         }));
 
         setVisitors(mapped);
@@ -1029,6 +1036,14 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       };
     });
 
+    const unattendedWaitingCount = activeVisitors.filter((v) => v.isWaiting && !v.exitTime).length;
+    const waitingBreachCount = activeVisitors.filter(
+      (v) => (v.waitingBreach || (v.waitingSeconds && v.waitingSeconds >= 900)) && !v.exitTime
+    ).length;
+    const breachVisitors = activeVisitors.filter(
+      (v) => (v.waitingBreach || (v.waitingSeconds && v.waitingSeconds >= 900)) && !v.exitTime
+    );
+
     return {
       totalVisitors,
       newVisitors,
@@ -1059,6 +1074,9 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       purposeDistribution,
       sectionCounts,
       sectionOccupancy,
+      unattendedWaitingCount,
+      waitingBreachCount,
+      breachVisitors,
     };
   }, [visitors, attendance, sectionCounts, sectionOccupancy, dateFilter]);
 

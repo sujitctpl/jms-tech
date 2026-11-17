@@ -45,6 +45,10 @@ export interface VisitorRecord {
   confidenceScore?: number;
   cameraSource?: string;
   zoneDwell?: Record<string, string>; // e.g. { "Sales Section": "8 mins", "Main Showroom": "2 mins" }
+  waitingSeconds?: number;
+  isWaiting?: boolean;
+  waitingBreach?: boolean;
+  waitingFormatted?: string;
 }
 
 export type AttendanceStatus = 'Present' | 'Absent' | 'Late' | 'On Leave';

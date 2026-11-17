@@ -23,6 +23,10 @@ class VisitorResponse(BaseModel):
     confidenceScore: float = 0.95
     cameraSource: Optional[str] = "Entrance Camera"
     zoneDwell: Optional[Dict[str, str]] = None
+    waitingSeconds: int = 0
+    isWaiting: bool = False
+    waitingBreach: bool = False
+    waitingFormatted: Optional[str] = None
 
 
 class VisitorListResponse(BaseModel):
@@ -51,6 +55,9 @@ class VisitorDetectRequest(BaseModel):
     zone_dwell: Optional[Dict[str, str]] = Field(None, description="Dwell times per detection zone")
     exit_time: Optional[str] = Field(None, description="Departure time formatted string")
     is_entrance: Optional[bool] = Field(True, description="Whether this camera is a store entrance camera")
+    waiting_seconds: Optional[int] = Field(None, description="Accumulated unattended waiting time in seconds")
+    is_waiting: Optional[bool] = Field(None, description="Whether visitor is currently waiting unattended")
+    waiting_breach: Optional[bool] = Field(None, description="Whether waiting time exceeded cutoff (15 mins)")
 
 
 class VisitorZoneUpdateRequest(BaseModel):
@@ -60,6 +67,9 @@ class VisitorZoneUpdateRequest(BaseModel):
     zone_dwell: Optional[Dict[str, str]] = None
     exit_time: Optional[str] = None
     notes_append: Optional[str] = None
+    waiting_seconds: Optional[int] = None
+    is_waiting: Optional[bool] = None
+    waiting_breach: Optional[bool] = None
 
 
 class VisitorDetectResponse(BaseModel):
