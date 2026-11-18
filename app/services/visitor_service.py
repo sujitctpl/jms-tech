@@ -43,6 +43,21 @@ def to_ist(dt: Optional[datetime]) -> Optional[datetime]:
     return dt.astimezone(IST)
 
 
+def get_waiting_cutoff_seconds() -> int:
+    """Reads configured SLA breach cutoff seconds from camera_config.json, default 900s (15m)."""
+    try:
+        cfg_path = os.path.join(".", "camera_config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                cutoff = int(cfg.get("waiting_cutoff_seconds", 900))
+                if cutoff > 0:
+                    return cutoff
+    except Exception:
+        pass
+    return 900
+
+
 class VisitorService:
     def __init__(self, db: Session):
         self.db = db
@@ -146,7 +161,11 @@ class VisitorService:
         # Resolve waiting time metrics
         waiting_sec = int(getattr(record, "waiting_seconds", 0) or 0)
         is_waiting = bool(getattr(record, "is_waiting", False) or False)
-        waiting_breach = bool(getattr(record, "waiting_breach", False) or (waiting_sec >= 900))
+        # If visitor has already departed or has an assigned salesperson, they are attended
+        if record.exit_time or record.assigned_salesperson:
+            is_waiting = False
+        cutoff_sec = get_waiting_cutoff_seconds()
+        waiting_breach = bool(getattr(record, "waiting_breach", False) or (waiting_sec >= cutoff_sec))
         w_mins = waiting_sec // 60
         w_secs = waiting_sec % 60
         waiting_formatted = f"{w_mins}m {w_secs:02d}s" if w_mins > 0 else f"{w_secs}s"
@@ -211,6 +230,12 @@ class VisitorService:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Visitor with ID '{person_id}' not found.",
             )
+        # If an employee is assigned, visitor is now attended -> not waiting
+        if payload.assigned_salesperson:
+            record.is_waiting = False
+            self.db.add(record)
+            self.db.commit()
+            self.db.refresh(record)
         return self._to_visitor_response(record)
 
     def update_visitor_zone(self, payload: VisitorZoneUpdateRequest) -> Optional[VisitorResponse]:
@@ -257,6 +282,7 @@ class VisitorService:
                     )
 
         if not record:
+            # Person has not been registered via an Entrance Line crossing; do not mint ghost visitors
             return None
         record.last_seen_at = now_utc
         if payload.tracker_id and f"Tracker #{payload.tracker_id}" not in (record.notes or ""):
@@ -265,14 +291,60 @@ class VisitorService:
             record.zone_entered = payload.current_zone
         if payload.exit_time:
             record.exit_time = payload.exit_time
+            record.is_waiting = False
         if payload.zone_dwell:
             record.zone_dwell = json.dumps(payload.zone_dwell)
+        if getattr(payload, "face_image_base64", None):
+            try:
+                b64_str = payload.face_image_base64
+                if "," in b64_str:
+                    b64_str = b64_str.split(",", 1)[1]
+                crop_bytes = base64.b64decode(b64_str)
+                nparr = np.frombuffer(crop_bytes, np.uint8)
+                crop_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                if crop_img is not None and crop_img.size > 0:
+                    os.makedirs("static/uploads/visitors", exist_ok=True)
+                    now_epoch = int(datetime.now(timezone.utc).timestamp())
+                    filename = f"{record.person_id}_{now_epoch}.jpg"
+                    if record.avatar_url:
+                        old_f = os.path.join(".", record.avatar_url.lstrip("/").split("?")[0])
+                        if os.path.isfile(old_f):
+                            try:
+                                os.remove(old_f)
+                            except Exception:
+                                pass
+                    filepath = os.path.join("static", "uploads", "visitors", filename)
+                    cv2.imwrite(filepath, crop_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    record.avatar_url = f"/static/uploads/visitors/{filename}"
+                    logger.info("Saved snapshot for visitor %s on SLA breach / zone update to %s", record.person_id, filepath)
+            except Exception as e:
+                logger.error("Failed to write visitor SLA snapshot: %s", str(e))
+
+        cutoff_sec = get_waiting_cutoff_seconds()
+
+        # Enforce physical dwell limit: waiting_seconds cannot exceed total showroom presence
         if payload.waiting_seconds is not None:
-            record.waiting_seconds = payload.waiting_seconds
+            new_wait = int(payload.waiting_seconds)
+            if record.created_at:
+                phys_elapsed = max(0, int((now_utc - record.created_at).total_seconds()))
+                # Allow a small 30s buffer for cross-camera handoff timing
+                new_wait = min(new_wait, phys_elapsed + 30)
+            record.waiting_seconds = max(int(record.waiting_seconds or 0), new_wait)
+        elif record.created_at:
+            phys_elapsed = max(0, int((now_utc - record.created_at).total_seconds()))
+            record.waiting_seconds = min(int(record.waiting_seconds or 0), phys_elapsed + 30)
+
         if payload.is_waiting is not None:
             record.is_waiting = payload.is_waiting
+
+        # Visitors who exited or have assigned staff are attended (not waiting)
+        if record.exit_time or record.assigned_salesperson:
+            record.is_waiting = False
+
         if payload.waiting_breach is not None:
-            record.waiting_breach = payload.waiting_breach
+            record.waiting_breach = bool(record.waiting_breach or payload.waiting_breach or ((record.waiting_seconds or 0) >= cutoff_sec))
+        elif (record.waiting_seconds or 0) >= cutoff_sec:
+            record.waiting_breach = True
 
         if payload.notes_append:
             if not record.notes:
@@ -416,7 +488,6 @@ class VisitorService:
             if face_img is not None and face_img.size > 0:
                 try:
                     os.makedirs("static/uploads/visitors", exist_ok=True)
-                    avatar_img = cv2.resize(face_img, (320, 320), interpolation=cv2.INTER_LANCZOS4)
                     now_epoch = int(datetime.now(timezone.utc).timestamp())
                     filename = f"{existing_rec.person_id}_{now_epoch}.jpg"
                     if existing_rec.avatar_url:
@@ -427,19 +498,20 @@ class VisitorService:
                             except Exception:
                                 pass
                     filepath = os.path.join("static", "uploads", "visitors", filename)
-                    cv2.imwrite(filepath, avatar_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    cv2.imwrite(filepath, face_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     existing_rec.avatar_url = f"/static/uploads/visitors/{filename}"
                 except Exception as e:
                     logger.error("Failed to update visitor face snapshot: %s", str(e))
             if getattr(req, "appearance", None):
                 if not existing_rec.notes or "AI Face Detection" in existing_rec.notes:
                     existing_rec.notes = f"Appearance: {req.appearance} | Tracker #{req.tracker_id or 'auto'}"
+            cutoff_sec = get_waiting_cutoff_seconds()
             if getattr(req, "waiting_seconds", None) is not None:
-                existing_rec.waiting_seconds = req.waiting_seconds
+                existing_rec.waiting_seconds = max(int(existing_rec.waiting_seconds or 0), int(req.waiting_seconds))
             if getattr(req, "is_waiting", None) is not None:
                 existing_rec.is_waiting = req.is_waiting
             if getattr(req, "waiting_breach", None) is not None:
-                existing_rec.waiting_breach = req.waiting_breach
+                existing_rec.waiting_breach = bool(existing_rec.waiting_breach or req.waiting_breach or ((existing_rec.waiting_seconds or 0) >= cutoff_sec))
             self.db.add(existing_rec)
             self.db.commit()
             self.db.refresh(existing_rec)
@@ -599,30 +671,16 @@ class VisitorService:
                         break
 
         # Interior Camera Safety Net: Interior cameras (Floor, Display Area, Service Desk)
-        # should NEVER mint new store walk-ins if an active customer is already in the showroom
+        # should NEVER mint new store walk-ins without an entrance line crossing.
         is_cam_entrance = getattr(req, "is_entrance", True)
         if not is_active_session and not is_returning_customer and not is_cam_entrance:
-            active_visitor = (
-                self.db.query(PersonIdentity)
-                .filter(
-                    PersonIdentity.is_expired.is_(False),
-                    PersonIdentity.exit_time.is_(None),
-                )
-                .order_by(PersonIdentity.last_seen_at.desc())
-                .first()
+            logger.info("Interior camera %s: suppressed new visitor creation (no entrance line crossing).", req.camera_name)
+            return VisitorDetectResponse(
+                status="IGNORED_INTERIOR",
+                is_employee=False,
+                is_new=False,
+                message="Interior camera does not create new walk-ins without entrance crossing.",
             )
-            if active_visitor:
-                act_ist = to_ist(active_visitor.created_at)
-                time_since_seen = (now_utc - active_visitor.last_seen_at).total_seconds()
-                if act_ist and act_ist.date() == now_ist.date() and time_since_seen < 3600.0:
-                    matched_person_id = active_visitor.person_id
-                    matched_similarity = 0.85
-                    is_active_session = True
-                    logger.info(
-                        "Interior camera %s associated detection with active showroom visitor %s (suppressing duplicate).",
-                        req.camera_name,
-                        matched_person_id,
-                    )
 
         # Case A: Existing visitor recognized active in showroom (disappeared & reappeared on camera 1 or camera 2)
         if is_active_session and matched_person_id:
@@ -716,11 +774,11 @@ class VisitorService:
         if getattr(req, "exit_time", None):
             new_record.exit_time = req.exit_time
         if getattr(req, "waiting_seconds", None) is not None:
-            new_record.waiting_seconds = req.waiting_seconds
+            new_record.waiting_seconds = int(req.waiting_seconds)
         if getattr(req, "is_waiting", None) is not None:
             new_record.is_waiting = req.is_waiting
         if getattr(req, "waiting_breach", None) is not None:
-            new_record.waiting_breach = req.waiting_breach
+            new_record.waiting_breach = bool(req.waiting_breach or ((new_record.waiting_seconds or 0) >= 900))
         if (
             getattr(req, "zone_dwell", None)
             or getattr(req, "exit_time", None)

@@ -107,17 +107,24 @@ class RetentionService:
                         except Exception:
                             pass
 
-            # 2. Purge associated biometric files (face crops / cached embeddings on disk)
-            if face_crops_dir and os.path.exists(face_crops_dir):
-                self._purge_face_crops(face_crops_dir, expired_person_ids)
+            # 2. Purge associated snapshot image files from disk (static/uploads/visitors/)
+            snapshots_dir = face_crops_dir or os.path.join("static", "uploads", "visitors")
+            deleted_files = 0
+            if os.path.exists(snapshots_dir):
+                deleted_files = self._purge_face_crops(snapshots_dir, expired_person_ids)
+                # Also purge any unlinked orphaned files older than retention days
+                deleted_files += self._purge_orphaned_snapshots(snapshots_dir, days)
 
-            # 3. Purge biometric embeddings from database (sets face_embedding = None, is_expired = True)
+            # 3. Purge biometric embeddings from database (sets face_embedding = None, avatar_url = None, is_expired = True)
+            for r in expired_records:
+                r.avatar_url = None
             purged_count = repo.expire_identities(expired_person_ids, expired_at=current_time)
 
             elapsed = time.time() - start_time
             logger.info(
-                "Biometric retention cleanup completed successfully: purged %d expired embeddings (retention: %d days, cutoff: %s).",
+                "Biometric & Snapshot retention cleanup completed: purged %d identities, deleted %d snapshot files (retention: %d days, cutoff: %s).",
                 purged_count,
+                deleted_files,
                 days,
                 cutoff.isoformat(),
             )
@@ -128,7 +135,7 @@ class RetentionService:
                 retention_days=days,
                 cutoff_timestamp=cutoff,
                 execution_time_seconds=round(elapsed, 4),
-                message=f"Purged {purged_count} expired face embeddings safely.",
+                message=f"Purged {purged_count} expired records and deleted {deleted_files} physical snapshot images.",
             )
 
         except Exception as e:
@@ -163,6 +170,24 @@ class RetentionService:
                     deleted += 1
                 except Exception:
                     pass
+        return deleted
+
+    @staticmethod
+    def _purge_orphaned_snapshots(directory: str, retention_days: int) -> int:
+        """Removes any visitor snapshot image on disk whose file age exceeds retention_days."""
+        deleted = 0
+        cutoff_epoch = time.time() - (retention_days * 86400)
+        try:
+            for entry in os.scandir(directory):
+                if entry.is_file() and entry.name.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                    try:
+                        if entry.stat().st_mtime < cutoff_epoch:
+                            os.remove(entry.path)
+                            deleted += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         return deleted
 
 

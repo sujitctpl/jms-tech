@@ -11,6 +11,7 @@ import {
   HourlyFootfall,
   DurationDistribution,
   PurposeDistribution,
+  WaitingTimeConfig,
 } from '../types';
 import {
   INITIAL_VISITORS,
@@ -50,6 +51,8 @@ interface ShowroomContextType {
   isStoreCurrentlyOpen: boolean;
   showroomSettings: ShowroomSettings;
   updateShowroomSettings: (settings: Partial<ShowroomSettings>) => void;
+  waitingConfig: WaitingTimeConfig;
+  updateWaitingConfig: (config: Partial<WaitingTimeConfig>) => void;
 
   // Filters & State
   dateFilter: DateFilterOption;
@@ -64,6 +67,7 @@ interface ShowroomContextType {
 
   // Computed Metrics
   metrics: {
+    virtualLineCrossings: number;
     totalVisitors: number;
     newVisitors: number;
     returningVisitors: number;
@@ -96,6 +100,11 @@ interface ShowroomContextType {
     unattendedWaitingCount: number;
     waitingBreachCount: number;
     breachVisitors: VisitorRecord[];
+    avgWaitingSeconds: number;
+    avgWaitingFormatted: string;
+    longestWaitingSeconds: number;
+    slaCompliancePct: number;
+    currentlyWaitingVisitors: VisitorRecord[];
   };
 
   // Section Tracking
@@ -114,6 +123,7 @@ interface ShowroomContextType {
   }>;
   departments: DepartmentModel[];
   refreshDepartments: () => Promise<void>;
+  lastSyncedFootfall: number | null;
 
   // CSV Export
   exportVisitorsCSV: () => void;
@@ -357,6 +367,36 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
   }, [showroomSettings]);
 
+  // Synchronize dynamic waiting & camera settings from camera_config.json
+  useEffect(() => {
+    let isMounted = true;
+    const fetchCameraConfig = async () => {
+      try {
+        const cfg = await cameraService.getCameraConfig();
+        if (isMounted && cfg) {
+          const cutoffMin = (cfg as any).waiting_cutoff_seconds
+            ? Math.round((cfg as any).waiting_cutoff_seconds / 60)
+            : 15;
+          setShowroomSettings((prev) => ({
+            ...prev,
+            waitingConfig: {
+              ...(prev.waitingConfig || {
+                warningThresholdMinutes: 5,
+                staffProximityMeters: 2.2,
+                soundAlertEnabled: true,
+                excludeDepartmentZones: true,
+              }),
+              slaCutoffMinutes: cutoffMin,
+            },
+          }));
+        }
+      } catch (err) {
+        console.warn('Failed to sync camera config to ShowroomContext', err);
+      }
+    };
+    fetchCameraConfig();
+  }, []);
+
   // Determine if store is currently open based on local IST time
   const isStoreCurrentlyOpen = useMemo(() => {
     const now = new Date();
@@ -426,8 +466,8 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           cameraSource: v.cameraSource || 'Entrance Camera',
           zoneDwell: v.zoneDwell || { [v.zoneEntered || 'Main Showroom']: `${v.durationMinutes || 1} mins` },
           waitingSeconds: v.waitingSeconds || 0,
-          isWaiting: Boolean(v.isWaiting),
-          waitingBreach: Boolean(v.waitingBreach || (v.waitingSeconds && v.waitingSeconds >= 900)),
+          isWaiting: Boolean(v.isWaiting && !v.exitTime && !v.assignedSalesperson),
+          waitingBreach: Boolean((v.waitingBreach || (v.waitingSeconds && v.waitingSeconds >= 900)) && !v.exitTime && !v.assignedSalesperson),
           waitingFormatted: v.waitingFormatted || (v.waitingSeconds ? `${Math.floor(v.waitingSeconds / 60)}m ${v.waitingSeconds % 60}s` : '0s'),
         }));
 
@@ -691,6 +731,35 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     setShowroomSettings((prev) => ({ ...prev, ...newSettings }));
   };
 
+  const waitingConfig: WaitingTimeConfig = useMemo(() => {
+    return {
+      slaCutoffMinutes: showroomSettings.waitingConfig?.slaCutoffMinutes ?? 15,
+      warningThresholdMinutes: showroomSettings.waitingConfig?.warningThresholdMinutes ?? 5,
+      staffProximityMeters: showroomSettings.waitingConfig?.staffProximityMeters ?? 2.2,
+      soundAlertEnabled: showroomSettings.waitingConfig?.soundAlertEnabled ?? true,
+      excludeDepartmentZones: showroomSettings.waitingConfig?.excludeDepartmentZones ?? true,
+    };
+  }, [showroomSettings.waitingConfig]);
+
+  const updateWaitingConfig = (config: Partial<WaitingTimeConfig>) => {
+    setShowroomSettings((prev) => {
+      const current = prev.waitingConfig || {
+        slaCutoffMinutes: 15,
+        warningThresholdMinutes: 5,
+        staffProximityMeters: 2.2,
+        soundAlertEnabled: true,
+        excludeDepartmentZones: true,
+      };
+      return {
+        ...prev,
+        waitingConfig: {
+          ...current,
+          ...config,
+        },
+      };
+    });
+  };
+
   const toggleLiveSimulation = () => {
     setIsLiveSimulationActive((prev) => !prev);
   };
@@ -800,19 +869,15 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           setStaffDepartmentDwell(data.staff_dwell);
         }
 
-        const backendTotal = data.total_entries;
+        const backendTotal = typeof data.total_entries === 'number' ? data.total_entries : 0;
 
-        // On first load, record baseline count
-        if (lastSyncedFootfall === null) {
+        // Sync edge detector line crossing count
+        if (lastSyncedFootfall === null || lastSyncedFootfall !== backendTotal) {
+          if (lastSyncedFootfall !== null && backendTotal > lastSyncedFootfall) {
+            const newEntriesCount = backendTotal - lastSyncedFootfall;
+            setLastSimulatedEvent(`Local AI Edge: Registered ${newEntriesCount} new visitor entry count from local camera.`);
+          }
           setLastSyncedFootfall(backendTotal);
-          return;
-        }
-
-        // When local detector detects new people crossing entry line:
-        if (backendTotal > lastSyncedFootfall) {
-          const newEntriesCount = backendTotal - lastSyncedFootfall;
-          setLastSyncedFootfall(backendTotal);
-          setLastSimulatedEvent(`Local AI Edge: Registered ${newEntriesCount} new visitor entry count from local camera.`);
         }
       } catch {
         // Ignore connection hiccups
@@ -1036,15 +1101,36 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       };
     });
 
-    const unattendedWaitingCount = activeVisitors.filter((v) => v.isWaiting && !v.exitTime).length;
-    const waitingBreachCount = activeVisitors.filter(
-      (v) => (v.waitingBreach || (v.waitingSeconds && v.waitingSeconds >= 900)) && !v.exitTime
-    ).length;
-    const breachVisitors = activeVisitors.filter(
-      (v) => (v.waitingBreach || (v.waitingSeconds && v.waitingSeconds >= 900)) && !v.exitTime
-    );
+    const cutoffSec = (waitingConfig.slaCutoffMinutes || 15) * 60;
+    const unattendedWaitingCount = activeVisitors.filter((v) => v.isWaiting && !v.exitTime && !v.assignedSalesperson).length;
+    const breachVisitors = activeVisitors
+      .filter((v) => !v.exitTime && !v.assignedSalesperson && Boolean((v.waitingBreach && v.isWaiting) || ((v.waitingSeconds || 0) >= cutoffSec && v.isWaiting)))
+      .sort((a, b) => (b.waitingSeconds || 0) - (a.waitingSeconds || 0));
+    const waitingBreachCount = breachVisitors.length;
+    const currentlyWaitingVisitors = activeVisitors
+      .filter((v) => v.isWaiting && !v.exitTime && !v.assignedSalesperson)
+      .sort((a, b) => (b.waitingSeconds || 0) - (a.waitingSeconds || 0));
+
+    const waitingVisits = activeVisitors.filter((v) => (v.waitingSeconds || 0) > 0);
+    const avgWaitingSeconds = waitingVisits.length > 0
+      ? Math.round(waitingVisits.reduce((acc, v) => acc + (v.waitingSeconds || 0), 0) / waitingVisits.length)
+      : 0;
+    const wMins = Math.floor(avgWaitingSeconds / 60);
+    const wSecs = avgWaitingSeconds % 60;
+    const avgWaitingFormatted = wMins > 0 ? `${wMins}m ${wSecs < 10 ? '0' : ''}${wSecs}s` : `${wSecs}s`;
+
+    const longestWaitingSeconds = activeVisitors.length > 0
+      ? Math.max(...activeVisitors.map((v) => v.waitingSeconds || 0), 0)
+      : 0;
+
+    const slaCompliancePct = totalVisitors > 0
+      ? Math.max(0, Math.round(((totalVisitors - waitingBreachCount) / totalVisitors) * 100))
+      : 100;
+
+    const virtualLineCrossings = lastSyncedFootfall ?? 0;
 
     return {
+      virtualLineCrossings,
       totalVisitors,
       newVisitors,
       returningVisitors,
@@ -1077,8 +1163,13 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       unattendedWaitingCount,
       waitingBreachCount,
       breachVisitors,
+      avgWaitingSeconds,
+      avgWaitingFormatted,
+      longestWaitingSeconds,
+      slaCompliancePct,
+      currentlyWaitingVisitors,
     };
-  }, [visitors, attendance, sectionCounts, sectionOccupancy, dateFilter]);
+  }, [visitors, attendance, sectionCounts, sectionOccupancy, dateFilter, waitingConfig, lastSyncedFootfall]);
 
   // Export functions
   const exportVisitorsCSV = () => {
@@ -1092,6 +1183,8 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       'Visit Purpose',
       'Assigned Salesperson',
       'Duration (Mins)',
+      'Wait Time',
+      'Waiting SLA Status',
       'Tagging Status',
       'Zone',
       'Notes',
@@ -1107,6 +1200,8 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       v.visitPurpose || 'Untagged',
       v.assignedSalesperson || 'Unassigned',
       v.durationMinutes,
+      v.waitingFormatted || `${v.waitingSeconds || 0}s`,
+      v.waitingBreach ? 'SLA Breach (>15m)' : v.isWaiting ? 'Currently Waiting' : 'Attended',
       v.taggingStatus,
       v.zoneEntered || 'Showroom Floor',
       `"${(v.notes || '').replace(/"/g, '""')}"`,
@@ -1183,6 +1278,8 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         isStoreCurrentlyOpen,
         showroomSettings,
         updateShowroomSettings,
+        waitingConfig,
+        updateWaitingConfig,
         dateFilter,
         setDateFilter,
         customDateRange,
@@ -1191,6 +1288,7 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         toggleLiveSimulation,
         lastSimulatedEvent,
         metrics,
+        lastSyncedFootfall,
         sectionCounts,
         sectionOccupancy,
         staffDepartmentDwell,

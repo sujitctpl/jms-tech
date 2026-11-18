@@ -289,7 +289,7 @@ export const VisitPurposeView: React.FC<VisitPurposeViewProps> = ({ onTagVisitor
                   <tr
                     key={vis.id}
                     className={`hover:bg-slate-50/80 transition-colors ${
-                      vis.waitingBreach
+                      vis.waitingBreach && vis.isWaiting && !vis.exitTime && !vis.assignedSalesperson
                         ? 'bg-red-50/80 border-l-4 border-l-red-600'
                         : !isTagged
                         ? 'bg-amber-50/20'

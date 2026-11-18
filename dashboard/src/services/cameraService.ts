@@ -147,7 +147,7 @@ export const DEFAULT_CAMERA_CONFIG: DynamicCameraConfig = {
     '101': {
       name: 'Showroom Camera 101 (Main Glass Entrance)',
       camera_id: '88970b31-d885-4fd5-a24a-bdc969c96240',
-      source: 'rtsp://zakir:06nov2014@192.168.20.184:554/Streaming/Channels/101',
+      source: 'rtsp://zakir:06nov2014@192.168.20.134:554/Streaming/Channels/101',
       location: 'Channel 101 (Main Glass Entrance)',
       confidence: 0.31,
       min_feet_y: 0.32,
@@ -177,7 +177,7 @@ export const DEFAULT_CAMERA_CONFIG: DynamicCameraConfig = {
     '201': {
       name: 'Showroom Camera 201 (Floor & Display Area)',
       camera_id: '0e7e29df-7375-47ce-8c3f-bf03c14d6e67',
-      source: 'rtsp://zakir:06nov2014@192.168.20.184:554/Streaming/Channels/201',
+      source: 'rtsp://zakir:06nov2014@192.168.20.134:554/Streaming/Channels/201',
       location: 'Channel 201 (Showroom Floor & Display Area)',
       confidence: 0.31,
       min_feet_y: 0.08,
@@ -193,7 +193,7 @@ export const DEFAULT_CAMERA_CONFIG: DynamicCameraConfig = {
     '301': {
       name: 'Showroom Camera 301 (Lounge & Billing Desk)',
       camera_id: '8da1af51-b4fb-4745-bc47-a5a5c0e4571e',
-      source: 'rtsp://zakir:06nov2014@192.168.20.184:554/Streaming/Channels/301',
+      source: 'rtsp://zakir:06nov2014@192.168.20.134:554/Streaming/Channels/301',
       location: 'Channel 301 (Customer Lounge & Billing Desk)',
       confidence: 0.31,
       min_feet_y: 0.08,
@@ -209,7 +209,7 @@ export const DEFAULT_CAMERA_CONFIG: DynamicCameraConfig = {
     '401': {
       name: 'Showroom Camera 401 (Delivery Bay & Service Gate)',
       camera_id: 'f959f6fc-eb56-4515-85c6-510f5c7fb27d',
-      source: 'rtsp://zakir:06nov2014@192.168.20.184:554/Streaming/Channels/401',
+      source: 'rtsp://zakir:06nov2014@192.168.20.134:554/Streaming/Channels/401',
       location: 'Channel 401 (Delivery Bay & Service Gate)',
       confidence: 0.31,
       min_feet_y: 0.08,

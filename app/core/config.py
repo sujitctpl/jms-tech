@@ -58,8 +58,9 @@ class Settings(BaseSettings):
     FACE_RECOGNITION_COOLDOWN_FRAMES: int = 5  # Cooldown between recognition attempts on unresolved tracks
     FACE_MAX_RECOGNITION_ATTEMPTS: int = 5  # Maximum attempts per track to avoid redundant inference
 
-    # 14-Day Rolling Biometric Retention Policy Settings
-    FACE_RETENTION_DAYS: int = 14  # Expire embeddings not recognized for 14 days
+    # 7-Day Rolling Biometric & Snapshot Retention Policy Settings
+    FACE_RETENTION_DAYS: int = 7  # Expire embeddings & snapshots not recognized for 7 days
+    SNAPSHOT_RETENTION_DAYS: int = 7  # Purge physical CCTV image snapshots older than 7 days
     RETENTION_CLEANUP_INTERVAL_HOURS: int = 24  # Run scheduled cleanup at least once daily
     RETENTION_AUTO_CLEANUP_ENABLED: bool = True  # Enable background scheduled cleanup
 

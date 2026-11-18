@@ -122,6 +122,14 @@ export interface PurposeDistribution {
   color: string;
 }
 
+export interface WaitingTimeConfig {
+  slaCutoffMinutes: number; // default: 15
+  warningThresholdMinutes: number; // default: 5
+  staffProximityMeters: number; // default: 2.2
+  soundAlertEnabled: boolean; // default: true
+  excludeDepartmentZones: boolean; // default: true
+}
+
 export interface ShowroomSettings {
   showroomName: string;
   brandDealership: string; // "Honda 2-Wheelers", "Hero MotoCorp", "TVS Motors", "Royal Enfield"
@@ -139,4 +147,5 @@ export interface ShowroomSettings {
   cctvAiEnabled: boolean;
   privacyComplianceEnabled: boolean;
   autoTaggingAssistance: boolean;
+  waitingConfig?: WaitingTimeConfig;
 }

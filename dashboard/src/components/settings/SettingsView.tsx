@@ -17,6 +17,11 @@ import {
   Sparkles,
   ToggleLeft,
   ToggleRight,
+  Timer,
+  Sliders,
+  Bell,
+  Info,
+  AlertTriangle,
 } from 'lucide-react';
 import {
   cameraService,
@@ -39,10 +44,77 @@ const PRESET_COLORS = [
 
 export const SettingsView: React.FC = () => {
   const { user } = useAuth();
-  const { storeHours, updateStoreHours, isStoreCurrentlyOpen, refreshDepartments } = useShowroom();
+  const {
+    storeHours,
+    updateStoreHours,
+    isStoreCurrentlyOpen,
+    refreshDepartments,
+    waitingConfig,
+    updateWaitingConfig,
+  } = useShowroom();
 
   // Tab State
-  const [activeTab, setActiveTab] = useState<'cameras' | 'detection' | 'schedule'>('cameras');
+  const [activeTab, setActiveTab] = useState<'cameras' | 'detection' | 'schedule' | 'waiting'>('cameras');
+
+  // Waiting Time Form State
+  const [formSlaCutoff, setFormSlaCutoff] = useState(waitingConfig.slaCutoffMinutes);
+  const [formWarningThreshold, setFormWarningThreshold] = useState(waitingConfig.warningThresholdMinutes);
+  const [formStaffProximity, setFormStaffProximity] = useState(waitingConfig.staffProximityMeters);
+  const [formSoundAlert, setFormSoundAlert] = useState(waitingConfig.soundAlertEnabled);
+  const [formExcludeDepts, setFormExcludeDepts] = useState(waitingConfig.excludeDepartmentZones);
+  const [waitingSaveSuccess, setWaitingSaveSuccess] = useState<string | null>(null);
+
+  // Sync state when waitingConfig changes
+  useEffect(() => {
+    setFormSlaCutoff(waitingConfig.slaCutoffMinutes);
+    setFormWarningThreshold(waitingConfig.warningThresholdMinutes);
+    setFormStaffProximity(waitingConfig.staffProximityMeters);
+    setFormSoundAlert(waitingConfig.soundAlertEnabled);
+    setFormExcludeDepts(waitingConfig.excludeDepartmentZones);
+  }, [waitingConfig]);
+
+  const handleSaveWaitingConfig = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cutoffMins = Number(formSlaCutoff);
+    updateWaitingConfig({
+      slaCutoffMinutes: cutoffMins,
+      warningThresholdMinutes: Number(formWarningThreshold),
+      staffProximityMeters: Number(formStaffProximity),
+      soundAlertEnabled: Boolean(formSoundAlert),
+      excludeDepartmentZones: Boolean(formExcludeDepts),
+    });
+    try {
+      await cameraService.saveCameraConfig({
+        waiting_cutoff_seconds: cutoffMins * 60,
+      } as any);
+    } catch (err) {
+      console.warn('Failed to sync SLA cutoff to camera_config.json:', err);
+    }
+    setWaitingSaveSuccess('Waiting time & SLA configuration saved successfully and synced with Vision AI.');
+    setTimeout(() => setWaitingSaveSuccess(null), 4000);
+  };
+
+  const handleResetWaitingDefaults = async () => {
+    setFormSlaCutoff(15);
+    setFormWarningThreshold(5);
+    setFormStaffProximity(2.2);
+    setFormSoundAlert(true);
+    setFormExcludeDepts(true);
+    updateWaitingConfig({
+      slaCutoffMinutes: 15,
+      warningThresholdMinutes: 5,
+      staffProximityMeters: 2.2,
+      soundAlertEnabled: true,
+      excludeDepartmentZones: true,
+    });
+    try {
+      await cameraService.saveCameraConfig({
+        waiting_cutoff_seconds: 900,
+      } as any);
+    } catch (_) {}
+    setWaitingSaveSuccess('Reset to showroom default parameters (15m SLA, 5m Warning, 2.2m distance).');
+    setTimeout(() => setWaitingSaveSuccess(null), 4000);
+  };
 
   // Store Hours Form State
   const [openingTime, setOpeningTime] = useState(storeHours.openingTime);
@@ -274,6 +346,17 @@ export const SettingsView: React.FC = () => {
           >
             <Clock className="w-3.5 h-3.5" />
             <span>Store Schedule</span>
+          </button>
+          <button
+            onClick={() => setActiveTab('waiting')}
+            className={`px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 cursor-pointer ${
+              activeTab === 'waiting'
+                ? 'bg-white text-blue-600 shadow-sm border border-slate-200/60'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <Timer className="w-3.5 h-3.5" />
+            <span>Waiting Time &amp; SLA</span>
           </button>
         </div>
       </div>
@@ -597,6 +680,284 @@ export const SettingsView: React.FC = () => {
               <Save className="w-4 h-4" />
               <span>Save Operating Hours</span>
             </button>
+          </form>
+        </div>
+      )}
+
+      {/* TAB 3: WAITING TIME & SERVICE SLA CONFIGURATION */}
+      {activeTab === 'waiting' && (
+        <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-[0_4px_24px_-4px_rgba(15,23,42,0.06)] space-y-6">
+          {/* Header */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-slate-100 gap-3">
+            <div className="flex items-center gap-3">
+              <div className="p-2.5 rounded-2xl bg-amber-50 text-amber-600 border border-amber-200/80 shadow-2xs">
+                <Timer className="w-5 h-5" />
+              </div>
+              <div>
+                <h2 className="font-extrabold text-slate-900 text-lg font-['Outfit']">
+                  Customer Waiting Time &amp; Service SLA Configuration
+                </h2>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Configure SLA breach cutoff times, attention alert thresholds, and staff attendance proximity rules.
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={handleResetWaitingDefaults}
+              className="text-xs text-slate-500 hover:text-slate-800 font-semibold px-3 py-1.5 rounded-xl border border-slate-200 hover:bg-slate-50 transition self-start sm:self-auto cursor-pointer"
+            >
+              Reset to Defaults (15m SLA)
+            </button>
+          </div>
+
+          {/* Success Banner */}
+          {waitingSaveSuccess && (
+            <div className="p-3.5 bg-emerald-50 border border-emerald-200 text-emerald-900 rounded-2xl text-xs flex items-center gap-2.5 animate-fadeIn">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+              <span className="font-medium">{waitingSaveSuccess}</span>
+            </div>
+          )}
+
+          {/* Current Live Status Banner */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div className="p-4 bg-red-50/80 rounded-2xl border border-red-200/80">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-red-700">SLA Breach Cutoff</span>
+              <p className="text-2xl font-black font-['Outfit'] text-red-950 mt-1">
+                {formSlaCutoff} <span className="text-xs font-semibold text-red-700">mins</span>
+              </p>
+              <span className="text-[10px] text-red-600 font-medium">Critical red alert cutoff</span>
+            </div>
+
+            <div className="p-4 bg-amber-50/80 rounded-2xl border border-amber-200/80">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-amber-800">Warning Threshold</span>
+              <p className="text-2xl font-black font-['Outfit'] text-amber-950 mt-1">
+                {formWarningThreshold} <span className="text-xs font-semibold text-amber-800">mins</span>
+              </p>
+              <span className="text-[10px] text-amber-700 font-medium">Early attention banner</span>
+            </div>
+
+            <div className="p-4 bg-blue-50/80 rounded-2xl border border-blue-200/80">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-blue-800">Staff Proximity</span>
+              <p className="text-2xl font-black font-['Outfit'] text-blue-950 mt-1">
+                {formStaffProximity} <span className="text-xs font-semibold text-blue-800">meters</span>
+              </p>
+              <span className="text-[10px] text-blue-700 font-medium">AI detection attendance radius</span>
+            </div>
+
+            <div className="p-4 bg-slate-50/90 rounded-2xl border border-slate-200">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-600">Department Exclusion</span>
+              <p className="text-2xl font-black font-['Outfit'] text-slate-900 mt-1">
+                {formExcludeDepts ? 'Active' : 'Off'}
+              </p>
+              <span className="text-[10px] text-slate-500 font-medium">Desk zones exempt from wait</span>
+            </div>
+          </div>
+
+          <form onSubmit={handleSaveWaitingConfig} className="space-y-6 pt-2">
+            {/* Setting 1: SLA Cutoff */}
+            <div className="p-5 rounded-2xl bg-slate-50/70 border border-slate-200/80 space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div>
+                  <label className="text-xs font-bold uppercase tracking-wider text-slate-800 flex items-center gap-1.5">
+                    <span>1. Critical SLA Breach Cutoff Limit (Minutes)</span>
+                    <span className="px-2 py-0.5 rounded-full text-[10px] bg-red-100 text-red-700 font-bold">High Priority</span>
+                  </label>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    If an unassisted customer waits longer than this duration on the floor, the system triggers a critical SLA breach alert.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={1}
+                    max={60}
+                    value={formSlaCutoff}
+                    onChange={(e) => {
+                      const val = Math.max(1, parseInt(e.target.value, 10) || 1);
+                      setFormSlaCutoff(val);
+                      updateWaitingConfig({ slaCutoffMinutes: val });
+                      cameraService.saveCameraConfig({ waiting_cutoff_seconds: val * 60 } as any).catch(() => {});
+                    }}
+                    className="w-24 px-3 py-2 text-sm bg-white border border-slate-300 rounded-xl font-bold text-center focus:border-blue-600 outline-none shadow-2xs"
+                  />
+                  <span className="text-xs font-bold text-slate-500">mins</span>
+                </div>
+              </div>
+
+              {/* Quick Preset Pills */}
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <span className="text-[10px] font-bold text-slate-500 uppercase">Presets:</span>
+                {[2, 5, 10, 15, 20, 25, 30].map((mins) => (
+                  <button
+                    key={mins}
+                    type="button"
+                    onClick={() => {
+                      setFormSlaCutoff(mins);
+                      updateWaitingConfig({ slaCutoffMinutes: mins });
+                      cameraService.saveCameraConfig({ waiting_cutoff_seconds: mins * 60 } as any).catch(() => {});
+                    }}
+                    className={`px-3 py-1 rounded-xl text-xs font-bold transition border cursor-pointer ${
+                      formSlaCutoff === mins
+                        ? 'bg-red-600 text-white border-red-600 shadow-xs'
+                        : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
+                    }`}
+                  >
+                    {mins} mins {mins === 15 ? '(Default)' : mins === 2 ? '(Test 2m)' : mins === 5 ? '(Express)' : ''}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Setting 2: Early Warning Threshold */}
+            <div className="p-5 rounded-2xl bg-slate-50/70 border border-slate-200/80 space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div>
+                  <label className="text-xs font-bold uppercase tracking-wider text-slate-800 flex items-center gap-1.5">
+                    <span>2. Early Attention Warning Threshold (Minutes)</span>
+                    <span className="px-2 py-0.5 rounded-full text-[10px] bg-amber-100 text-amber-800 font-bold">Proactive</span>
+                  </label>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Triggers the amber attention banner and highlights the visitor in the waiting queue before the SLA is breached.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={1}
+                    max={formSlaCutoff - 1}
+                    value={formWarningThreshold}
+                    onChange={(e) => setFormWarningThreshold(Math.max(1, parseInt(e.target.value, 10) || 1))}
+                    className="w-24 px-3 py-2 text-sm bg-white border border-slate-300 rounded-xl font-bold text-center focus:border-blue-600 outline-none shadow-2xs"
+                  />
+                  <span className="text-xs font-bold text-slate-500">mins</span>
+                </div>
+              </div>
+
+              {/* Quick Preset Pills */}
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <span className="text-[10px] font-bold text-slate-500 uppercase">Presets:</span>
+                {[2, 3, 5, 7, 10].map((mins) => (
+                  <button
+                    key={mins}
+                    type="button"
+                    onClick={() => setFormWarningThreshold(mins)}
+                    className={`px-3 py-1 rounded-xl text-xs font-bold transition border cursor-pointer ${
+                      formWarningThreshold === mins
+                        ? 'bg-amber-600 text-white border-amber-600 shadow-xs'
+                        : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
+                    }`}
+                  >
+                    {mins} mins {mins === 5 ? '(Default)' : ''}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Setting 3: Staff Attendance Proximity */}
+            <div className="p-5 rounded-2xl bg-slate-50/70 border border-slate-200/80 space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div>
+                  <label className="text-xs font-bold uppercase tracking-wider text-slate-800 flex items-center gap-1.5">
+                    <span>3. Staff Proximity Distance Threshold (Meters)</span>
+                  </label>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    The AI vision detector checks perspective ground distance. If a registered staff member is within this radius, the customer is counted as attended.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    step="0.1"
+                    min={1.0}
+                    max={5.0}
+                    value={formStaffProximity}
+                    onChange={(e) => setFormStaffProximity(parseFloat(e.target.value) || 2.2)}
+                    className="w-24 px-3 py-2 text-sm bg-white border border-slate-300 rounded-xl font-bold text-center focus:border-blue-600 outline-none shadow-2xs"
+                  />
+                  <span className="text-xs font-bold text-slate-500">meters</span>
+                </div>
+              </div>
+
+              {/* Quick Preset Pills */}
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <span className="text-[10px] font-bold text-slate-500 uppercase">Presets:</span>
+                {[1.8, 2.0, 2.2, 2.5, 3.0].map((dist) => (
+                  <button
+                    key={dist}
+                    type="button"
+                    onClick={() => setFormStaffProximity(dist)}
+                    className={`px-3 py-1 rounded-xl text-xs font-bold transition border cursor-pointer ${
+                      formStaffProximity === dist
+                        ? 'bg-blue-600 text-white border-blue-600 shadow-xs'
+                        : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
+                    }`}
+                  >
+                    {dist} m {dist === 2.2 ? '(Default)' : ''}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Setting 4 & 5: Toggles for Department Desk Zones & Sound Alerts */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div
+                onClick={() => setFormExcludeDepts(!formExcludeDepts)}
+                className={`p-4 rounded-2xl border transition-all cursor-pointer flex items-start gap-3.5 select-none ${
+                  formExcludeDepts
+                    ? 'bg-blue-50/60 border-blue-200 shadow-2xs'
+                    : 'bg-slate-50/80 border-slate-200 opacity-80'
+                }`}
+              >
+                <div className="mt-0.5 text-blue-600">
+                  {formExcludeDepts ? (
+                    <ToggleRight className="w-6 h-6 text-blue-600" />
+                  ) : (
+                    <ToggleLeft className="w-6 h-6 text-slate-400" />
+                  )}
+                </div>
+                <div>
+                  <h4 className="font-bold text-xs text-slate-900">Exclude Department Desk Zones</h4>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Customers seated or standing inside defined department zones (Sales Desk, Accounts, Delivery) are considered assisted.
+                  </p>
+                </div>
+              </div>
+
+              <div
+                onClick={() => setFormSoundAlert(!formSoundAlert)}
+                className={`p-4 rounded-2xl border transition-all cursor-pointer flex items-start gap-3.5 select-none ${
+                  formSoundAlert
+                    ? 'bg-amber-50/60 border-amber-200 shadow-2xs'
+                    : 'bg-slate-50/80 border-slate-200 opacity-80'
+                }`}
+              >
+                <div className="mt-0.5 text-amber-600">
+                  {formSoundAlert ? (
+                    <ToggleRight className="w-6 h-6 text-amber-600" />
+                  ) : (
+                    <ToggleLeft className="w-6 h-6 text-slate-400" />
+                  )}
+                </div>
+                <div>
+                  <h4 className="font-bold text-xs text-slate-900">Sound / Chime Alert on SLA Breach</h4>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Plays an alert sound on the dashboard browser when a customer crosses the SLA cutoff without assistance.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Save Button */}
+            <div className="pt-2">
+              <button
+                type="submit"
+                className="w-full py-3 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white rounded-xl text-sm font-bold border border-blue-400/30 shadow-md shadow-blue-500/20 flex items-center justify-center gap-2 transition active:scale-[0.98] cursor-pointer"
+              >
+                <Save className="w-4 h-4" />
+                <span>Save Waiting Time &amp; SLA Configuration</span>
+              </button>
+            </div>
           </form>
         </div>
       )}

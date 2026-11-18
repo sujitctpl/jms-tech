@@ -25,19 +25,19 @@ import {
 const PRESET_STREAMS = [
   {
     label: 'Main Entrance (Ch 101)',
-    url: 'rtsp://zakir:06nov2014@192.168.20.184:554/Streaming/Channels/101',
+    url: 'rtsp://zakir:06nov2014@192.168.20.134:554/Streaming/Channels/101',
   },
   {
     label: 'Display Floor (Ch 201)',
-    url: 'rtsp://zakir:06nov2014@192.168.20.184:554/Streaming/Channels/201',
+    url: 'rtsp://zakir:06nov2014@192.168.20.134:554/Streaming/Channels/201',
   },
   {
     label: 'Customer Lounge (Ch 301)',
-    url: 'rtsp://zakir:06nov2014@192.168.20.184:554/Streaming/Channels/301',
+    url: 'rtsp://zakir:06nov2014@192.168.20.134:554/Streaming/Channels/301',
   },
   {
     label: 'Service Bay (Ch 401)',
-    url: 'rtsp://zakir:06nov2014@192.168.20.184:554/Streaming/Channels/401',
+    url: 'rtsp://zakir:06nov2014@192.168.20.134:554/Streaming/Channels/401',
   },
   {
     label: 'Local USB / Webcam (0)',

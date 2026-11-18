@@ -94,6 +94,16 @@ class CrossCameraTracker:
                 except Exception:
                     pass
 
+    def has_active_visitor(self, person_id: str) -> bool:
+        """Checks if person_id is an active recognized visitor who entered via an entrance camera."""
+        if not person_id:
+            return False
+        self._load_from_disk()
+        key = f"visitor:{str(person_id).strip()}"
+        existing = self._memory_state.get(key)
+        now_ts = time.time()
+        return bool(existing and (now_ts - existing.get("last_seen_ts", 0) <= self.session_timeout))
+
     def get_or_register_staff(
         self,
         emp_id: str,
@@ -171,9 +181,43 @@ class CrossCameraTracker:
             "last_seen_ts": float(now_ts),
             "first_camera": str(camera_channel),
             "last_camera": str(camera_channel),
+            "waiting_seconds": 0.0,
+            "waiting_breach": False,
         }
         self._memory_state[key] = new_entry
         self._dirty = True
         self._save_to_disk(force=True)
 
         return int(local_track_id), float(local_start_ts)
+
+    def update_visitor_waiting(
+        self,
+        person_id: str,
+        waiting_seconds: float,
+        waiting_breach: bool,
+        now_ts: float,
+    ) -> None:
+        """Persists accumulated waiting metrics atomically across cameras."""
+        if not person_id:
+            return
+        self._load_from_disk()
+        key = f"visitor:{str(person_id).strip()}"
+        existing = self._memory_state.get(key)
+        if existing:
+            prev_w = float(existing.get("waiting_seconds", 0.0))
+            existing["waiting_seconds"] = max(prev_w, float(waiting_seconds))
+            existing["waiting_breach"] = bool(existing.get("waiting_breach", False) or waiting_breach)
+            existing["last_seen_ts"] = float(now_ts)
+            self._dirty = True
+            self._save_to_disk()
+
+    def get_visitor_waiting(self, person_id: str) -> Tuple[float, bool]:
+        """Retrieves cross-camera continuous waiting metrics for a visitor."""
+        if not person_id:
+            return (0.0, False)
+        self._load_from_disk()
+        key = f"visitor:{str(person_id).strip()}"
+        existing = self._memory_state.get(key)
+        if existing:
+            return (float(existing.get("waiting_seconds", 0.0)), bool(existing.get("waiting_breach", False)))
+        return (0.0, False)

@@ -70,6 +70,7 @@ class VisitorZoneUpdateRequest(BaseModel):
     waiting_seconds: Optional[int] = None
     is_waiting: Optional[bool] = None
     waiting_breach: Optional[bool] = None
+    face_image_base64: Optional[str] = Field(None, description="Optional Base64 encoded snapshot captured on SLA breach or zone update")
 
 
 class VisitorDetectResponse(BaseModel):

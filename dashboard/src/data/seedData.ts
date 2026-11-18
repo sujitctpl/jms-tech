@@ -57,6 +57,13 @@ export const INITIAL_SHOWROOM_SETTINGS: ShowroomSettings = {
   cctvAiEnabled: true,
   privacyComplianceEnabled: true,
   autoTaggingAssistance: true,
+  waitingConfig: {
+    slaCutoffMinutes: 15,
+    warningThresholdMinutes: 5,
+    staffProximityMeters: 2.2,
+    soundAlertEnabled: true,
+    excludeDepartmentZones: true,
+  },
 };
 
 export const INITIAL_VISITORS: VisitorRecord[] = [];

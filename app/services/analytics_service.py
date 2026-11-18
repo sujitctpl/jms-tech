@@ -40,10 +40,17 @@ class AnalyticsService:
         active_depts = DepartmentRepository(self.db).list_departments(only_active=True)
         active_dept_keys = {d.id.lower() for d in active_depts} if active_depts else None
 
+        import time
         sec_counts: dict = {}
         sec_occupancy: dict = {}
         staff_dwell: dict = {}
-        for cam_telemetry in _edge_telemetry.values():
+        edge_entries = 0
+        has_active_edge = False
+        telemetry_items = [_edge_telemetry[camera_id]] if camera_id and camera_id in _edge_telemetry else list(_edge_telemetry.values())
+        for cam_telemetry in telemetry_items:
+            if time.time() - cam_telemetry.get("last_seen", 0) < 30.0:
+                edge_entries += cam_telemetry.get("total_entries", 0)
+                has_active_edge = True
             for sec_name, count in cam_telemetry.get("section_counts", {}).items():
                 if active_dept_keys is None or sec_name.lower() in active_dept_keys:
                     sec_counts[sec_name] = sec_counts.get(sec_name, 0) + count
@@ -53,8 +60,10 @@ class AnalyticsService:
             for emp_id, dwell_data in cam_telemetry.get("staff_dwell", {}).items():
                 staff_dwell[emp_id] = dwell_data
 
+        effective_total = edge_entries if has_active_edge else total
+
         return FootfallTotalResponse(
-            total_entries=total,
+            total_entries=effective_total,
             camera_id=camera_id,
             start_time=start_time,
             end_time=end_time,

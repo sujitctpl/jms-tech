@@ -131,6 +131,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
     quickCheckOutEmployee,
     staffDepartmentDwell,
     departments,
+    waitingConfig,
   } = useShowroom();
 
   // Interactive Chart States (Neon Wave Curve / Dual Comparative Pillars / Stacked)
@@ -236,12 +237,12 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             <div>
               <div className="flex items-center gap-2">
                 <span className="px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-white text-red-700">
-                  Critical SLA Breach (&gt; 15 Mins)
+                  Critical SLA Breach (&gt; {waitingConfig?.slaCutoffMinutes || 15} Mins)
                 </span>
                 <span className="w-2.5 h-2.5 rounded-full bg-white animate-ping" />
               </div>
               <h2 className="text-base font-extrabold font-['Outfit'] mt-1">
-                {metrics.waitingBreachCount} Customer{metrics.waitingBreachCount > 1 ? 's' : ''} Waiting Unassisted for Over 15 Minutes!
+                {metrics.waitingBreachCount} Customer{metrics.waitingBreachCount > 1 ? 's' : ''} Waiting Unassisted for Over {waitingConfig?.slaCutoffMinutes || 15} Minutes!
               </h2>
               <p className="text-xs text-red-100 mt-0.5">
                 Immediate showroom floor action required: No salesperson is near the visitor, and they are outside any department desk.
@@ -253,6 +254,38 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             className="px-4 py-2.5 bg-white hover:bg-red-50 text-red-700 hover:text-red-800 text-xs font-bold rounded-xl shadow-md transition-all shrink-0 active:scale-[0.98] flex items-center gap-1.5"
           >
             <span>Dispatch Sales Rep Now</span>
+            <ChevronRight className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {/* ⚠️ UNATTENDED WAITING ATTENTION BANNER (< 15 MINS) */}
+      {metrics.unattendedWaitingCount > 0 && metrics.waitingBreachCount === 0 && (
+        <div className="bg-gradient-to-r from-amber-500/15 via-orange-500/10 to-amber-500/5 border-2 border-amber-300 rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 shadow-sm animate-fadeIn">
+          <div className="flex items-start gap-3.5">
+            <div className="p-2.5 bg-amber-100 text-amber-800 rounded-xl shrink-0 mt-0.5 border border-amber-300">
+              <Clock className="w-6 h-6 text-amber-700" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-amber-200 text-amber-900 border border-amber-300">
+                  Floor Service Attention
+                </span>
+                <span className="w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse" />
+              </div>
+              <h2 className="text-base font-extrabold text-amber-950 font-['Outfit'] mt-1">
+                {metrics.unattendedWaitingCount} Customer{metrics.unattendedWaitingCount > 1 ? 's' : ''} Currently Waiting for Assistance
+              </h2>
+              <p className="text-xs text-amber-800 mt-0.5">
+                Customers are currently unassisted on the floor. Average wait today is <strong>{metrics.avgWaitingFormatted}</strong>. Greet them promptly before the {waitingConfig?.slaCutoffMinutes || 15}-minute SLA limit.
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => onNavigateTab('visitors')}
+            className="px-4 py-2.5 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-xl shadow-xs transition-all shrink-0 active:scale-[0.98] flex items-center gap-1.5"
+          >
+            <span>View Floor Queue</span>
             <ChevronRight className="w-4 h-4" />
           </button>
         </div>
@@ -316,13 +349,13 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
           </button>
         </div>
 
-        {/* 4 Elevated KPI Cards */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-5 mb-6">
+        {/* 5 Elevated KPI Cards */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 sm:gap-4 mb-6">
           {/* Total Visitors Today */}
           <div className="p-5 rounded-2xl bg-gradient-to-br from-blue-50/70 via-slate-50/40 to-white border border-blue-200/70 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-200 group">
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-1.5">
-                <span className="text-xs font-bold text-blue-900 uppercase tracking-wider">Total Visitors Today</span>
+                <span className="text-xs font-bold text-blue-900 uppercase tracking-wider">Total Visitors</span>
                 <MetricInfoTooltip
                   title="Total Visitors Today"
                   description="Total distinct customer walk-ins detected entering the showroom today during operational hours."
@@ -377,7 +410,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
           <div className="p-5 rounded-2xl bg-gradient-to-br from-indigo-50/70 via-slate-50/40 to-white border border-indigo-200/70 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-200 group">
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-1.5">
-                <span className="text-xs font-bold text-indigo-950 uppercase tracking-wider">Returning Visitors</span>
+                <span className="text-xs font-bold text-indigo-950 uppercase tracking-wider">Returning</span>
                 <MetricInfoTooltip
                   title="Returning Visitors"
                   description="Repeat customers who previously visited the showroom (for follow-ups, test rides, or delivery)."
@@ -398,18 +431,17 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             <p className="text-[11px] text-slate-600 font-medium mt-3">Repeat visits & test ride follow-ups</p>
           </div>
 
-          {/* Comparison with Yesterday */}
-          <div className="p-5 rounded-2xl bg-gradient-to-br from-amber-50/70 via-slate-50/40 to-white border border-amber-200/70 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-200 group">
+          {/* Day-over-Day Comparison */}
+          <div className="p-5 rounded-2xl bg-gradient-to-br from-purple-50/70 via-slate-50/40 to-white border border-purple-200/70 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-200 group">
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-1.5">
-                <span className="text-xs font-bold text-amber-950 uppercase tracking-wider">Day-over-Day</span>
+                <span className="text-xs font-bold text-purple-950 uppercase tracking-wider">Day-over-Day</span>
                 <MetricInfoTooltip
                   title="Day-over-Day Footfall Growth"
                   description="Percentage comparison of today's customer footfall relative to total visitors yesterday."
-                  alignRight={true}
                 />
               </div>
-              <div className="p-2 rounded-xl bg-amber-100/70 text-amber-700 border border-amber-200/60 group-hover:scale-110 transition-transform">
+              <div className="p-2 rounded-xl bg-purple-100/70 text-purple-700 border border-purple-200/60 group-hover:scale-110 transition-transform">
                 <TrendingUp className="w-4 h-4" />
               </div>
             </div>
@@ -424,6 +456,45 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             <p className="text-[11px] text-slate-600 font-medium mt-3">
               {metrics.totalVisitors === 0 ? "Awaiting today's showroom footfall" : "Steady day-over-day showroom growth"}
             </p>
+          </div>
+
+          {/* Customer Wait Time & Floor SLA (5th Card) */}
+          <div className="p-5 rounded-2xl bg-gradient-to-br from-amber-50/70 via-orange-50/30 to-white border border-amber-200/80 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all duration-200 group">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs font-bold text-amber-950 uppercase tracking-wider">Avg Wait Time</span>
+                <MetricInfoTooltip
+                  title="Customer Waiting Time & Floor SLA"
+                  description="Average unassisted time before customer is greeted by sales staff. SLA target is response under 15 minutes."
+                  alignRight={true}
+                />
+              </div>
+              <div className="p-2 rounded-xl bg-amber-100/80 text-amber-800 border border-amber-300 group-hover:scale-110 transition-transform">
+                <Clock className="w-4 h-4" />
+              </div>
+            </div>
+            <div className="flex items-baseline gap-2">
+              <span className="text-3xl sm:text-4xl font-extrabold text-slate-900 font-['Outfit'] tracking-tight">
+                {metrics.avgWaitingFormatted}
+              </span>
+              <span className="text-xs font-bold text-slate-500">avg wait</span>
+            </div>
+            <div className="mt-3 flex items-center justify-between gap-1 text-[11px]">
+              {metrics.unattendedWaitingCount > 0 ? (
+                <span className="px-2 py-0.5 rounded-md font-bold bg-amber-100 text-amber-900 border border-amber-300 flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-600 animate-ping" />
+                  {metrics.unattendedWaitingCount} unassisted now
+                </span>
+              ) : (
+                <span className="px-2 py-0.5 rounded-md font-bold bg-emerald-100 text-emerald-800 border border-emerald-200 flex items-center gap-1">
+                  <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                  All attended
+                </span>
+              )}
+              <span className="text-slate-500 font-medium">
+                {metrics.slaCompliancePct}% SLA
+              </span>
+            </div>
           </div>
         </div>
 
@@ -494,7 +565,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                         <span className="text-xs font-bold text-slate-300 uppercase tracking-wide">Main Entry Attendance</span>
                       </div>
                       <div className="text-2xl sm:text-3xl font-extrabold font-['Outfit'] text-white mt-1">
-                        {metrics.totalVisitors}
+                        {metrics.virtualLineCrossings}
                       </div>
                       <div className="text-[11px] text-slate-400 mt-0.5">
                         Crossed Virtual Line
@@ -1116,6 +1187,175 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
       </div>
 
       {/* ========================================================================= */}
+      {/* SECTION: LIVE CUSTOMER WAITING QUEUE & FLOOR SERVICE SLA */}
+      {/* ========================================================================= */}
+      <section className="bg-white rounded-3xl p-6 sm:p-7 border border-slate-200/80 shadow-[0_4px_24px_-4px_rgba(15,23,42,0.06)]">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-slate-100 gap-3 mb-6">
+          <div className="flex items-center gap-3">
+            <div className="p-2.5 rounded-2xl bg-amber-50 text-amber-600 border border-amber-200/80 shadow-2xs">
+              <Clock className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h2 className="text-lg font-bold text-slate-900 font-['Outfit']">
+                  Live Customer Waiting Queue &amp; Floor Service SLA
+                </h2>
+                {metrics.unattendedWaitingCount > 0 ? (
+                  <span className="text-[10px] font-black bg-amber-100 text-amber-800 px-2.5 py-0.5 rounded-full border border-amber-200 animate-pulse flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-600 animate-ping" />
+                    {metrics.unattendedWaitingCount} unassisted on floor
+                  </span>
+                ) : (
+                  <span className="text-[10px] font-bold bg-emerald-100/80 text-emerald-800 px-2.5 py-0.5 rounded-full border border-emerald-200/60">
+                    Floor All Attended
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Real-time AI camera detection of customers standing unassisted on the showroom floor (&lt; 15m cutoff SLA)
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => onNavigateTab('visitors')}
+            className="text-xs text-blue-600 hover:text-blue-800 font-bold flex items-center gap-1 self-start sm:self-auto px-3 py-1.5 rounded-xl hover:bg-blue-50 transition border border-transparent hover:border-blue-200"
+          >
+            <span>View All Visitors</span>
+            <ChevronRight className="w-4 h-4" />
+          </button>
+        </div>
+
+        {/* 4 Quick SLA KPI Micro-Metrics */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+          <div className="p-3.5 bg-slate-50/80 rounded-2xl border border-slate-200/80">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Average Wait Today</span>
+            <p className="text-2xl font-extrabold font-['Outfit'] text-slate-900 mt-1">
+              {metrics.avgWaitingFormatted}
+            </p>
+            <span className="text-[10px] text-slate-500">Across all walk-ins</span>
+          </div>
+
+          <div className="p-3.5 bg-amber-50/60 rounded-2xl border border-amber-200/70">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-amber-800">Currently Waiting</span>
+            <p className="text-2xl font-extrabold font-['Outfit'] text-amber-950 mt-1">
+              {metrics.unattendedWaitingCount}
+            </p>
+            <span className="text-[10px] text-amber-700">Awaiting staff greeting</span>
+          </div>
+
+          <div className="p-3.5 bg-emerald-50/60 rounded-2xl border border-emerald-200/70">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-800">15m SLA Compliance</span>
+            <p className="text-2xl font-extrabold font-['Outfit'] text-emerald-950 mt-1">
+              {metrics.slaCompliancePct}%
+            </p>
+            <span className="text-[10px] text-emerald-700">Attended before cutoff</span>
+          </div>
+
+          <div className={`p-3.5 rounded-2xl border ${metrics.waitingBreachCount > 0 ? 'bg-red-50/80 border-red-300' : 'bg-slate-50/80 border-slate-200/80'}`}>
+            <span className={`text-[10px] font-bold uppercase tracking-wider ${metrics.waitingBreachCount > 0 ? 'text-red-700' : 'text-slate-500'}`}>
+              SLA Breaches (&gt; 15m)
+            </span>
+            <p className={`text-2xl font-extrabold font-['Outfit'] mt-1 ${metrics.waitingBreachCount > 0 ? 'text-red-700 animate-pulse' : 'text-slate-900'}`}>
+              {metrics.waitingBreachCount}
+            </p>
+            <span className={`text-[10px] ${metrics.waitingBreachCount > 0 ? 'text-red-600 font-bold' : 'text-slate-500'}`}>
+              {metrics.waitingBreachCount > 0 ? 'Requires immediate action' : 'Zero breaches today'}
+            </span>
+          </div>
+        </div>
+
+        {/* ========================================================================= */}
+        {/* 📸 CAPTURED SLA BREACH & CCTV INCIDENT SNAPSHOTS GALLERY */}
+        {/* ========================================================================= */}
+        <div className="pt-2">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+            <div className="flex items-center gap-2.5">
+              <div className="p-2 rounded-xl bg-red-100 text-red-700">
+                <Camera className="w-4 h-4" />
+              </div>
+              <div>
+                <h3 className="text-xs font-bold uppercase tracking-wider text-slate-900 flex items-center gap-2">
+                  <span>📸 Captured SLA Breach Snapshots (&gt; {waitingConfig?.slaCutoffMinutes || 15}m Cutoff)</span>
+                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-bold ${
+                    metrics.breachVisitors.length > 0 ? 'bg-red-600 text-white animate-pulse' : 'bg-slate-100 text-slate-600'
+                  }`}>
+                    {metrics.breachVisitors.length} Captured
+                  </span>
+                </h3>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Automatic high-clarity camera snapshots saved whenever an unassisted customer crosses the SLA cutoff.
+                </p>
+              </div>
+            </div>
+            {metrics.breachVisitors.length === 0 ? (
+              <span className="text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-3 py-1 rounded-xl border border-emerald-200/60 shrink-0">
+                ✓ Zero Breaches Today
+              </span>
+            ) : (
+              <span className="text-[11px] font-bold text-red-700 bg-red-50 px-3 py-1 rounded-xl border border-red-200 shrink-0 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-red-600 animate-ping" />
+                {metrics.breachVisitors.length} Incident Snapshot{metrics.breachVisitors.length > 1 ? 's' : ''} on Record
+              </span>
+            )}
+          </div>
+
+          {metrics.breachVisitors.length > 0 ? (
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
+              {metrics.breachVisitors.map((vis) => (
+                <div
+                  key={vis.id}
+                  onClick={() => setInspectedVisitor(vis)}
+                  className="group/card relative rounded-2xl overflow-hidden border-2 border-red-500/80 bg-slate-900 shadow-xs hover:shadow-md cursor-pointer hover:scale-[1.03] transition-all"
+                  title="Click to view full CCTV camera snapshot"
+                >
+                  <div className="aspect-[4/3] w-full bg-slate-950 relative overflow-hidden">
+                    {vis.avatarUrl ? (
+                      <img
+                        src={vis.avatarUrl}
+                        alt={vis.visitorId}
+                        className="w-full h-full object-cover object-top contrast-[1.05] brightness-95 group-hover/card:scale-105 transition-transform"
+                      />
+                    ) : (
+                      <div className="w-full h-full flex flex-col items-center justify-center text-slate-500">
+                        <Camera className="w-6 h-6 text-slate-600 mb-1" />
+                        <span className="text-[10px]">No Photo</span>
+                      </div>
+                    )}
+                    {/* Badge Overlay */}
+                    <div className="absolute top-1.5 left-1.5 bg-red-600/90 text-white text-[8px] font-mono font-bold px-1.5 py-0.5 rounded shadow-xs flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 rounded-full bg-white animate-ping" />
+                      SLA BREACH
+                    </div>
+                    <div className="absolute bottom-1.5 right-1.5 bg-black/80 text-emerald-400 text-[8px] font-mono font-bold px-1.5 py-0.5 rounded">
+                      ⏱️ {vis.waitingFormatted || `${Math.round((vis.waitingSeconds || 0) / 60)}m`}
+                    </div>
+                  </div>
+                  <div className="p-2.5 bg-white border-t border-slate-100">
+                    <p className="font-mono font-bold text-xs text-slate-900 truncate">{vis.visitorId}</p>
+                    <p className="text-[10px] text-slate-500 truncate mt-0.5">
+                      📍 {vis.zoneEntered || 'Showroom Floor'}
+                    </p>
+                    <p className="text-[10px] text-red-600 font-bold mt-1">
+                      Waited {vis.waitingFormatted || `${vis.waitingSeconds}s`}
+                    </p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="p-5 rounded-2xl bg-slate-50/80 border border-dashed border-slate-200 text-center">
+              <p className="text-xs text-slate-600 font-medium">
+                No customer has exceeded the {waitingConfig?.slaCutoffMinutes || 15}-minute cutoff limit today.
+              </p>
+              <p className="text-[11px] text-slate-400 mt-0.5">
+                The moment a visitor waits unassisted for over {waitingConfig?.slaCutoffMinutes || 15} minutes, their CCTV camera snapshot will be automatically captured and permanently archived in this incident gallery.
+              </p>
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* ========================================================================= */}
       {/* 2-COLUMN GRID: SECTION D (AVERAGE TIME PER VISITOR) & SECTION E (STORE OPERATING HOURS) */}
       {/* ========================================================================= */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
@@ -1569,12 +1809,12 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             {/* Modal Body */}
             <div className="p-5 sm:p-6 space-y-4">
               {/* Clear CCTV Snapshot Frame */}
-              <div className="relative rounded-2xl overflow-hidden border border-slate-800 bg-black flex items-center justify-center h-64 sm:h-72 group shadow-inner">
+              <div className="relative rounded-2xl overflow-hidden border border-slate-800 bg-black flex items-center justify-center min-h-[300px] max-h-[460px] group shadow-inner">
                 {inspectedVisitor.avatarUrl ? (
                   <img
                     src={inspectedVisitor.avatarUrl}
                     alt={inspectedVisitor.visitorId}
-                    className="w-full h-full object-cover object-top contrast-[1.05] brightness-95"
+                    className="w-full h-auto max-h-[460px] object-contain"
                   />
                 ) : (
                   <div className="w-full h-full flex flex-col items-center justify-center text-slate-500 gap-2">
@@ -1587,10 +1827,21 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 <div className="absolute top-2.5 inset-x-3 flex items-center justify-between text-[10px] font-mono text-emerald-400 bg-black/75 px-2.5 py-1 rounded border border-emerald-400/20 pointer-events-none">
                   <span className="flex items-center gap-1.5 font-bold">
                     <span className="w-2 h-2 rounded-full bg-red-500 animate-ping" />
-                    LIVE • CAM 01 [MAIN ENTRANCE]
+                    LIVE • {inspectedVisitor.cameraSource || 'CAM 01 [MAIN ENTRANCE]'}
                   </span>
                   <span className="text-slate-300">1080P HD • 25 FPS</span>
                 </div>
+
+                {/* SLA Breach Banner on Snapshot */}
+                {(inspectedVisitor.waitingBreach || (inspectedVisitor.waitingSeconds || 0) >= (waitingConfig?.slaCutoffMinutes || 15) * 60) && (
+                  <div className="absolute top-10 inset-x-3 flex items-center justify-between text-[10px] font-mono font-bold text-white bg-red-600/90 px-2.5 py-1 rounded border border-red-400 shadow-sm pointer-events-none z-10">
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-white animate-ping" />
+                      CRITICAL SLA BREACH SNAPSHOT (&gt; {waitingConfig?.slaCutoffMinutes || 15}m UNATTENDED)
+                    </span>
+                    <span>WAIT: {inspectedVisitor.waitingFormatted || `${Math.round((inspectedVisitor.waitingSeconds || 0) / 60)}m`}</span>
+                  </div>
+                )}
 
                 {/* Face Detection Bounding Corners */}
                 <div className="absolute inset-x-12 inset-y-8 border border-emerald-400/80 rounded-xl pointer-events-none shadow-[0_0_15px_rgba(16,185,129,0.4)] flex flex-col justify-between p-2">
