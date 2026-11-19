@@ -7,6 +7,7 @@ class VisitorResponse(BaseModel):
     id: str
     visitorId: str
     avatarUrl: Optional[str] = None
+    exitAvatarUrl: Optional[str] = None
     firstSeenTime: str
     lastSeenTime: Optional[str] = None
     exitTime: Optional[str] = None
@@ -45,6 +46,7 @@ class VisitorTagRequest(BaseModel):
 class VisitorDetectRequest(BaseModel):
     face_image_base64: Optional[str] = Field(None, description="Base64 encoded JPEG crop of the face")
     face_embedding: Optional[List[float]] = Field(None, description="512-dim ArcFace embedding vector")
+    body_embedding: Optional[List[float]] = Field(None, description="512-dim OSNet body ReID embedding vector")
     person_id: Optional[str] = Field(None, description="Persistent visitor ID if already resolved")
     camera_id: Optional[str] = None
     camera_name: Optional[str] = "Main Entrance"
@@ -54,7 +56,7 @@ class VisitorDetectRequest(BaseModel):
     appearance: Optional[str] = Field(None, description="Estimated clothing appearance e.g. Blue Top")
     zone_dwell: Optional[Dict[str, str]] = Field(None, description="Dwell times per detection zone")
     exit_time: Optional[str] = Field(None, description="Departure time formatted string")
-    is_entrance: Optional[bool] = Field(True, description="Whether this camera is a store entrance camera")
+    is_entrance: Optional[bool] = Field(None, description="Whether this camera is a store entrance camera")
     waiting_seconds: Optional[int] = Field(None, description="Accumulated unattended waiting time in seconds")
     is_waiting: Optional[bool] = Field(None, description="Whether visitor is currently waiting unattended")
     waiting_breach: Optional[bool] = Field(None, description="Whether waiting time exceeded cutoff (15 mins)")
@@ -71,6 +73,9 @@ class VisitorZoneUpdateRequest(BaseModel):
     is_waiting: Optional[bool] = None
     waiting_breach: Optional[bool] = None
     face_image_base64: Optional[str] = Field(None, description="Optional Base64 encoded snapshot captured on SLA breach or zone update")
+    exit_image_base64: Optional[str] = Field(None, description="Optional Base64 encoded snapshot captured when visitor departs through entrance")
+    body_embedding: Optional[List[float]] = Field(None, description="Optional 512-dim OSNet body ReID embedding vector")
+
 
 
 class VisitorDetectResponse(BaseModel):

@@ -118,6 +118,21 @@ def clear_all_visitors(
 
 
 @router.delete(
+    "/{person_id}",
+    status_code=status.HTTP_200_OK,
+    summary="Delete a single bounced or cancelled visitor record",
+)
+def delete_single_visitor(
+    person_id: str,
+    db: Session = Depends(get_db),
+):
+    """Deletes a single visitor record, footfall event, and snapshot image."""
+    service = VisitorService(db)
+    success = service.delete_visitor(person_id)
+    return {"success": success, "person_id": person_id}
+
+
+@router.delete(
     "",
     status_code=status.HTTP_200_OK,
     summary="Delete all visitor records",

@@ -28,6 +28,7 @@ from app.schemas.visitor import (
 )
 from app.services.employee_service import global_employee_recognizer
 from app.vision.face_embedder import FaceEmbedder
+from app.vision.body_embedder import BodyEmbedder
 
 # Indian Standard Time (UTC+05:30)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -65,6 +66,7 @@ class VisitorService:
         self.emp_repo = EmployeeRepository(db)
         self.attendance_repo = EmployeeAttendanceRepository(db)
         self.embedder = FaceEmbedder()
+        self.body_embedder = BodyEmbedder()
 
     def _to_visitor_response(self, record: PersonIdentity) -> VisitorResponse:
         # Convert created_at and last_seen_at to Indian Standard Time (IST) 12-hour AM/PM format
@@ -96,10 +98,24 @@ class VisitorService:
             # If the visit is from a previous calendar date (in IST), departure was when last seen
             if created_ist.date() < now_ist.date():
                 exit_time_val = last_seen_str or first_seen_str
+                record.exit_time = exit_time_val
+                record.is_waiting = False
+                try:
+                    self.db.add(record)
+                    self.db.commit()
+                except Exception:
+                    pass
             elif last_seen_ist:
                 # If visitor hasn't been seen in > 15 minutes today, mark departed
                 if (now_ist - last_seen_ist).total_seconds() > 900:
                     exit_time_val = last_seen_str
+                    record.exit_time = exit_time_val
+                    record.is_waiting = False
+                    try:
+                        self.db.add(record)
+                        self.db.commit()
+                    except Exception:
+                        pass
 
         # Calculate duration in minutes (till exit if departed, or till now if active inside)
         duration = 0
@@ -142,21 +158,37 @@ class VisitorService:
             primary_z = record.zone_entered or "Main Showroom"
             zone_dwell_dict = {primary_z: f"{duration} mins"}
 
-        # Dynamic cache-busting timestamp on avatarUrl so browsers NEVER serve stale cached images
+        # Dynamic cache-busting timestamp on avatarUrl (verify file exists on disk)
         avatar_url_res = record.avatar_url
         if avatar_url_res:
             mtime = 0
             try:
                 clean_path = avatar_url_res.lstrip("/").split("?")[0]
-                if os.path.exists(clean_path):
+                if os.path.isfile(clean_path):
                     mtime = int(os.path.getmtime(clean_path))
+                else:
+                    avatar_url_res = None
             except Exception:
                 pass
-            if not mtime:
-                ts_dt = record.last_seen_at or record.created_at
-                mtime = int(ts_dt.timestamp()) if ts_dt else int(datetime.now(timezone.utc).timestamp())
-            base_url = avatar_url_res.split("?")[0]
-            avatar_url_res = f"{base_url}?t={mtime}"
+            if avatar_url_res and mtime:
+                base_url = avatar_url_res.split("?")[0]
+                avatar_url_res = f"{base_url}?t={mtime}"
+
+        # Dynamic cache-busting timestamp on exitAvatarUrl (verify file exists on disk)
+        exit_avatar_url_res = getattr(record, "exit_avatar_url", None)
+        if exit_avatar_url_res:
+            mtime_e = 0
+            try:
+                clean_path_e = exit_avatar_url_res.lstrip("/").split("?")[0]
+                if os.path.isfile(clean_path_e):
+                    mtime_e = int(os.path.getmtime(clean_path_e))
+                else:
+                    exit_avatar_url_res = None
+            except Exception:
+                pass
+            if exit_avatar_url_res and mtime_e:
+                base_url_e = exit_avatar_url_res.split("?")[0]
+                exit_avatar_url_res = f"{base_url_e}?t={mtime_e}"
 
         # Resolve waiting time metrics
         waiting_sec = int(getattr(record, "waiting_seconds", 0) or 0)
@@ -174,6 +206,7 @@ class VisitorService:
             id=str(record.id),
             visitorId=record.person_id,
             avatarUrl=avatar_url_res,
+            exitAvatarUrl=exit_avatar_url_res,
             firstSeenTime=first_seen_str,
             lastSeenTime=last_seen_str,
             exitTime=exit_time_val,
@@ -260,30 +293,163 @@ class VisitorService:
                 if time_diff < 45.0:
                     record = cand
 
+        # Extract exit image crop & embeddings (Face + Body Person Re-ID)
+        exit_img_b64 = getattr(payload, "exit_image_base64", None)
+        if not exit_img_b64 and payload.exit_time and getattr(payload, "face_image_base64", None):
+            exit_img_b64 = payload.face_image_base64
+
+        exit_crop_img = None
+        exit_face_emb = None
+        exit_body_emb = None
+        if exit_img_b64:
+            try:
+                b64_str = exit_img_b64
+                if "," in b64_str:
+                    b64_str = b64_str.split(",", 1)[1]
+                b64_str = b64_str.strip()
+                missing_padding = len(b64_str) % 4
+                if missing_padding:
+                    b64_str += "=" * (4 - missing_padding)
+                crop_bytes = base64.b64decode(b64_str)
+                nparr = np.frombuffer(crop_bytes, np.uint8)
+                exit_crop_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                if exit_crop_img is not None and exit_crop_img.size > 0:
+                    try:
+                        c_face, c_lms, raw_lms = self.embedder.detect_and_crop_face(exit_crop_img)
+                        if c_face is not None and c_face.size > 0:
+                            exit_face_emb = self.embedder.extract_embedding(
+                                c_face, c_lms, full_image=exit_crop_img, raw_landmarks=raw_lms
+                            )
+                    except Exception:
+                        pass
+                    # Extract full-body OSNet Person Re-ID embedding from exit crop
+                    exit_body_emb = self.body_embedder.extract_embedding(exit_crop_img)
+            except Exception as e:
+                logger.warning("Could not extract exit image embeddings: %s", e)
+
+        # Verify biometric consistency if candidate record has a stored face embedding and exit photo has a face
+        if record and payload.exit_time and exit_face_emb is not None:
+            cand_emb = record.get_embedding_vector()
+            if cand_emb is not None:
+                sim = FaceEmbedder.compute_similarity(exit_face_emb, cand_emb)
+                if sim < 0.45:
+                    logger.warning(
+                        "Biometric mismatch on exit for visitor %s: similarity %.3f < 0.45. Refusing to attach exit to this visitor.",
+                        record.person_id,
+                        sim,
+                    )
+                    record = None
+
         # Fallback for store exit: if tracker ID was reset on 180-deg turnaround (e.g. #2 became #6)
         if not record and payload.exit_time:
-            active_cand = (
+            now_ist = datetime.now(IST)
+            active_cands = (
                 self.db.query(PersonIdentity)
                 .filter(
                     PersonIdentity.is_expired.is_(False),
                     PersonIdentity.exit_time.is_(None),
                 )
                 .order_by(PersonIdentity.last_seen_at.desc())
-                .first()
+                .all()
             )
-            if active_cand and active_cand.last_seen_at:
-                # Any active customer who entered today (within 12 hours)
-                time_diff = (now_utc - active_cand.last_seen_at).total_seconds()
-                if time_diff < 43200.0:
-                    record = active_cand
+
+            # 1. If exit face embedding is available, search active candidates for a biometric face match (>= 0.50)
+            if exit_face_emb is not None:
+                best_match = None
+                best_sim = 0.0
+                for active_cand in active_cands:
+                    cand_emb = active_cand.get_embedding_vector()
+                    if cand_emb is not None:
+                        sim = FaceEmbedder.compute_similarity(exit_face_emb, cand_emb)
+                        if sim >= 0.50 and sim > best_sim:
+                            best_sim = sim
+                            best_match = active_cand
+                if best_match:
+                    record = best_match
                     logger.info(
-                        "Resolved entrance exit event to active showroom visitor %s (Tracker swapped on turnaround).",
+                        "Resolved entrance exit event to active showroom visitor %s via biometric face match (sim=%.3f).",
                         record.person_id,
+                        best_sim,
                     )
 
+            # 2. Dual-Factor Appearance Match: OSNet Person Re-ID + Multi-Part 3D Clothing Color Correlation
+            if not record and exit_body_emb is not None:
+                best_body_match = None
+                best_body_sim = 0.0
+                best_color_sim = 0.0
+                for active_cand in active_cands:
+                    cand_b_emb = active_cand.get_body_embedding_vector()
+                    if cand_b_emb is not None:
+                        # Load candidate entry image to verify clothing color distribution
+                        cand_crop = None
+                        if getattr(active_cand, "avatar_url", None):
+                            c_path = active_cand.avatar_url.lstrip("/").split("?")[0]
+                            if os.path.isfile(c_path):
+                                cand_crop = cv2.imread(c_path)
+
+                        reid_s, clothing_s, app_score, is_match = self.body_embedder.verify_appearance(
+                            crop1=exit_crop_img,
+                            crop2=cand_crop,
+                            emb1=exit_body_emb,
+                            emb2=cand_b_emb,
+                        )
+
+                        # Strict Multi-Factor verification:
+                        # 1. is_match enforces hard Re-ID floor (>= 0.81) + 3D torso/legs clothing correlation (>= 0.60)
+                        # 2. Minimum time in store must be >= 15 seconds (prevents instant turnaround misattribution)
+                        time_in_store = (now_utc - active_cand.created_at).total_seconds() if active_cand.created_at else 30.0
+                        if is_match and time_in_store >= 15.0 and app_score > best_body_sim:
+                            best_body_sim = app_score
+                            best_color_sim = clothing_s
+                            best_body_match = active_cand
+
+                if best_body_match:
+                    record = best_body_match
+                    logger.info(
+                        "Resolved entrance exit event to active showroom visitor %s via Dual-Factor Re-ID & Clothing Match (score=%.3f, color=%.3f).",
+                        record.person_id,
+                        best_body_sim,
+                        best_color_sim,
+                    )
+
+            # 3. Fallback: If only one active visitor is in the store, verify appearance before turnaround resolve
+            if not record and len(active_cands) == 1:
+                cand = active_cands[0]
+                cand_ist = to_ist(cand.created_at)
+                if cand_ist and cand_ist.date() == now_ist.date():
+                    total_presence = (now_utc - cand.created_at).total_seconds() if cand.created_at else 10.0
+                    if total_presence >= 15.0 and cand.last_seen_at and (now_utc - cand.last_seen_at).total_seconds() < 180.0:
+                        cand_b_emb = cand.get_body_embedding_vector()
+                        cand_crop = None
+                        if getattr(cand, "avatar_url", None):
+                            c_path = cand.avatar_url.lstrip("/").split("?")[0]
+                            if os.path.isfile(c_path):
+                                cand_crop = cv2.imread(c_path)
+                        reid_s, clothing_s, lone_score, is_lone_match = self.body_embedder.verify_appearance(
+                            crop1=exit_crop_img,
+                            crop2=cand_crop,
+                            emb1=exit_body_emb,
+                            emb2=cand_b_emb,
+                        )
+                        if is_lone_match:
+                            record = cand
+                            logger.info(
+                                "Resolved entrance exit event to lone active showroom visitor %s (Tracker swapped on turnaround, score=%.3f).",
+                                record.person_id,
+                                lone_score,
+                            )
+
+            # 4. If still unmapped, suppress phantom visitor creation instead of polluting dashboard with 0-min duplicates
+            if not record:
+                logger.warning(
+                    "Unmapped exit event for tracker %s could not be matched to any active visitor. Suppressed ghost visitor creation.",
+                    payload.tracker_id,
+                )
+                return None
+
         if not record:
-            # Person has not been registered via an Entrance Line crossing; do not mint ghost visitors
             return None
+
         record.last_seen_at = now_utc
         if payload.tracker_id and f"Tracker #{payload.tracker_id}" not in (record.notes or ""):
             record.notes = f"{record.notes} | Tracker #{payload.tracker_id}" if record.notes else f"Tracker #{payload.tracker_id}"
@@ -294,7 +460,30 @@ class VisitorService:
             record.is_waiting = False
         if payload.zone_dwell:
             record.zone_dwell = json.dumps(payload.zone_dwell)
-        if getattr(payload, "face_image_base64", None):
+
+        # Handle saving exit snapshot
+        if exit_crop_img is not None and exit_crop_img.size > 0:
+            try:
+                os.makedirs("static/uploads/visitors", exist_ok=True)
+                now_epoch = int(datetime.now(timezone.utc).timestamp())
+                filename = f"{record.person_id}_exit_{now_epoch}.jpg"
+                if getattr(record, "exit_avatar_url", None):
+                    old_f = os.path.join(".", record.exit_avatar_url.lstrip("/").split("?")[0])
+                    entry_f = os.path.join(".", record.avatar_url.lstrip("/").split("?")[0]) if getattr(record, "avatar_url", None) else None
+                    if os.path.isfile(old_f):
+                        # Safety: never delete if avatar_url is pointing to the same file on disk
+                        if not entry_f or os.path.abspath(old_f) != os.path.abspath(entry_f):
+                            try:
+                                os.remove(old_f)
+                            except Exception:
+                                pass
+                filepath = os.path.join("static", "uploads", "visitors", filename)
+                cv2.imwrite(filepath, exit_crop_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                record.exit_avatar_url = f"/static/uploads/visitors/{filename}"
+                logger.info("Saved exit snapshot for visitor %s to %s", record.person_id, filepath)
+            except Exception as e:
+                logger.error("Failed to write visitor exit snapshot: %s", str(e))
+        elif getattr(payload, "face_image_base64", None) and not payload.exit_time:
             try:
                 b64_str = payload.face_image_base64
                 if "," in b64_str:
@@ -391,6 +580,27 @@ class VisitorService:
             "deleted_files": deleted_files,
             "message": "All visitor records, footfall events, tracks, and face snapshots cleared successfully.",
         }
+
+    def delete_visitor(self, person_id: str) -> bool:
+        """Deletes a single visitor record, its tracks, footfall events, and snapshot image (used for bounce cancellations)."""
+        record = self.repo.get_by_person_id(person_id)
+        if not record:
+            return False
+        if record.avatar_url:
+            try:
+                rel_path = record.avatar_url.lstrip("/")
+                if os.path.exists(rel_path):
+                    os.remove(rel_path)
+            except Exception:
+                pass
+        tracks = self.db.query(VisitorTrack).filter(VisitorTrack.person_identity_id == record.id).all()
+        for t in tracks:
+            self.db.query(FootfallEvent).filter(FootfallEvent.visitor_track_id == t.id).delete()
+            self.db.delete(t)
+        self.db.delete(record)
+        self.db.commit()
+        logger.info("Deleted bounced/cancelled visitor record %s and associated footfall events.", person_id)
+        return True
 
     def create_walk_in(self, payload: WalkInCreateRequest) -> VisitorResponse:
         total_count = self.db.query(PersonIdentity).count()
@@ -529,10 +739,16 @@ class VisitorService:
         if req.face_embedding and len(req.face_embedding) == 512:
             embedding = np.array(req.face_embedding, dtype=np.float32)
         elif face_img is not None and face_img.size > 0:
-            try:
-                embedding = self.embedder.extract_embedding(face_img)
-            except Exception as e:
-                logger.warning("Failed to extract embedding from face crop: %s", str(e))
+            # ONLY extract embedding if face_img is actually a tight face crop, NOT a full body portrait!
+            # Full-body crops squash the human torso into 112x112, causing false ArcFace cross-identity collisions (>0.85 similarity)
+            fh, fw = face_img.shape[:2]
+            ar = float(fw) / float(fh) if fh > 0 else 0.0
+            # A genuine face crop has roughly 1:1 aspect ratio (0.55 to 1.45) and is not a tall full-body crop
+            if 0.55 <= ar <= 1.45 and fh <= 220 and fw <= 220:
+                try:
+                    embedding = self.embedder.extract_embedding(face_img)
+                except Exception as e:
+                    logger.warning("Failed to extract embedding from face crop: %s", str(e))
 
         # ---------------------------------------------------------------------
         # 1. Check against Showroom Employee Roster
@@ -587,30 +803,50 @@ class VisitorService:
         past_record = None
 
         now_ist = datetime.now(IST)
+        if req.is_entrance is not None:
+            is_cam_entrance = bool(req.is_entrance)
+        else:
+            c_name = (req.camera_name or "").lower()
+            is_cam_entrance = ("entrance" in c_name or "gate" in c_name or "door" in c_name or "entry" in c_name)
 
         if embedding is not None:
-            visitor_reid_thresh = float(getattr(settings, "VISITOR_REID_THRESHOLD", 0.55))
+            visitor_reid_thresh = float(getattr(settings, "VISITOR_REID_THRESHOLD", 0.65))
 
             # Step 2A: Check for an ongoing active visit inside the showroom TODAY
-            active_pid, active_sim = self.repo.find_best_match(
-                embedding=embedding,
-                similarity_threshold=visitor_reid_thresh,
-                only_active=True,
-            )
-            if active_pid:
-                cand = self.repo.get_by_person_id(active_pid)
-                if cand and not cand.is_expired and cand.exit_time is None:
-                    cand_ist = to_ist(cand.created_at)
-                    if cand_ist and cand_ist.date() == now_ist.date():
-                        matched_person_id = active_pid
-                        matched_similarity = active_sim
-                        is_active_session = True
-                    else:
-                        # Stale visit from a previous calendar day: close it out
+            # IMPORTANT: A person crossing an entrance line on an ENTRANCE camera is an arrival,
+            # NOT someone who is already actively walking around inside the showroom.
+            # Only interior cameras (not is_cam_entrance) or matching tracker IDs re-identify active visitors!
+            if not is_cam_entrance:
+                active_pid, active_sim = self.repo.find_best_match(
+                    embedding=embedding,
+                    similarity_threshold=visitor_reid_thresh,
+                    only_active=True,
+                )
+                if active_pid:
+                    cand = self.repo.get_by_person_id(active_pid)
+                    if cand and not cand.is_expired and cand.exit_time is None:
+                        cand_ist = to_ist(cand.created_at)
                         c_last_ist = to_ist(cand.last_seen_at) or cand_ist
-                        cand.exit_time = c_last_ist.strftime("%I:%M %p") if c_last_ist else "Exited"
-                        self.db.add(cand)
-                        self.db.commit()
+                        if cand_ist and cand_ist.date() == now_ist.date():
+                            # If customer hasn't been seen for > 30 minutes, prior visit timed out: close it out
+                            if c_last_ist and (now_ist - c_last_ist).total_seconds() > 1800.0:
+                                cand.exit_time = c_last_ist.strftime("%I:%M %p")
+                                cand.is_waiting = False
+                                self.db.add(cand)
+                                self.db.commit()
+                                is_returning_customer = True
+                                past_record = cand
+                                is_active_session = False
+                            else:
+                                # Customer is continuously active inside the showroom on their ongoing visit!
+                                matched_person_id = active_pid
+                                matched_similarity = active_sim
+                                is_active_session = True
+                        else:
+                            # Stale visit from a previous calendar day: close it out
+                            cand.exit_time = c_last_ist.strftime("%I:%M %p") if c_last_ist else "Exited"
+                            self.db.add(cand)
+                            self.db.commit()
 
             # Step 2B: If not currently active today, check 14-day history for returning customer
             if not is_active_session:
@@ -623,23 +859,33 @@ class VisitorService:
                     history_cand = self.repo.get_by_person_id(history_pid)
                     if history_cand and not history_cand.is_expired:
                         hist_ist = to_ist(history_cand.created_at)
+                        h_last_ist = to_ist(history_cand.last_seen_at) or hist_ist
                         # A visit from a previous day OR with an exit_time marked indicates a returning customer
                         if (hist_ist and hist_ist.date() < now_ist.date()) or history_cand.exit_time is not None:
                             is_returning_customer = True
                             past_record = history_cand
                             if not history_cand.exit_time:
-                                h_last_ist = to_ist(history_cand.last_seen_at) or hist_ist
                                 history_cand.exit_time = h_last_ist.strftime("%I:%M %p") if h_last_ist else "Exited"
                                 self.db.add(history_cand)
                                 self.db.commit()
                         else:
-                            matched_person_id = history_pid
-                            matched_similarity = history_sim
-                            is_active_session = True
+                            # Same day and not marked exited: check if absent for > 30 minutes
+                            if h_last_ist and (now_ist - h_last_ist).total_seconds() > 1800.0:
+                                history_cand.exit_time = h_last_ist.strftime("%I:%M %p")
+                                history_cand.is_waiting = False
+                                self.db.add(history_cand)
+                                self.db.commit()
+                                is_returning_customer = True
+                                past_record = history_cand
+                                is_active_session = False
+                            elif not is_cam_entrance:
+                                matched_person_id = history_pid
+                                matched_similarity = history_sim
+                                is_active_session = True
 
         # Extended recency safety net: Match visitors active in the showroom today (within 2 hours)
-        # ONLY if biometric match is genuinely high (sim >= 0.55)
-        if not is_active_session and not is_returning_customer and embedding is not None:
+        # ONLY on interior cameras and if biometric match is genuinely high (sim >= 0.65)
+        if not is_active_session and not is_returning_customer and embedding is not None and not is_cam_entrance:
             recent_identities = (
                 self.db.query(PersonIdentity)
                 .filter(
@@ -658,13 +904,24 @@ class VisitorService:
                     norm_r = np.linalg.norm(rec_emb)
                     rec_norm = (rec_emb / norm_r).astype(np.float32) if norm_r > 0 else rec_emb
                     sim = float(np.dot(norm_emb, rec_norm))
-                    time_diff = (now_utc - rec.last_seen_at).total_seconds()
-                    if time_diff < 7200.0 and sim >= 0.55:
+                    r_last = to_ist(rec.last_seen_at) or now_ist
+                    time_diff = (now_ist - r_last).total_seconds()
+                    if time_diff < 7200.0 and sim >= 0.65:
                         rec_ist = to_ist(rec.created_at)
+                        r_last_ist = to_ist(rec.last_seen_at) or rec_ist
                         if rec_ist and rec_ist.date() == now_ist.date() and rec.exit_time is None:
-                            matched_person_id = rec.person_id
-                            matched_similarity = sim
-                            is_active_session = True
+                            if r_last_ist and (now_ist - r_last_ist).total_seconds() > 1800.0:
+                                rec.exit_time = r_last_ist.strftime("%I:%M %p")
+                                rec.is_waiting = False
+                                self.db.add(rec)
+                                self.db.commit()
+                                is_returning_customer = True
+                                past_record = rec
+                                is_active_session = False
+                            else:
+                                matched_person_id = rec.person_id
+                                matched_similarity = sim
+                                is_active_session = True
                         elif (rec_ist and rec_ist.date() < now_ist.date()) or rec.exit_time is not None:
                             is_returning_customer = True
                             past_record = rec
@@ -672,7 +929,6 @@ class VisitorService:
 
         # Interior Camera Safety Net: Interior cameras (Floor, Display Area, Service Desk)
         # should NEVER mint new store walk-ins without an entrance line crossing.
-        is_cam_entrance = getattr(req, "is_entrance", True)
         if not is_active_session and not is_returning_customer and not is_cam_entrance:
             logger.info("Interior camera %s: suppressed new visitor creation (no entrance line crossing).", req.camera_name)
             return VisitorDetectResponse(
@@ -693,18 +949,12 @@ class VisitorService:
                     record.zone_entered = req.zone
                 if req.tracker_id and f"Tracker #{req.tracker_id}" not in (record.notes or ""):
                     record.notes = f"{record.notes} | Tracker #{req.tracker_id}" if record.notes else f"Tracker #{req.tracker_id}"
-                if face_img is not None and face_img.size > 0:
+                # Only set avatar_url if the record doesn't have one yet (preserve original clean entrance portrait)
+                if not record.avatar_url and face_img is not None and face_img.size > 0:
                     try:
                         os.makedirs("static/uploads/visitors", exist_ok=True)
                         now_epoch = int(datetime.now(timezone.utc).timestamp())
                         filename = f"{record.person_id}_{now_epoch}.jpg"
-                        if record.avatar_url:
-                            old_f = os.path.join(".", record.avatar_url.lstrip("/").split("?")[0])
-                            if os.path.isfile(old_f):
-                                try:
-                                    os.remove(old_f)
-                                except Exception:
-                                    pass
                         filepath = os.path.join("static", "uploads", "visitors", filename)
                         cv2.imwrite(filepath, face_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
                         record.avatar_url = f"/static/uploads/visitors/{filename}"
@@ -732,7 +982,11 @@ class VisitorService:
         # 3. New or Returning Customer Arrival -> Mint ID, Save Crisp Snapshot, Add to Visit Purpose
         # ---------------------------------------------------------------------
         total_count = self.db.query(PersonIdentity).count()
-        new_person_id = f"VIS-2026-{1040 + total_count + 1}"
+        candidate_num = 1040 + total_count + 1
+        new_person_id = f"VIS-2026-{candidate_num}"
+        while self.repo.get_by_person_id(new_person_id):
+            candidate_num += 1
+            new_person_id = f"VIS-2026-{candidate_num}"
 
         # Save full-body portrait snapshot to disk with high quality (quality 95)
         avatar_url = None
@@ -757,9 +1011,17 @@ class VisitorService:
         elif getattr(req, "appearance", None):
             note_text = f"Appearance: {req.appearance} | Tracker #{req.tracker_id or 'auto'}"
 
+        # Extract full-body OSNet Person Re-ID embedding from the arrival body snapshot
+        body_embedding = None
+        if getattr(req, "body_embedding", None):
+            body_embedding = np.array(req.body_embedding, dtype=np.float32)
+        elif face_img is not None and face_img.size > 0:
+            body_embedding = self.body_embedder.extract_embedding(face_img)
+
         new_record = self.repo.create_or_update(
             person_id=new_person_id,
             embedding=embedding,
+            body_embedding=body_embedding,
             timestamp=now_utc,
             avatar_url=avatar_url,
             camera_source=req.camera_name or "Entrance Camera",
@@ -775,8 +1037,14 @@ class VisitorService:
             new_record.exit_time = req.exit_time
         if getattr(req, "waiting_seconds", None) is not None:
             new_record.waiting_seconds = int(req.waiting_seconds)
+        else:
+            new_record.waiting_seconds = 0
+
         if getattr(req, "is_waiting", None) is not None:
             new_record.is_waiting = req.is_waiting
+        else:
+            new_record.is_waiting = True
+
         if getattr(req, "waiting_breach", None) is not None:
             new_record.waiting_breach = bool(req.waiting_breach or ((new_record.waiting_seconds or 0) >= 900))
         if (

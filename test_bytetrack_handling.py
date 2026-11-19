@@ -176,8 +176,9 @@ class TestByteTrackTrackingAndFallback(unittest.TestCase):
             smoothed = self.smoother.smooth_body_boxes(tracked_objects)
 
             # 3. ZoneManager entry line crossing evaluation
-            new_attendance, _ = self.zone_manager.process(smoothed)
+            new_attendance, _, _ = self.zone_manager.process(smoothed)
             for crossed_id in new_attendance:
+                self.zone_manager.record_visitor_entry(crossed_id)
                 attendance_events.append((f, crossed_id))
 
         # Check total attendance

@@ -29,6 +29,8 @@ class PersonIdentity(Base):
     )
     # 512-dimensional ArcFace vector; nulled upon 14-day expiration
     face_embedding: Mapped[Optional[Any]] = mapped_column(Vector(512), nullable=True)
+    # 512-dimensional OSNet full-body ReID vector
+    body_embedding: Mapped[Optional[Any]] = mapped_column(Vector(512), nullable=True)
 
     is_expired: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False, index=True
@@ -45,6 +47,7 @@ class PersonIdentity(Base):
 
     # Visitor profile and journey metadata
     avatar_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    exit_avatar_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     visit_purpose: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     assigned_salesperson: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     notes: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
@@ -74,4 +77,18 @@ class PersonIdentity(Base):
         if hasattr(self.face_embedding, "to_numpy"):
             return self.face_embedding.to_numpy().astype(np.float32)
         return np.array(self.face_embedding, dtype=np.float32)
+
+    get_embedding_vector = get_embedding_array
+
+    def get_body_embedding_array(self) -> Optional[np.ndarray]:
+        """Returns normalized numpy float32 array or None if unset."""
+        if self.body_embedding is None:
+            return None
+        if isinstance(self.body_embedding, np.ndarray):
+            return self.body_embedding.astype(np.float32)
+        if hasattr(self.body_embedding, "to_numpy"):
+            return self.body_embedding.to_numpy().astype(np.float32)
+        return np.array(self.body_embedding, dtype=np.float32)
+
+    get_body_embedding_vector = get_body_embedding_array
 

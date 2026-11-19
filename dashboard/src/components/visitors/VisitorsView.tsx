@@ -48,6 +48,7 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
   const [filterWaiting, setFilterWaiting] = useState<string>('all');
   const [checkoutNotification, setCheckoutNotification] = useState<string | null>(null);
   const [inspectedVisitor, setInspectedVisitor] = useState<VisitorRecord | null>(null);
+  const [inspectedPhotoType, setInspectedPhotoType] = useState<'entry' | 'exit'>('entry');
   const [isClearing, setIsClearing] = useState(false);
 
   // Extract unique salespeople
@@ -370,7 +371,7 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
               <tr>
                 <th className="py-3 px-4">Visitor & Detected Face</th>
                 <th className="py-3 px-3">First Seen</th>
-                <th className="py-3 px-3">Exit Time</th>
+                <th className="py-3 px-3">Exit Time / Status</th>
                 <th className="py-3 px-3">Type</th>
                 <th className="py-3 px-3">Visit Purpose</th>
                 <th className="py-3 px-3">Assigned Salesperson</th>
@@ -408,33 +409,56 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
                     >
                       <td className="py-3 px-4">
                         <div className="flex items-center gap-3">
-                          <div
-                            onClick={() => vis.avatarUrl && setInspectedVisitor(vis)}
-                            className={`relative group/cctv shrink-0 overflow-hidden rounded-xl border border-slate-700/80 bg-slate-950 shadow-xs hover:border-emerald-500 transition-all w-12 h-16 ${
-                              vis.avatarUrl ? 'cursor-pointer' : 'cursor-default'
-                            }`}
-                            title={vis.avatarUrl ? "Click to view full CCTV camera detection snapshot" : "No photo captured"}
-                          >
-                            {vis.avatarUrl ? (
-                              <img
-                                src={vis.avatarUrl}
-                                alt={vis.visitorId}
-                                className="w-full h-full object-cover object-top contrast-[1.05] brightness-95 group-hover/cctv:scale-105 transition-transform"
-                              />
-                            ) : (
-                              <div className="w-full h-full flex items-center justify-center bg-slate-800 text-slate-400">
-                                <User className="w-5 h-5 text-slate-400" />
+                          <div className="relative shrink-0 w-12 h-16">
+                            <div
+                              onClick={() => {
+                                if (vis.avatarUrl || vis.exitAvatarUrl) {
+                                  setInspectedVisitor(vis);
+                                  setInspectedPhotoType('entry');
+                                }
+                              }}
+                              className={`w-full h-full overflow-hidden rounded-xl border border-slate-700/80 bg-slate-950 shadow-xs hover:border-emerald-500 transition-all ${
+                                vis.avatarUrl || vis.exitAvatarUrl ? 'cursor-pointer group/cctv' : 'cursor-default'
+                              }`}
+                              title={vis.avatarUrl ? "Click to view full CCTV camera detection snapshot" : "No photo captured"}
+                            >
+                              {vis.avatarUrl ? (
+                                <img
+                                  src={vis.avatarUrl}
+                                  alt={vis.visitorId}
+                                  className="w-full h-full object-cover object-top contrast-[1.05] brightness-95 group-hover/cctv:scale-105 transition-transform"
+                                />
+                              ) : (
+                                <div className="w-full h-full flex items-center justify-center bg-slate-800 text-slate-400">
+                                  <User className="w-5 h-5 text-slate-400" />
+                                </div>
+                              )}
+                              {/* CCTV Reticle & Corner Box */}
+                              <div className="absolute inset-0.5 border border-emerald-400/30 rounded-lg pointer-events-none" />
+                              <div className="absolute top-0.5 left-1 bg-black/80 px-1 py-0.2 rounded text-[7px] font-mono font-bold text-emerald-400 leading-tight">
+                                CAM-01
                               </div>
+                              <div className="absolute bottom-0.5 right-1 flex items-center gap-0.5 bg-black/80 px-1 py-0.2 rounded leading-tight">
+                                <span className="w-1 h-1 rounded-full bg-red-500 animate-ping" />
+                                <span className="text-[7px] font-mono text-white/90 font-bold">REC</span>
+                              </div>
+                            </div>
+
+                            {/* +1 Exit Image Badge */}
+                            {vis.exitAvatarUrl && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setInspectedVisitor(vis);
+                                  setInspectedPhotoType('exit');
+                                }}
+                                className="absolute -top-1.5 -right-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-black text-[9px] px-1.5 py-0.5 rounded-full shadow-md border-2 border-white flex items-center gap-0.5 z-10 transition-transform hover:scale-110 cursor-pointer"
+                                title="Exit photo available (+1). Click to inspect exit snapshot."
+                              >
+                                +1
+                              </button>
                             )}
-                            {/* CCTV Reticle & Corner Box */}
-                            <div className="absolute inset-0.5 border border-emerald-400/30 rounded-lg pointer-events-none" />
-                            <div className="absolute top-0.5 left-1 bg-black/80 px-1 py-0.2 rounded text-[7px] font-mono font-bold text-emerald-400 leading-tight">
-                              CAM-01
-                            </div>
-                            <div className="absolute bottom-0.5 right-1 flex items-center gap-0.5 bg-black/80 px-1 py-0.2 rounded leading-tight">
-                              <span className="w-1 h-1 rounded-full bg-red-500 animate-ping" />
-                              <span className="text-[7px] font-mono text-white/90 font-bold">REC</span>
-                            </div>
                           </div>
                           <div>
                             <span className="font-mono font-bold text-slate-900 block">{vis.visitorId}</span>
@@ -465,9 +489,13 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
                           <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-rose-50 text-rose-700 border border-rose-200 whitespace-nowrap">
                             Attended (Waited {vis.waitingFormatted})
                           </span>
+                        ) : vis.assignedSalesperson ? (
+                          <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200 whitespace-nowrap">
+                            Assigned: {vis.assignedSalesperson}
+                          </span>
                         ) : (
-                          <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 animate-pulse border border-emerald-200">
-                            Inside (Attended)
+                          <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-blue-50 text-blue-700 border border-blue-200 whitespace-nowrap">
+                            Inside ({vis.zoneEntered || 'Showroom'})
                           </span>
                         )}
                       </td>
@@ -562,125 +590,167 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
       </div>
 
       {/* CCTV Camera Face Detection Snapshot Modal */}
-      {inspectedVisitor && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/75 backdrop-blur-sm animate-fadeIn">
-          <div className="bg-slate-900 text-white rounded-3xl max-w-lg w-full border border-slate-700 shadow-2xl overflow-hidden relative animate-scaleUp">
-            {/* Header */}
-            <div className="p-4 sm:p-5 border-b border-slate-800 flex items-center justify-between bg-slate-950">
-              <div className="flex items-center gap-2.5">
-                <div className="p-2 rounded-xl bg-emerald-500/20 text-emerald-400 border border-emerald-400/30">
-                  <Camera className="w-5 h-5" />
-                </div>
-                <div>
-                  <h3 className="font-extrabold text-sm sm:text-base font-['Outfit'] text-white flex items-center gap-2">
-                    CCTV Camera Entry Snapshot
-                    <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
-                  </h3>
-                  <p className="text-[11px] text-slate-400 font-mono">
-                    CH-01 Main Glass Entrance • NVR Stream
-                  </p>
-                </div>
-              </div>
-              <button
-                onClick={() => setInspectedVisitor(null)}
-                className="p-2 text-slate-400 hover:text-white rounded-xl hover:bg-slate-800 transition"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
+      {inspectedVisitor && (() => {
+        const currentPhotoUrl = inspectedPhotoType === 'exit'
+          ? (inspectedVisitor.exitAvatarUrl || inspectedVisitor.avatarUrl)
+          : (inspectedVisitor.avatarUrl || inspectedVisitor.exitAvatarUrl);
 
-            {/* Modal Body */}
-            <div className="p-5 sm:p-6 space-y-4">
-              {/* Clear CCTV Snapshot Frame (Full Body Portrait) */}
-              <div className="relative rounded-2xl overflow-hidden border border-slate-800 bg-slate-950 flex items-center justify-center h-80 sm:h-96 group shadow-inner">
-                {inspectedVisitor.avatarUrl ? (
-                  <img
-                    src={inspectedVisitor.avatarUrl}
-                    alt={inspectedVisitor.visitorId}
-                    className="w-full h-full object-contain contrast-[1.05] brightness-95"
-                  />
-                ) : (
-                  <div className="w-full h-full flex flex-col items-center justify-center bg-slate-900 text-slate-400">
-                    <User className="w-16 h-16 text-slate-500 mb-2" />
-                    <span className="text-xs font-semibold">No body photo captured</span>
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/75 backdrop-blur-sm animate-fadeIn">
+            <div className="bg-slate-900 text-white rounded-3xl max-w-lg w-full border border-slate-700 shadow-2xl overflow-hidden relative animate-scaleUp">
+              {/* Header */}
+              <div className="p-4 sm:p-5 border-b border-slate-800 flex items-center justify-between bg-slate-950">
+                <div className="flex items-center gap-2.5">
+                  <div className={`p-2 rounded-xl border ${inspectedPhotoType === 'exit' ? 'bg-blue-500/20 text-blue-400 border-blue-400/30' : 'bg-emerald-500/20 text-emerald-400 border-emerald-400/30'}`}>
+                    {inspectedPhotoType === 'exit' ? <LogOut className="w-5 h-5" /> : <Camera className="w-5 h-5" />}
                   </div>
-                )}
-
-                {/* CCTV Top Status Overlay */}
-                <div className="absolute top-2.5 inset-x-3 flex items-center justify-between text-[10px] font-mono text-emerald-400 bg-black/75 px-2.5 py-1 rounded border border-emerald-400/20 pointer-events-none">
-                  <span className="flex items-center gap-1.5 font-bold">
-                    <span className="w-2 h-2 rounded-full bg-red-500 animate-ping" />
-                    LIVE • CAM 01 [MAIN ENTRANCE]
-                  </span>
-                  <span className="text-emerald-400 font-bold bg-emerald-950/80 px-1.5 py-0.5 rounded border border-emerald-500/30">
-                    BODY SNAPSHOT • {inspectedVisitor.visitorId}
-                  </span>
+                  <div>
+                    <h3 className="font-extrabold text-sm sm:text-base font-['Outfit'] text-white flex items-center gap-2">
+                      {inspectedPhotoType === 'exit' ? 'CCTV Camera Exit Snapshot (+1)' : 'CCTV Camera Entry Snapshot'}
+                      <span className={`w-2 h-2 rounded-full ${inspectedPhotoType === 'exit' ? 'bg-blue-500' : 'bg-red-500 animate-pulse'}`} />
+                    </h3>
+                    <p className="text-[11px] text-slate-400 font-mono">
+                      CH-01 Main Glass Entrance • {inspectedPhotoType === 'exit' ? 'Exit Stream' : 'Entry Stream'}
+                    </p>
+                  </div>
                 </div>
-
-                {/* CCTV Bottom Watermark */}
-                <div className="absolute bottom-2.5 inset-x-3 flex items-center justify-between text-[9px] font-mono text-white/90 bg-black/75 px-2.5 py-1 rounded pointer-events-none">
-                  <span>TIME: {inspectedVisitor.date} {inspectedVisitor.firstSeenTime} IST</span>
-                  <span className="text-slate-400">1080P HD • 4096 KBPS</span>
-                </div>
+                <button
+                  onClick={() => setInspectedVisitor(null)}
+                  className="p-2 text-slate-400 hover:text-white rounded-xl hover:bg-slate-800 transition"
+                >
+                  <X className="w-5 h-5" />
+                </button>
               </div>
 
-              {/* Telemetry Grid */}
-              <div className="grid grid-cols-2 gap-2.5 text-xs">
-                <div className="p-3 bg-slate-800/60 rounded-xl border border-slate-700/60">
-                  <span className="text-slate-400 text-[10px] uppercase font-bold block">Arrived Date & Time</span>
-                  <p className="font-extrabold text-white font-mono mt-0.5">{inspectedVisitor.date} • {inspectedVisitor.firstSeenTime}</p>
-                </div>
-                <div className="p-3 bg-slate-800/60 rounded-xl border border-slate-700/60">
-                  <span className="text-slate-400 text-[10px] uppercase font-bold block">Departure & Status</span>
-                  <p className="font-extrabold text-white font-mono mt-0.5">
-                    {inspectedVisitor.exitTime ? `Departed at ${inspectedVisitor.exitTime}` : `Inside Showroom (${inspectedVisitor.durationMinutes}m)`}
-                  </p>
-                </div>
-                <div className="p-3 bg-slate-800/60 rounded-xl border border-slate-700/60">
-                  <span className="text-slate-400 text-[10px] uppercase font-bold block">Visit Intent & Staff</span>
-                  <p className="font-extrabold text-cyan-400 mt-0.5">{inspectedVisitor.visitPurpose || 'Untagged'}</p>
-                  <p className="text-[11px] text-slate-300 mt-0.5 font-medium">{inspectedVisitor.assignedSalesperson || 'Unassigned Staff'}</p>
-                </div>
-                <div className="p-3 bg-slate-800/60 rounded-xl border border-slate-700/60">
-                  <span className="text-slate-400 text-[10px] uppercase font-bold block">Zone Dwell Time</span>
-                  <p className="font-extrabold text-amber-400 mt-0.5">
-                    {inspectedVisitor.zoneDwell && Object.keys(inspectedVisitor.zoneDwell).length > 0
-                      ? Object.entries(inspectedVisitor.zoneDwell).map(([z, t]) => `${z} (${t})`).join(', ')
-                      : `${inspectedVisitor.zoneEntered || 'Main Showroom'} (${inspectedVisitor.durationMinutes}m)`}
-                  </p>
-                </div>
-              </div>
-
-              {inspectedVisitor.notes && (
-                <div className="p-3 bg-slate-800/40 rounded-xl border border-slate-700/50 text-xs text-slate-300">
-                  <span className="text-[10px] text-slate-400 uppercase font-bold block mb-1">Customer Session Notes</span>
-                  {inspectedVisitor.notes}
+              {/* Photo Selector Tabs if Exit Image is Available */}
+              {inspectedVisitor.exitAvatarUrl && (
+                <div className="px-5 pt-3 pb-0 bg-slate-900">
+                  <div className="flex items-center gap-2 p-1 bg-slate-950 rounded-xl border border-slate-800">
+                    <button
+                      type="button"
+                      onClick={() => setInspectedPhotoType('entry')}
+                      className={`flex-1 py-1.5 px-3 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 ${
+                        inspectedPhotoType === 'entry'
+                          ? 'bg-emerald-600 text-white shadow-sm'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      <Camera className="w-3.5 h-3.5" />
+                      Entry Photo ({inspectedVisitor.firstSeenTime})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setInspectedPhotoType('exit')}
+                      className={`flex-1 py-1.5 px-3 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 ${
+                        inspectedPhotoType === 'exit'
+                          ? 'bg-blue-600 text-white shadow-sm'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      <LogOut className="w-3.5 h-3.5" />
+                      Exit Photo (+1) ({inspectedVisitor.exitTime || 'Departed'})
+                    </button>
+                  </div>
                 </div>
               )}
-            </div>
 
-            {/* Footer */}
-            <div className="p-4 bg-slate-950 border-t border-slate-800 flex items-center justify-end gap-2.5">
-              <button
-                onClick={() => setInspectedVisitor(null)}
-                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded-xl text-xs font-semibold transition"
-              >
-                Close
-              </button>
-              <button
-                onClick={() => {
-                  const target = inspectedVisitor;
-                  setInspectedVisitor(null);
-                  onTagVisitor(target);
-                }}
-                className="px-4 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-xl text-xs font-bold transition shadow-lg shadow-blue-600/30"
-              >
-                Assign / Edit Purpose
-              </button>
+              {/* Modal Body */}
+              <div className="p-5 sm:p-6 space-y-4">
+                {/* Clear CCTV Snapshot Frame (Full Body Portrait) */}
+                <div className="relative rounded-2xl overflow-hidden border border-slate-800 bg-slate-950 flex items-center justify-center h-80 sm:h-96 group shadow-inner">
+                  {currentPhotoUrl ? (
+                    <img
+                      src={currentPhotoUrl}
+                      alt={inspectedVisitor.visitorId}
+                      className="w-full h-full object-contain contrast-[1.05] brightness-95"
+                    />
+                  ) : (
+                    <div className="w-full h-full flex flex-col items-center justify-center bg-slate-900 text-slate-400">
+                      <User className="w-16 h-16 text-slate-500 mb-2" />
+                      <span className="text-xs font-semibold">
+                        {inspectedPhotoType === 'exit' ? 'No exit photo captured' : 'No entry photo captured'}
+                      </span>
+                    </div>
+                  )}
+
+                  {/* CCTV Top Status Overlay */}
+                  <div className="absolute top-2.5 inset-x-3 flex items-center justify-between text-[10px] font-mono text-emerald-400 bg-black/75 px-2.5 py-1 rounded border border-emerald-400/20 pointer-events-none">
+                    <span className="flex items-center gap-1.5 font-bold">
+                      <span className={`w-2 h-2 rounded-full ${inspectedPhotoType === 'exit' ? 'bg-blue-400' : 'bg-red-500 animate-ping'}`} />
+                      {inspectedPhotoType === 'exit' ? 'DEPARTURE • CAM 01 [MAIN ENTRANCE]' : 'ARRIVAL • CAM 01 [MAIN ENTRANCE]'}
+                    </span>
+                    <span className="text-emerald-400 font-bold bg-emerald-950/80 px-1.5 py-0.5 rounded border border-emerald-500/30">
+                      {inspectedPhotoType === 'exit' ? `EXIT SNAPSHOT (+1) • ${inspectedVisitor.visitorId}` : `ENTRY SNAPSHOT • ${inspectedVisitor.visitorId}`}
+                    </span>
+                  </div>
+
+                  {/* CCTV Bottom Watermark */}
+                  <div className="absolute bottom-2.5 inset-x-3 flex items-center justify-between text-[9px] font-mono text-white/90 bg-black/75 px-2.5 py-1 rounded pointer-events-none">
+                    <span>
+                      TIME: {inspectedVisitor.date} {inspectedPhotoType === 'exit' ? (inspectedVisitor.exitTime || inspectedVisitor.firstSeenTime) : inspectedVisitor.firstSeenTime} IST
+                    </span>
+                    <span className="text-slate-400">1080P HD • 4096 KBPS</span>
+                  </div>
+                </div>
+
+                {/* Telemetry Grid */}
+                <div className="grid grid-cols-2 gap-2.5 text-xs">
+                  <div className="p-3 bg-slate-800/60 rounded-xl border border-slate-700/60">
+                    <span className="text-slate-400 text-[10px] uppercase font-bold block">Arrived Date & Time</span>
+                    <p className="font-extrabold text-white font-mono mt-0.5">{inspectedVisitor.date} • {inspectedVisitor.firstSeenTime}</p>
+                  </div>
+                  <div className="p-3 bg-slate-800/60 rounded-xl border border-slate-700/60">
+                    <span className="text-slate-400 text-[10px] uppercase font-bold block">Departure & Status</span>
+                    <p className="font-extrabold text-white font-mono mt-0.5">
+                      {inspectedVisitor.exitTime ? `Departed at ${inspectedVisitor.exitTime}` : `Inside Showroom (${inspectedVisitor.durationMinutes}m)`}
+                    </p>
+                  </div>
+                  <div className="p-3 bg-slate-800/60 rounded-xl border border-slate-700/60">
+                    <span className="text-slate-400 text-[10px] uppercase font-bold block">Visit Intent & Staff</span>
+                    <p className="font-extrabold text-cyan-400 mt-0.5">{inspectedVisitor.visitPurpose || 'Untagged'}</p>
+                    <p className="text-[11px] text-slate-300 mt-0.5 font-medium">{inspectedVisitor.assignedSalesperson || 'Unassigned Staff'}</p>
+                  </div>
+                  <div className="p-3 bg-slate-800/60 rounded-xl border border-slate-700/60">
+                    <span className="text-slate-400 text-[10px] uppercase font-bold block">Zone Dwell Time</span>
+                    <p className="font-extrabold text-amber-400 mt-0.5">
+                      {inspectedVisitor.zoneDwell && Object.keys(inspectedVisitor.zoneDwell).length > 0
+                        ? Object.entries(inspectedVisitor.zoneDwell).map(([z, t]) => `${z} (${t})`).join(', ')
+                        : `${inspectedVisitor.zoneEntered || 'Main Showroom'} (${inspectedVisitor.durationMinutes}m)`}
+                    </p>
+                  </div>
+                </div>
+
+                {inspectedVisitor.notes && (
+                  <div className="p-3 bg-slate-800/40 rounded-xl border border-slate-700/50 text-xs text-slate-300">
+                    <span className="text-[10px] text-slate-400 uppercase font-bold block mb-1">Customer Session Notes</span>
+                    {inspectedVisitor.notes}
+                  </div>
+                )}
+              </div>
+
+              {/* Footer */}
+              <div className="p-4 bg-slate-950 border-t border-slate-800 flex items-center justify-end gap-2.5">
+                <button
+                  onClick={() => setInspectedVisitor(null)}
+                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded-xl text-xs font-semibold transition"
+                >
+                  Close
+                </button>
+                <button
+                  onClick={() => {
+                    const target = inspectedVisitor;
+                    setInspectedVisitor(null);
+                    onTagVisitor(target);
+                  }}
+                  className="px-4 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-xl text-xs font-bold transition shadow-lg shadow-blue-600/30"
+                >
+                  Assign / Edit Purpose
+                </button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
     </div>
   );
 };

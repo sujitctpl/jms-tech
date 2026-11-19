@@ -449,6 +449,9 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           avatarUrl: v.avatarUrl
             ? (v.avatarUrl.startsWith('http') ? v.avatarUrl : `${FASTAPI_BASE_URL}${v.avatarUrl}`)
             : undefined,
+          exitAvatarUrl: v.exitAvatarUrl
+            ? (v.exitAvatarUrl.startsWith('http') ? v.exitAvatarUrl : `${FASTAPI_BASE_URL}${v.exitAvatarUrl}`)
+            : undefined,
           firstSeenTime: v.firstSeenTime,
           lastSeenTime: v.lastSeenTime,
           exitTime: v.exitTime,

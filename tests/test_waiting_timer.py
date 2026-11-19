@@ -239,4 +239,56 @@ def test_sla_breach_requires_unattended_and_not_in_department():
     assert is_br3 is False  # Only 28s dwell, cannot breach!
 
 
+def test_suppress_premature_exit_under_7s():
+    """Verify record_visitor_exit ignores premature exits if dwell is < 7.0 seconds."""
+    from unittest.mock import MagicMock
+    from local_detector import VisitorZoneTracker
+
+    mock_sync = MagicMock()
+    tracker = VisitorZoneTracker(sync_client=mock_sync, sync_interval=4.0, waiting_cutoff_seconds=900.0)
+    t0 = 1000.0
+
+    # Visitor enters at t0 (triggers initial zone sync)
+    tracker.update_visitor_zone(track_id=1, current_dept=None, now_ts=t0, person_id="VIS-TEST", is_employee_nearby=False)
+    assert mock_sync.send_visitor_zone_update.call_count == 1
+    mock_sync.reset_mock()
+
+    # 4 seconds later (under 7.0s threshold), premature reverse exit fires
+    tracker.record_visitor_exit(track_id=1, now_ts=t0 + 4.0)
+
+    # Exit update MUST be suppressed!
+    mock_sync.send_visitor_zone_update.assert_not_called()
+
+    # If they exit after 10 seconds (>= 7.0s), exit IS recorded
+    tracker.update_visitor_zone(track_id=1, current_dept=None, now_ts=t0 + 10.0, person_id="VIS-TEST", is_employee_nearby=False)
+    mock_sync.reset_mock()
+    tracker.record_visitor_exit(track_id=1, now_ts=t0 + 10.0)
+    mock_sync.send_visitor_zone_update.assert_called_once()
+    payload = mock_sync.send_visitor_zone_update.call_args[0][0]
+    assert payload.get("exit_time") is not None
+
+
+def test_delete_bounced_visitor():
+    """Verify delete_visitor removes bounced visitor record from database."""
+    from unittest.mock import MagicMock
+    from app.services.visitor_service import VisitorService
+    from app.db.models.person_identity import PersonIdentity
+
+    mock_db = MagicMock()
+    service = VisitorService(mock_db)
+    mock_repo = MagicMock()
+    service.repo = mock_repo
+
+    mock_rec = PersonIdentity(person_id="VIS-BOUNCE", avatar_url=None)
+    mock_repo.get_by_person_id.return_value = mock_rec
+    mock_db.query.return_value.filter.return_value.all.return_value = []
+
+    res = service.delete_visitor("VIS-BOUNCE")
+    assert res is True
+    mock_db.delete.assert_called()
+    mock_db.commit.assert_called()
+
+
+
+
 

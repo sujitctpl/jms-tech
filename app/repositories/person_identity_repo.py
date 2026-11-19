@@ -49,10 +49,25 @@ class PersonIdentityRepository:
             only_active=only_active,
         )
 
+    def find_best_body_match(
+        self,
+        embedding: np.ndarray,
+        similarity_threshold: Optional[float] = None,
+        only_active: bool = False,
+    ) -> Tuple[Optional[str], float]:
+        """Queries pgvector for the most similar visitor full-body ReID embedding."""
+        return self.vector_manager.find_best_visitor_body_match(
+            embedding=embedding,
+            similarity_threshold=similarity_threshold,
+            db=self.db,
+            only_active=only_active,
+        )
+
     def create_or_update(
         self,
         person_id: str,
         embedding: Optional[np.ndarray] = None,
+        body_embedding: Optional[np.ndarray] = None,
         timestamp: Optional[datetime] = None,
         avatar_url: Optional[str] = None,
         camera_source: Optional[str] = None,
@@ -63,12 +78,15 @@ class PersonIdentityRepository:
     ) -> PersonIdentity:
         ts = timestamp or datetime.now(timezone.utc)
         vec_data = embedding.astype(np.float32).tolist() if embedding is not None else None
+        body_vec_data = body_embedding.astype(np.float32).tolist() if body_embedding is not None else None
 
         try:
             record = self.get_by_person_id(person_id)
             if record:
                 if vec_data is not None:
                     record.face_embedding = vec_data
+                if body_vec_data is not None:
+                    record.body_embedding = body_vec_data
                 record.last_seen_at = ts
                 record.is_expired = False
                 record.expired_at = None
@@ -90,6 +108,7 @@ class PersonIdentityRepository:
                 record = PersonIdentity(
                     person_id=str(person_id),
                     face_embedding=vec_data,
+                    body_embedding=body_vec_data,
                     created_at=ts,
                     last_seen_at=ts,
                     is_expired=False,
@@ -113,6 +132,8 @@ class PersonIdentityRepository:
             if record:
                 if vec_data is not None:
                     record.face_embedding = vec_data
+                if body_vec_data is not None:
+                    record.body_embedding = body_vec_data
                 record.last_seen_at = ts
                 record.is_expired = False
                 record.expired_at = None

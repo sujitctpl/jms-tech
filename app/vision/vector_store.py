@@ -206,6 +206,49 @@ class PgVectorStoreManager:
 
         return best_pid, max(0.0, round(best_score, 4))
 
+    def find_best_visitor_body_match(
+        self,
+        embedding: np.ndarray,
+        similarity_threshold: Optional[float] = None,
+        db: Optional[Session] = None,
+        only_active: bool = False,
+    ) -> Tuple[Optional[str], float]:
+        """
+        Queries active or historical visitor identities by full-body ReID embedding using pgvector cosine similarity.
+        """
+        session = db or self.db
+        thresh = similarity_threshold if similarity_threshold is not None else 0.60
+        emb_norm = self._ensure_normalized(embedding)
+        if session is None:
+            return None, 0.0
+
+        dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+        if dialect_name == "postgresql":
+            emb_list = emb_norm.tolist()
+            dist_expr = PersonIdentity.body_embedding.cosine_distance(emb_list).label("dist")
+            query = (
+                session.query(PersonIdentity.person_id, dist_expr)
+                .filter(
+                    PersonIdentity.is_expired.is_(False),
+                    PersonIdentity.body_embedding.isnot(None),
+                )
+            )
+            if only_active:
+                query = query.filter(PersonIdentity.exit_time.is_(None))
+
+            query = query.order_by(dist_expr.asc()).limit(1)
+            row = query.first()
+            if not row:
+                return None, 0.0
+
+            pid, dist = row[0], float(row[1])
+            similarity = round(max(0.0, min(1.0, 1.0 - dist)), 4)
+            if similarity >= thresh:
+                return pid, similarity
+            return None, similarity
+
+        return None, 0.0
+
     # ---------------------------------------------------------------------
     # Employee Face Searches (Permanent Retention)
     # ---------------------------------------------------------------------

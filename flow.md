@@ -19,9 +19,11 @@ graph TD
             FaceDet["Face Detector\n• SCRFD (2.5G ONNX)\n• OpenCV YuNet"]
             Embedder["Biometric Extractor\n• ArcFace ResNet50 (512-D)\n• Quality Gating & Landmark Alignment"]
             Tracker["Multi-Object Tracker\n• ByteTrack (bytetrack.yaml)\n• BoT-SORT + GMC (botsort.yaml)\n• Fallback Kalman Tracker"]
+            Handoff["Spatial-Temporal Handoff Tracker\n• 25s Multi-Cue Coasting Pool\n• Torso HSV Color Correlation\n• Unbroken Waiting Timers"]
             StaffClassifier["Employee vs Visitor Classifier\n• Cosine Similarity (thresh = 0.32)\n• Temporal Voting Buffer (win = 5)"]
+            EntryGate["Entry-Line Gating & Ghost Elimination\n• Confirmed vs Unconfirmed Passersby\n• Neutral Slate (180,180,180) Bboxes\n• Interior Ingress Suppression"]
             PhotoPipeline["Visitor Photo Optimization\n• Multi-Frame Best-Shot Scoring\n• Progressive Upgrades (3.5s)\n• CLAHE Backlight & HSV Attire"]
-            ZoneTracker["Visitor Zone & Dwell Tracker\n• Live Zone Dwell Accumulator\n• Reverse Exit Line Detector"]
+            ZoneTracker["Visitor Zone & Dwell Tracker\n• Live Zone Dwell Accumulator\n• Reverse Exit Line Detector\n• 2-Param Waiting SLA Monitor"]
             LineZone["Spatial Analytics Engine\n• Directional Entry-Line Crossing\n• Dynamic Department Dwell Timers"]
             MJPEG["Local MJPEG Live Stream Server"]
             HotReload["Config Hot-Reloader\n(Watches camera_config.json mtime)"]
@@ -32,7 +34,7 @@ graph TD
 
     subgraph Central Backend [FastAPI & Express Backend]
         API["FastAPI Backend (:8000)\n• /api/v1/cameras (Config, CRUD, Stream Testing)\n• /api/v1/visitors (Detect, Tag, Dwell, Walk-In)\n• /api/v1/departments (Dynamic CRUD)\n• /api/v1/employees (Profiles, Photos, Gallery)\n• /api/v1/attendance (Punch & Daily Report)\n• /api/v1/analytics (Footfall & Heatmaps)\n• /api/v1/identity (Retention & Cleanup)"]
-        RetentionWorker["Scheduled Retention Worker\n(14-Day Rolling Biometric Purge)"]
+        RetentionWorker["Scheduled Retention Worker\n(14-Day Rolling Biometric Purge\n& Physical Snapshot Cleanup)"]
         AuthSrv["Express Auth Server (:5000)\n• /api/auth/login & /register\n• Admin Role-Based Access"]
         ServerWorker["Optional Server VideoWorker\n(app/workers/video_worker.py)"]
     end
@@ -42,7 +44,7 @@ graph TD
     end
 
     subgraph Client Layer [Modern Web UI]
-        UI["React 19 Dashboard (:5173)\n(Vite + TypeScript + Tailwind CSS)\n• Live CCTV Preview & Stream Playback\n• Dynamic Camera & AI Settings Panel\n• Visit Purpose Tagging & Zoom Lightbox\n• Real-Time Zone Dwell & Journey Analytics\n• Staff Attendance & Daily Rolls\n• Section Dwell Time & Export Reports"]
+        UI["React 19 Dashboard (:5173)\n(Vite + TypeScript + Tailwind CSS)\n• Live CCTV Preview & Stream Playback\n• Dynamic Camera & AI Settings Panel\n• Waiting Time & SLA Alert Settings\n• Visit Purpose Tagging & Zoom Lightbox\n• Real-Time Zone Dwell & Journey Analytics\n• Staff Attendance & Daily Rolls\n• Section Dwell Time & Export Reports"]
     end
 
     CCTV -->|RTSP TCP Stream| RTSP
@@ -50,9 +52,11 @@ graph TD
     Detector --> FaceDet
     FaceDet --> Embedder
     Embedder --> Tracker
-    Tracker --> StaffClassifier
-    StaffClassifier --> PhotoPipeline
-    StaffClassifier --> ZoneTracker
+    Tracker --> Handoff
+    Handoff --> StaffClassifier
+    StaffClassifier --> EntryGate
+    EntryGate --> PhotoPipeline
+    EntryGate --> ZoneTracker
     ZoneTracker --> LineZone
     LineZone --> SyncQueue
     LineZone -.->|Annotated Buffer| MJPEG
@@ -62,7 +66,7 @@ graph TD
     CCTV -.->|Optional Direct RTSP| ServerWorker
     ServerWorker -->|Ingestion| DB
     API -->|SQLAlchemy 2.x ORM| DB
-    RetentionWorker -->|Purge Expired Embeddings| DB
+    RetentionWorker -->|Purge Expired Vectors & Physical Files| DB
     AuthSrv -->|pg Pool / bcrypt| DB
     UI -->|REST API Requests| API
     UI -->|Authentication Requests| AuthSrv
@@ -188,6 +192,29 @@ Raw detections exhibit coordinate micro-jitter due to digital sensor noise. The 
 * **Exponential Moving Average (EMA)** smoothing:
   $$\text{Box}_{t} = \alpha \cdot \text{Box}_{\text{detected}} + (1 - \alpha) \cdot \text{Box}_{t-1}, \quad \text{with } \alpha = 0.35$$
 * **Stationary Deadband Filter**: Shifts smaller than `deadband = 6.0` pixels are suppressed, locking bounding boxes motionless when persons stand still.
+
+### 4.3 Multi-Cue Spatial-Temporal & Torso Handoff Tracking (`SpatialTemporalHandoffTracker`)
+Showroom environments frequently present tracking interruptions: visitors turn 180° away from the lens, bend down over glass display cases, or are occluded by structural pillars. Under conventional tracking, such events cause raw tracker IDs to reset, which resets dwell timers, fragments visitor profiles, and duplicates records. 
+
+`SpatialTemporalHandoffTracker` solves this through a multi-cue appearance coasting engine:
+1. **25-Second Coasting Pool**:
+   When a track disappears from the active frame, its state (last bounding box, upper-torso HSV histogram, `person_id`, display alias, `first_seen_ts`, `waiting_seconds`, and `waiting_breach` flag) is moved to a coasting pool for up to $25.0\text{ seconds}$ (`max_coasting_sec = 25.0`).
+2. **Upper-Torso HSV Color Histogram Extraction**:
+   For each tracked person, an adaptive upper-torso region (from $20\%$ to $58\%$ of total box height, with $15\%$ horizontal margin) is extracted and converted to HSV color space. A 2D joint Hue-Saturation histogram (16 hue bins $\times$ 8 saturation bins) is calculated and L1-normalized:
+   $$H(h, s) = \frac{\text{Hist}(h, s)}{\sum \text{Hist}(h, s)}$$
+3. **Multi-Cue Candidate Matching**:
+   When a new track ID appears, it is matched against the coasting pool using a composite criterion:
+   - **Normalized Spatial Proximity**: Center displacement normalized by maximum box height:
+     $$\text{norm\_dist} = \frac{\sqrt{(x_{\text{new}} - x_{\text{coast}})^2 + (y_{\text{new}} - y_{\text{coast}})^2}}{\max(h_{\text{new}}, h_{\text{coast}})} \le 1.6$$
+   - **Bounding Box Scale Consistency**: Area ratio $\frac{\text{Area}_{\text{new}}}{\text{Area}_{\text{coast}}} \in [0.45, 2.2]$ ensures matches are posture-compatible.
+   - **Torso Color Histogram Correlation**: Evaluated via Pearson correlation coefficient:
+     $$\text{Corr}(H_{\text{new}}, H_{\text{coast}}) = \frac{\sum_i (H_{\text{new}}(i) - \bar{H}_{\text{new}})(H_{\text{coast}}(i) - \bar{H}_{\text{coast}})}{\sqrt{\sum_i (H_{\text{new}}(i) - \bar{H}_{\text{new}})^2 \sum_i (H_{\text{coast}}(i) - \bar{H}_{\text{coast}})^2}} \ge 0.55$$
+4. **Seamless Identity & Timer Restoration**:
+   When a match satisfies $\text{Corr} \ge 0.55$ within proximity limits, the new track inherits the original visitor metadata:
+   $$\text{first\_seen\_ts}_{\text{new}} = \text{first\_seen\_ts}_{\text{coast}}$$
+   $$\text{waiting\_seconds}_{\text{new}} = \text{waiting\_seconds}_{\text{coast}}, \quad \text{waiting\_breach}_{\text{new}} = \text{waiting\_breach}_{\text{coast}}$$
+   $$\text{person\_id}_{\text{new}} = \text{person\_id}_{\text{coast}}, \quad \text{display\_id}_{\text{new}} = \text{display\_id}_{\text{coast}}$$
+   This guarantees unbroken dwell accumulation, uninterrupted SLA monitoring, and zero duplicate customer records.
 
 ---
 
@@ -324,7 +351,7 @@ To distinguish whether a browsing customer is receiving assistance or waiting un
    $$d_m = \frac{\sqrt{(x_v - x_s)^2 + (y_v - y_s)^2}}{\text{Scale}_{\text{px/m}}}$$
    If $d_m \le \text{radius\_m}$ (default $2.2\text{ m}$), the visitor is marked as actively engaged (`is_employee_nearby = True`).
 
-### 6.4 Visitor Waiting Timer & 15-Minute Unattended SLA Breach Pipeline
+### 6.4 Visitor Waiting Timer & Configurable SLA Breach Pipeline
 Showroom customer experience hinges on prompt staff engagement. The platform implements a strict **2-Parameter Unattended Waiting Logic** evaluated every frame:
 
 $$\text{is\_waiting\_now} = (\neg \text{is\_employee\_nearby}) \land (\neg \text{is\_in\_dept})$$
@@ -370,8 +397,40 @@ stateDiagram-v2
   1. **Normal Waiting ($< 5\text{ mins}$)**: Neon Emerald Green bounding box `(0, 240, 110)` with `⏱️ WAITING [MMm SSs]` timer.
   2. **Elevated Warning ($5\text{ to }15\text{ mins}$)**: High-contrast Amber border `(0, 140, 255)` with `⚠️ WAITING [MMm SSs]` warning.
   3. **Critical SLA Breach ($> 15\text{ mins}$ / $900\text{s}$)**: Bright Red alert box `(0, 0, 255, thickness=3)` and red header badge `🚨 UNATTENDED > 15m [MMm SSs]`.
-* **Telemetry Synchronization**:
-  `waiting_seconds`, `is_waiting`, and `waiting_breach` are synced every $4.0\text{s}$ via `/api/v1/visitors/update-zone` and stored in PostgreSQL `person_identities`. The React web dashboard renders live waiting counters and SLA breach warning badges in `OverviewView`, `VisitorsView`, and `VisitPurposeView`.
+* **Monotonic Dwell Protection & Physical Elapsed Bounds**:
+  - The backend `VisitorService.update_visitor_zone` enforces monotonic protection:
+    $$\text{rec.waiting\_seconds} = \max(\text{rec.waiting\_seconds}, \; \text{req.waiting\_seconds})$$
+    preventing any secondary camera or fresh track from rolling back waiting counts.
+  - The edge engine enforces real physical dwell limits:
+    $$\text{waiting\_seconds} \le \max(0.0, \; \text{now\_ts} - \text{first\_seen\_ts})$$
+    guaranteeing that waiting timers cannot exceed physical time elapsed in the showroom.
+* **Configurable SLA Cutoff**:
+  The cutoff threshold is fully configurable in the React Dashboard ("Waiting Time & SLA Alerts" tab in Settings) and stored in `camera_config.json` (`waiting_cutoff_seconds`, default $900\text{s}$ / $15\text{ mins}$).
+* **High-Resolution SLA Breach Snapshot Capture**:
+  When a visitor transitions into SLA breach state, `local_detector.py` automatically captures an un-annotated full-resolution frame from the RTSP feed, saves it to `static/uploads/visitors/`, and dispatches it for immediate managerial action.
+* **Telemetry Synchronization & Cross-Camera Waiting Sync**:
+  `waiting_seconds`, `is_waiting`, and `waiting_breach` are synced every $4.0\text{s}$ via `/api/v1/visitors/update-zone` and stored in PostgreSQL `person_identities`. Furthermore, `CrossCameraTracker` synchronizes waiting metrics across all cameras via atomic state updates in `.cross_camera_state.json`.
+
+### 6.5 Entry-Line Gated Ingress & Ghost Visitor Elimination
+Showrooms with glass facades or open frontages often face challenges with transient passersby, outdoor foot traffic, or glass reflections triggering false detections. The platform implements a rigorous multi-tier gating architecture:
+
+1. **Unconfirmed Bystander Segregation**:
+   - A person detected in camera view who has not yet crossed the calibrated directional entry line is tagged `is_confirmed_visitor = False`.
+   - The HUD renders an unconfirmed person with a neutral slate/silver bounding box `(180, 180, 180)` and simple tracker alias (`Person #ID (Unconfirmed)`).
+   - Unconfirmed tracks **never** trigger walk-in visitor creation, do not increment footfall counters, do not accumulate waiting timers, and do not capture photos.
+2. **Directional Virtual Entry-Line Crossing & 7-Second Dwell Threshold**:
+   - When a person crosses the entry line in the configured ingress direction, they are held in a pending state with a **7.0-second minimum dwell window**.
+   - If the person turns around or disappears from view in under 7 seconds, the crossing is discarded as a transient bounce (no footfall count added, no profile minted, no photo saved).
+   - If the person is identified as a showroom employee, an attendance `CHECK_IN` punch is recorded immediately without waiting.
+   - Once a non-staff person sustains showroom presence for $\ge 7.0\text{ seconds}$, they are confirmed as a genuine visitor (`is_confirmed_visitor = True`), footfall increments by +1, best-shot portrait crop is dispatched, and waiting SLA monitoring begins.
+3. **Reverse Line Departure & Staff Checkout**:
+   - When an active, confirmed visitor leaves in reverse after staying $\ge 7.0$ seconds, their departure timestamp is recorded and final dwell breakdown is persisted to the database. Reverse crossings under 7 seconds are ignored to eliminate jitter.
+   - When a confirmed showroom employee crosses in reverse, their `CHECK_OUT` attendance punch is logged automatically.
+4. **Interior Camera Ingress Guard (`IGNORED_INTERIOR`)**:
+   - In-store floor and display cameras (`is_entrance: false`) suppress minting new walk-ins entirely.
+   - If an interior camera detects a person who was not previously registered at an entrance camera or matched via ArcFace biometric re-identification, the backend logs:
+     `Interior camera: suppressed new visitor creation (no entrance line crossing)`
+     and responds with `status: "IGNORED_INTERIOR"`. This eliminates false walk-ins from staff entering via side doors or reflections.
 
 ---
 
@@ -496,17 +555,24 @@ flowchart TD
     Start["Daily Retention Scheduler (Runs every 24h)"] --> Query["Query person_identities where last_seen_at < NOW() - 14 Days"]
     Check{"Found Expired Visitor Identities?"}
     Query --> Check
-    Check -- No --> Finish["Log: No expired biometric records found"]
-    Check -- Yes --> PurgeDB["Set face_embedding = NULL\nSet is_expired = TRUE\nSet expired_at = NOW()"]
+    Check -- No --> ScanOrphaned["Scan & Purge Orphaned Physical Snapshots on Disk"]
+    ScanOrphaned --> Finish["Log: Retention cleanup completed"]
+    Check -- Yes --> PurgeDB["Set face_embedding = NULL\nSet avatar_url = NULL\nSet is_expired = TRUE\nSet expired_at = NOW()"]
     PurgeDB --> PurgeVectors["Purge expired vectors from pgvector / HNSW index"]
-    PurgeVectors --> KeepStats["PRESERVE visitor_tracks, footfall_events & visit purpose\n(Aggregate analytics & counts remain intact!)"]
+    PurgeVectors --> DeleteFiles["Delete Physical Snapshot Files from static/uploads/visitors/"]
+    DeleteFiles --> PurgeOrphaned["Purge unlinked orphaned snapshot images older than 14 days"]
+    PurgeOrphaned --> KeepStats["PRESERVE visitor_tracks, footfall_events & visit purpose\n(Aggregate analytics & counts remain intact!)"]
     KeepStats --> ExemptStaff["EXEMPT: Registered employee embeddings remain permanently active"]
     ExemptStaff --> Report["Generate RetentionCleanupReport & Log Summary"]
 ```
 
 * **Visitor Biometric Isolation**: Face embeddings extracted from unidentified visitors are assigned an automatic 14-day rolling expiration window.
-* **Permanent Employee Exemption**: Registered staff embeddings stored in the `employees` table are permanent and exempt from the purge.
-* **Analytics Preservation**: Historical footfall counts, peak-hour distributions, visit purpose tags, and dwell durations remain fully intact when biometric embeddings are purged.
+* **Dual Database & Physical Disk Cleanup**:
+  - Sets `face_embedding = NULL`, `avatar_url = NULL`, and `is_expired = TRUE` in PostgreSQL `person_identities`.
+  - Physically unlinks and deletes corresponding JPEG portrait crops from `static/uploads/visitors/`.
+  - Executes `_purge_orphaned_snapshots(directory, retention_days)` to clean up any orphaned or unlinked image files on disk exceeding the retention threshold.
+* **Permanent Employee Exemption**: Registered staff embeddings stored in the `employees` table and their gallery photos in `static/uploads/employees/` are permanent and strictly exempt from the purge.
+* **Analytics Preservation**: Historical footfall counts, peak-hour distributions, visit purpose tags, and dwell durations remain fully intact when biometric embeddings and photos are purged.
 
 ---
 
@@ -685,6 +751,11 @@ erDiagram
         [ Roboflow RF-DETR / YOLO Person Detection ]
                         │
                         ▼
+  [ Multi-Cue Tracking & Spatial-Temporal Handoff Tracker ]
+  ├─► ByteTrack / BoT-SORT Coordinate State Filtering
+  └─► 25s Torso HSV Color Correlation (Unbroken Timers across Turnarounds/Occlusions)
+                        │
+                        ▼
         [ SCRFD / YuNet Face Detection + Quality Gating ]
                         │
                         ▼
@@ -697,23 +768,30 @@ erDiagram
         ▼                                       ▼
 [ Identified as Employee ]             [ Tracked as Showroom Visitor ]
         │                                       │
-        ├─► Exclude from footfall counts        ├─► Multi-object tracking (ByteTrack / BoT-SORT)
-        ├─► Log Attendance Punch (CHECK_IN)     ├─► Multi-Frame Best-Shot Quality Scoring (Laplacian + Pose)
-        └─► Upsert Daily Attendance Roll        ├─► Expanded Bust Framing (Hair + Collar + Upper Chest)
+        ├─► Exclude from footfall counts        ├─► Unconfirmed Passerby Filter: Neutral Slate Box (180,180,180)
+        ├─► Log Attendance Punch (CHECK_IN)     │   (Ghost Visitor Elimination: No DB writes, no footfall count)
+        └─► Upsert Daily Attendance Roll        │
+                                                ├─► Ingress: Directional Entry-Line Crossing Verification
+                                                │   └─► Upgrades track to Confirmed Visitor (is_confirmed_visitor=True)
+                                                ├─► Multi-Frame Best-Shot Quality Scoring (Laplacian + Pose)
+                                                ├─► Expanded Bust Framing (Hair + Collar + Upper Chest)
                                                 ├─► CLAHE Backlight Compensation (Shadow lifting)
                                                 ├─► Torso HSV Attire Extraction (e.g. "Blue / Navy Top")
-                                                ├─► High-DPI Snapshot Dispatch (@ 320x320 Q95)
+                                                ├─► High-DPI Snapshot Dispatch (@ 320x320 Q95) to /visitors/detect
                                                 ├─► Progressive Upgrade Window (3.5s trajectory)
-                                                ├─► Ingress: Directional entry line crossing verification
-                                                │   └─► Non-blocking HTTP POST to /visitors/detect & /footfall
+                                                ├─► Non-blocking HTTP POST to /visitors/detect & /footfall
+                                                │
                                                 ├─► Store Interior: Real-time department dwell accumulation
                                                 │   └─► Periodic HTTP POST to /visitors/update-zone (every 4s)
                                                 ├─► Proximity & Waiting Engine: Ground-plane staff distance (2.2m)
                                                 │   ├─► Unattended & outside dept: Accumulate waiting timer
+                                                │   ├─► Monotonic Bound: waiting_sec <= elapsed physical presence
                                                 │   ├─► HUD Alerts: Green (<5m) ➔ Amber (5-15m) ➔ Red (>15m)
-                                                │   └─► SLA Breach: 🚨 UNATTENDED > 15m alert to CRM & Dashboard
+                                                │   ├─► SLA Breach: 🚨 UNATTENDED > 15m (Cutoff configurable in UI)
+                                                │   └─► SLA Breach Snapshot: Full-resolution clean frame saved to disk
                                                 ├─► Cross-Camera Handover: State sync across entrance & floor feeds
-                                                │   └─► Atomic .cross_camera_state.json maintains persistent identity
+                                                │   ├─► Atomic .cross_camera_state.json maintains persistent identity
+                                                │   └─► In-Store cameras suppress redundant walk-in counts (IGNORED_INTERIOR)
                                                 ├─► Receptionist UI: 1-click purpose & staff assignment
                                                 │   └─► HTTP PATCH to /visitors/{person_id}/tag
                                                 └─► Egress: Reverse line crossing detection (Exit Door)

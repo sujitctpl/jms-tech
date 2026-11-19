@@ -29,6 +29,7 @@ export interface VisitorRecord {
   id: string;
   visitorId: string;
   avatarUrl?: string; // AI Detected face crop / camera snapshot
+  exitAvatarUrl?: string; // AI Detected departure crop snapshot
   firstSeenTime: string; // ISO string or time string
   lastSeenTime: string | null; // null if currently in showroom
   exitTime: string | null;

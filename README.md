@@ -47,10 +47,17 @@ Detailed architectural flows, mathematical models, and sequence diagrams are doc
   - **Ultralytics YOLO (`--v1`)**: Ultra-fast CNN detection fallback (`yolo26s.pt` / `yolov8n.pt` / `yolo11n.pt`).
   - **RTMDet Support**: High-performance ONNX detection engine.
 - **RTSP TCP Buffer Management**: Forces TCP transport globally (`rtsp_transport;tcp`) and employs a non-blocking threaded frame grabber (`ThreadedRTSPReader`) to prevent frame delay and macroblock artifacts.
-- **Pluggable Multi-Object Tracking**:
+- **Pluggable Multi-Object Tracking & Spatial-Temporal Appearance Handoff**:
   - **ByteTrack** (`bytetrack.yaml`): Low-latency matching using both high- and low-score detection boxes.
   - **BoT-SORT** (`botsort.yaml`): Includes Global Motion Compensation (GMC via sparse optical flow) and Kalman state estimation to eliminate camera shake/drift.
+  - **Spatial-Temporal Handoff Tracker (`SpatialTemporalHandoffTracker`)**: Multi-cue coasting engine (25s window) combining spatial distance, bounding box scaling, and **Upper-Torso HSV Color Histogram Correlation** ($\ge 0.55$). Seamlessly preserves identity, display aliases, and waiting timers across 180° turnarounds, counter occlusions, and brief tracker ID switches.
   - **Robust Fallback Centroid & Kalman Tracker**: Velocity-prediction fallback ensuring tracking continuity across temporary drops.
+- **Entry-Line Gated Ingress, 7s Dwell Bounce Filter & Ghost Elimination**:
+  - **Strict Entry-Line Gating**: Walk-in visitor creation, footfall counts, waiting timers, and photo capture are strictly gated by directional virtual entry-line crossing.
+  - **7-Second Dwell Threshold (Bounce Filter)**: When a person crosses the entry line, the system waits for $\ge 7.0$ seconds of showroom dwell before confirming the visitor and incrementing footfall. If someone turns around or leaves in under 7 seconds (e.g. delivery persons, wrong-store turnarounds, or pacing near the doorway), the entry is discarded with zero ghost records.
+  - **Reverse Line Departure & Staff Checkout**: Crossing the line in reverse triggers departure logging only after $\ge 7.0$ seconds of stay, and automatically logs `CHECK_OUT` attendance punches for recognized showroom employees.
+  - **Ghost Visitor Suppression**: Persons visible in camera view who have not crossed the entry line are marked as *Unconfirmed* with a neutral slate border `(180, 180, 180)` and tracker ID only, completely preventing transient passersby, outdoor foot traffic, or glass facade reflections from skewing visitor analytics.
+  - **Interior Camera Guard**: Non-entrance cameras (`is_entrance: false`) suppress minting new walk-ins (`IGNORED_INTERIOR`) unless verified via cross-camera biometric matching against an entered visitor.
 - **Biometric Face Recognition & Staff vs. Visitor Segregation**:
   - Neural face detection via **SCRFD** (`scrfd_2.5g_bnkps.onnx`) or **YuNet**.
   - **ArcFace** (`w600k_r50.onnx`) 512-dimensional feature embedding extraction.
@@ -70,6 +77,9 @@ Detailed architectural flows, mathematical models, and sequence diagrams are doc
 - **Visitor Waiting Timer & Unattended SLA Breach Monitoring**:
   - **Perspective-Calibrated Staff Proximity Filter (`is_staff_near_box`)**: Dynamically measures ground-plane distance in meters between visitor feet and staff feet using bounding box height scaling ($\text{Scale}_{\text{px/m}} = \frac{\bar{h}}{1.70}$). A visitor within $2.2\text{ m}$ is considered actively attended.
   - **2-Parameter Unattended Logic**: Customer waiting time accumulates only when the visitor is **unassisted** (no staff within $2.2\text{ m}$) **and outside any designated department counter box**.
+  - **Monotonic Protection & Physical Dwell Bound**: Backend updates protect against clobbering higher accumulated `waiting_seconds` via monotonic max resolution, and the edge engine caps waiting time to true physical dwell ($\min(W, \text{now} - T_{\text{first}})$), preventing artificial spikes.
+  - **Configurable SLA Cutoff**: SLA threshold configurable directly from the Dashboard Settings panel (`waiting_cutoff_seconds`, default $900\text{s}$ / $15\text{ mins}$, warning threshold $5\text{ mins}$).
+  - **High-Resolution SLA Breach Snapshot**: Automatically grabs a clean full-frame snapshot when an unattended visitor crosses the 15-minute SLA cutoff for manager intervention.
   - **Three-Tier Visual HUD Alerting**:
     - **Normal Waiting ($< 5\text{ mins}$)**: Neon Emerald Green bounding box `(0, 240, 110)` with `⏱️ WAITING [MMm SSs]`.
     - **Amber Warning ($5\text{ to }15\text{ mins}$)**: Amber border `(0, 140, 255)` with `⚠️ WAITING [MMm SSs]` to alert floor staff.
@@ -77,10 +87,11 @@ Detailed architectural flows, mathematical models, and sequence diagrams are doc
   - **Dashboard SLA Breach & Waiting Badges**: Live counters, waiting duration pills, and unattended alerts surfaced across `OverviewView`, `VisitorsView`, and `VisitPurposeView`.
 - **Dynamic Multi-Camera Handover & Cross-Camera Re-Identification**:
   - **CrossCameraTracker & Global Identity Synchronization**: Coordinates tracks between entrance cameras (`is_entrance: true`) and interior section cameras (`is_entrance: false`) via `.cross_camera_state.json`.
+  - **Cross-Camera Waiting Sync**: Seamlessly syncs accumulated waiting seconds and breach flags between camera streams.
   - **ArcFace Cosine Matching ($\ge 0.55$)**: Re-identifies customers moving from entrance to floor sections without creating duplicate footfall counts.
   - **Isolated GPU VRAM Allocation**: Automatic memory fraction limit ($42\%$) ensures multi-camera instances run concurrently on 4GB consumer GPUs without OOM errors.
 - **Dynamic Camera Configuration & Edge Hot-Reloading**:
-  - **Full Web UI Management**: Configure RTSP feeds, camera names, confidence thresholds, and entry lines directly in the React Dashboard via `CameraSettingsSection.tsx`.
+  - **Full Web UI Management**: Configure RTSP feeds, camera names, confidence thresholds, and entry lines directly in the React Dashboard via `CameraSettingsSection.tsx` and `SettingsView.tsx`.
   - **Pre-Flight Stream Testing**: Dedicated `/api/v1/cameras/test-stream` endpoint opens OpenCV streams on demand to verify connectivity, resolution ($W\times H$), and framerate (FPS) before deployment.
   - **Entrance vs. Floor Camera Role Separation**: Flags camera channel as `is_entrance: true/false`. Entrance cameras count walk-in footfall and detect exits; in-store floor cameras track zone occupancy and dwell times without double-counting store footfall.
   - **Zero-Downtime Hot-Reloading**: `local_detector.py` watches `camera_config.json` timestamp and reloads lines, exclusion zones, and departments without dropping active RTSP connections.
@@ -92,8 +103,9 @@ Detailed architectural flows, mathematical models, and sequence diagrams are doc
 - **Dynamic Department Management**:
   - Showroom zones/departments can be created, updated, and color-coded dynamically via API (`/api/v1/departments`) or Dashboard UI.
   - Associate specific departments with cameras or configure global showroom sections.
-- **14-Day Rolling Biometric Retention (GDPR / Privacy Compliance)**:
+- **14-Day Rolling Biometric Retention & Physical Snapshot Purge (GDPR / Privacy Compliance)**:
   - Automated daily background scheduler (`retention_scheduler`) purging visitor facial embeddings and tracks inactive for > 14 days while preserving aggregated footfall numbers.
+  - Automatically deletes physical snapshot files (`static/uploads/visitors/`) and purges orphaned snapshot images older than retention period.
 - **Virtual Entry-Line Crossing**:
   - 2D ground-plane foot contact point calculation ($\frac{x_1 + x_2}{2}, y_2$) with strict directional validation (`top_to_bottom`, `bottom_to_top`, `left_to_right`, `right_to_left`).
 - **Strict Multi-Tier Duplicate Prevention**:
@@ -102,10 +114,11 @@ Detailed architectural flows, mathematical models, and sequence diagrams are doc
   - Built-in HTTP MJPEG streaming server for low-latency live preview with AI bounding boxes and tracks directly in the web dashboard.
 - **Modern Web Dashboard (`dashboard/`)**:
   - Built with React 19, Vite, TypeScript, and Tailwind CSS.
-  - Live CCTV preview, dynamic camera settings, dynamic department configuration, employee attendance management, peak hour heatmaps, visitor tagging, and exportable reports.
-- **Single-Command & Batch Orchestration**:
+  - Live CCTV preview, dynamic camera settings, dynamic department configuration, waiting time & SLA alert configuration, employee attendance management, peak hour heatmaps, visitor tagging, and exportable reports.
+- **Single-Command & Batch Multi-Camera Orchestration**:
   - Concurrently launch all 3 services (FastAPI, Express Auth, and Vite Dashboard) via `python scripts/run_all.py` or Windows `.bat` / `.ps1` scripts.
   - 1-Click edge detector launch via [`start_detector.bat`](file:///c:/Users/capermint/Desktop/Abhishek/jms/start_detector.bat).
+  - Concurrent multi-camera launch for all configured channels via [`run_all_cameras.bat`](file:///c:/Users/capermint/Desktop/Abhishek/jms/run_all_cameras.bat) or `python scripts/run_multi_camera.py`.
 - **Desktop Executable Packaging**:
   - PyInstaller builder script (`build_exe.py`) to compile the edge detector into a standalone Windows `.exe`.
 
@@ -186,6 +199,8 @@ jms/
 │   └── vite.config.ts
 ├── scripts/                             # Multi-Service Orchestration & Benchmarking
 │   ├── run_all.py                       # Single-command runner for FastAPI, Auth, and Dashboard
+│   ├── run_multi_camera.py              # Parallel launcher for all configured camera feeds
+│   ├── run_all_cameras.bat              # Batch script to launch all 4 channels concurrently
 │   ├── run_detector.bat                 # Quick-launch batch script for local_detector.py
 │   ├── benchmark_trackers.py            # ByteTrack vs BoT-SORT performance benchmark
 │   ├── download_models.py               # Automated weights downloader
@@ -194,9 +209,9 @@ jms/
 ├── static/                              # Static file uploads (employee and visitor photos)
 │   └── uploads/
 │       ├── employees/                   # Registered employee gallery photos
-│       └── visitors/                    # 320x320 retina visitor portrait crops
+│       └── visitors/                    # 320x320 retina visitor portrait crops & SLA breach captures
 ├── tests/                               # Comprehensive Automated Test Suites
-│   ├── test_waiting_timer.py            # Unit tests for waiting timer & SLA breach
+│   ├── test_waiting_timer.py            # Unit tests for waiting timer, handoff, SLA breach & monotonic bounds
 │   ├── test_cross_camera_tracker.py     # Cross-camera tracking & re-ID tests
 │   ├── test_returning_visitor.py        # Returning visitor recognition tests
 │   └── test_identity_and_retention.py   # 14-day retention & biometric purge tests
@@ -204,6 +219,7 @@ jms/
 ├── alembic/                             # Database migration scripts
 ├── local_detector.py                    # Standalone Local Edge AI Video Processing Engine
 ├── start_detector.bat                   # 1-Click Windows Batch Launcher for Single-Camera Detector
+├── run_all_cameras.bat                  # 1-Click Root Batch Launcher for All Configured CCTV Channels
 ├── run_multi_camera.bat                 # Concurrent Multi-Camera Launcher for Windows CMD
 ├── run_multi_camera.ps1                 # Concurrent Multi-Camera Launcher for PowerShell
 ├── build_exe.py                         # PyInstaller standalone EXE compiler
@@ -369,16 +385,29 @@ python local_detector.py --channel 101 --tracker botsort
 
 To process multiple camera feeds concurrently with independent preview windows on your desktop:
 
-#### Option 1: Via Windows Batch Launcher
+#### Option 1: 1-Click Launch All Cameras (Recommended)
+Launch all configured, active camera channels (101, 201, 301, 401) concurrently in separate terminal windows with staggered startup:
 ```cmd
-# Launch Camera 101 (Entrance) and Camera 201 (Floor) concurrently:
-run_multi_camera.bat 101 201
+# Double click or run from terminal:
+run_all_cameras.bat
 
-# Or run interactively to choose presets:
-run_multi_camera.bat
+# Or run via Python orchestrator:
+python scripts/run_multi_camera.py
 ```
 
-#### Option 2: Via PowerShell Launcher
+#### Option 2: Launch Specific Cameras via Batch or Python
+```cmd
+# Launch specific camera subset (e.g. Channel 101 and Channel 201):
+run_multi_camera.bat 101 201
+
+# Or via Python script directly:
+python scripts/run_multi_camera.py 101 201
+
+# Launch all cameras in headless background mode:
+python scripts/run_multi_camera.py --headless
+```
+
+#### Option 3: Via PowerShell Launcher
 ```powershell
 # Launch Channels 101 and 201 in parallel:
 .\run_multi_camera.ps1 101, 201
@@ -387,7 +416,7 @@ run_multi_camera.bat
 .\run_multi_camera.ps1 101, 201, 301, 401
 ```
 
-#### Option 3: Via Separate Terminal Tabs
+#### Option 4: Via Separate Terminal Tabs
 You can open separate terminal windows and run:
 ```powershell
 # Terminal 1:
@@ -403,6 +432,28 @@ Each process creates a dedicated desktop window:
 
 ---
 
+### Entry-Line Gated Ingress & Ghost Visitor Elimination
+
+Showrooms with glass facades or open frontages often face challenges with transient passersby, outdoor foot traffic, or glass reflections triggering false detections. The platform implements a rigorous multi-tier gating architecture:
+
+1. **Gated Walk-in Ingress**: A person detected in front of the camera is considered an **Unconfirmed Person** until they physically cross the calibrated directional entry line.
+2. **Neutral Slate Visualization**: Unconfirmed individuals are rendered with neutral slate/silver bounding boxes `(180, 180, 180)` and labeled with their tracker ID only (`Person #ID (Unconfirmed)`). They **do not** trigger footfall events, create database visitor records, initiate waiting timers, or fire photo captures.
+3. **Ghost Visitor Elimination**: Passersby on the sidewalk or glass facade reflections are completely prevented from polluting visitor analytics or creating ghost profiles in the CRM.
+4. **Interior Camera Ingress Guard**: In-store section cameras (`is_entrance: false`) suppress minting new walk-ins (`IGNORED_INTERIOR`) unless verified via cross-camera biometric matching against an already-entered visitor.
+
+---
+
+### Multi-Cue Spatial-Temporal & Torso Handoff Tracking
+
+When visitors turn 180° away from the camera, bend over jewelry showcases, or navigate behind display counters, facial recognition is temporarily occluded and raw tracker IDs can switch. The edge engine deploys `SpatialTemporalHandoffTracker`:
+
+- **25-Second Spatial-Temporal Coasting Pool**: When a track is lost, its geometric state, last known position, display alias, and accumulated waiting metrics are held in a coasting pool for up to $25.0\text{s}$.
+- **Upper-Torso HSV Histogram Correlation**: When a new track appears, the engine computes normalized HSV color histograms of the upper-torso region and compares them via histogram correlation:
+  $$\text{Corr}(H_1, H_2) \ge 0.55$$
+- **Seamless Timer & Identity Restoration**: Upon a correlation match within physical distance tolerance, the new track inherits the original `first_seen_ts`, `person_id`, display alias, accumulated `waiting_seconds`, and `waiting_breach` status (`Timer & Waiting unbroken!`).
+
+---
+
 ### Multi-Camera Person & Visitor Re-Identification Flow
 
 The platform features seamless cross-camera handover between entrance and interior floor cameras:
@@ -410,9 +461,9 @@ The platform features seamless cross-camera handover between entrance and interi
 ```mermaid
 flowchart TD
     subgraph Entrance ["Camera 101 (Main Glass Entrance - is_entrance: true)"]
-        E1["Person crosses Entrance Line"] --> E2["SCRFD Face Detection + ArcFace 512-D Embedding"]
+        E1["Person crosses Directional Entry Line"] --> E2["SCRFD Face Detection + ArcFace 512-D Embedding"]
         E2 --> E3{"Staff or Visitor?"}
-        E3 -->|Employee| E4["Staff Attendance Checked In"]
+        E3 -->|Employee| E4["Staff Attendance Checked In (Gated)"]
         E3 -->|Visitor| E5["Mint Persistent ID (e.g. VIS-2026-1043)"]
         E5 --> E6["Save Face Vector & Portrait to PostgreSQL `person_identities`"]
     end
@@ -476,7 +527,7 @@ flowchart TD
 | `--head-fallback` | Enable synthetic anatomical head box fallback when face is turned away | `False` |
 | `--headless` | Run as background service without local OpenCV window | `False` |
 | `--api-url` | Base URL of FastAPI backend for syncing events | `'http://127.0.0.1:8000'` |
-| `waiting_cutoff_seconds` | Configurable in `camera_config.json`: Cutoff SLA threshold in seconds (e.g. `900.0` for 15 mins) | `900.0` |
+| `waiting_cutoff_seconds` | Configurable in `camera_config.json` & UI: Cutoff SLA threshold in seconds (e.g. `900.0` for 15 mins) | `900.0` |
 
 ---
 
@@ -484,21 +535,28 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    A["Customer in Showroom"] --> B{"Inside Calibrated<br/>Department Box?"}
-    B -- Yes --> C["Dwell Accumulates to Zone<br/>(Attended / In Consultation)"]
-    B -- No --> D{"Showroom Staff<br/>Within 2.2m Proximity?"}
-    D -- Yes --> C
-    D -- No --> E["Customer Marked Unattended<br/>(⏱️ Waiting Timer Starts)"]
-    E --> F{"Waiting Duration?"}
-    F -- "< 5 mins" --> G["🟢 Emerald Green Box<br/>⏱️ WAITING [MMm SSs]"]
-    F -- "5 to 15 mins" --> H["🟠 Amber Warning Box<br/>⚠️ WAITING [MMm SSs]"]
-    F -- "> 15 mins (SLA Breach)" --> I["🚨 Bright Red Alert Box<br/>🚨 UNATTENDED > 15m"]
-    I --> J["Console Alert Alarm +<br/>CRM & Dashboard SLA Breach Badge"]
+    A["Customer in Showroom"] --> B{"Confirmed Ingress<br/>(Crossed Entry Line)?"}
+    B -- No --> C["Unconfirmed Bystander<br/>(Neutral Slate Border - No SLA)"]
+    B -- Yes --> D{"Inside Calibrated<br/>Department Box?"}
+    D -- Yes --> E["Dwell Accumulates to Zone<br/>(Attended / In Consultation)"]
+    D -- No --> F{"Showroom Staff<br/>Within 2.2m Proximity?"}
+    F -- Yes --> E
+    F -- No --> G["Customer Marked Unattended<br/>(⏱️ Waiting Timer Starts)"]
+    G --> H{"Waiting Duration?"}
+    H -- "< 5 mins" --> I["🟢 Emerald Green Box<br/>⏱️ WAITING [MMm SSs]"]
+    H -- "5 to 15 mins" --> J["🟠 Amber Warning Box<br/>⚠️ WAITING [MMm SSs]"]
+    H -- "> 15 mins (SLA Breach)" --> K["🚨 Bright Red Alert Box<br/>🚨 UNATTENDED > 15m"]
+    K --> L["Console Alert Alarm +<br/>SLA Breach Snapshot Saved +<br/>CRM & Dashboard SLA Breach Badge"]
 ```
 
 - **Perspective Proximity Math**:
   $$\text{dist\_m} = \frac{\sqrt{(x_v - x_s)^2 + (y_v - y_s)^2}}{\max(1.0, \; \bar{h} / 1.70)}$$
-- **Automatic Reset**: As soon as a registered employee steps within $2.2\text{ m}$ of the customer or the customer enters a department zone, the active waiting state pauses and transitions back to attended.
+- **Automatic Attended Reset**: As soon as a registered employee steps within $2.2\text{ m}$ of the customer or the customer enters a department zone, the active waiting state pauses and transitions back to attended.
+- **Monotonic Protection & Physical Dwell Upper Bound**:
+  - The FastAPI backend updates preserve highest accumulated waiting seconds (`existing_rec.waiting_seconds = max(...)`), ensuring secondary cameras do not clobber metrics.
+  - The edge engine enforces real physical dwell limits: $\text{waiting\_seconds} \le \text{now\_ts} - \text{first\_seen\_ts}$, preventing clock skew or artificial spikes.
+- **Configurable SLA Cutoff**: Configurable via the React Dashboard Settings tab ("Waiting Time & SLA Alerts") and synchronized to `camera_config.json` (`waiting_cutoff_seconds`, default $900\text{s}$ / $15\text{ mins}$).
+- **Automated High-Resolution SLA Breach Snapshot**: When an unattended visitor breaches the cutoff threshold, the engine immediately grabs an un-annotated full-resolution frame, writes it to `static/uploads/visitors/`, and dispatches it for immediate floor management intervention.
 
 ---
 
