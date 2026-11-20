@@ -277,19 +277,17 @@ class FaceEmbedder:
         self,
         image: np.ndarray,
         margin_ratio: float = 0.12,
-    ) -> Tuple[np.ndarray, Optional[List[Tuple[int, int]]], Optional[List[Tuple[int, int]]]]:
+    ) -> Tuple[Optional[np.ndarray], Optional[List[Tuple[int, int]]], Optional[List[Tuple[int, int]]]]:
         """
-        Detects the primary face in a full-frame photo / webcam snapshot and crops it
+        Detects the primary face in a full-frame photo / person crop and crops it
         so ArcFace receives an aligned, tight face crop matching live detection feeds.
         Returns (cropped_face, crop_landmarks, full_image_landmarks).
-        If no face is detected or if image is already a small crop, returns the original image.
+        If no valid face is detected, returns (None, None, None).
         """
         if image is None or image.size == 0:
-            return image, None, None
+            return None, None, None
 
         h, w = image.shape[:2]
-        if h <= 128 and w <= 128:
-            return image, None, None
 
         # Check for OpenCV YuNet face detection model
         candidate_paths = [
@@ -314,17 +312,43 @@ class FaceEmbedder:
                 else:
                     new_w, new_h = w, h
 
-                detector = cv2.FaceDetectorYN_create(yunet_path, "", (new_w, new_h), score_threshold=0.30)
+                detector = cv2.FaceDetectorYN_create(yunet_path, "", (new_w, new_h), score_threshold=0.35)
                 _, raw_faces = detector.detect(det_img)
 
                 if raw_faces is not None and len(raw_faces) > 0:
-                    # Select face with greatest area
+                    # Select face with highest confidence score among anatomically valid faces
                     best_face = None
-                    best_area = -1.0
+                    best_score = -1.0
                     for f in raw_faces:
-                        area = float(f[2]) * float(f[3])
-                        if area > best_area:
-                            best_area = area
+                        fx = float(f[0]) / scale
+                        fy = float(f[1]) / scale
+                        fw = float(f[2]) / scale
+                        fh = float(f[3]) / scale
+                        conf = float(f[14]) if len(f) > 14 else 0.5
+
+                        # 1. Minimum confidence score
+                        if conf < 0.40:
+                            continue
+                        # 2. Minimum face size (at least 16x18 px in source image)
+                        if fw < 16 or fh < 18:
+                            continue
+                        # 3. Maximum face size: a face cannot occupy > 75% of a full person crop width or height
+                        if fw > w * 0.75 or fh > h * 0.65:
+                            continue
+                        # 4. Aspect ratio check (human faces typically 0.45 to 1.55)
+                        aspect = fw / max(1.0, fh)
+                        if aspect < 0.45 or aspect > 1.55:
+                            continue
+                        # 5. Anatomical position check for standing person crop (where h > w * 1.15):
+                        # Human head/face must be located in the upper 50% of the body crop.
+                        # This eliminates false detections on circular floor objects (like dustbins, bag buckles, shoes)
+                        if h > w * 1.15:
+                            cy = fy + fh * 0.5
+                            if cy > h * 0.50:
+                                continue
+
+                        if conf > best_score:
+                            best_score = conf
                             best_face = f
 
                     if best_face is not None:
@@ -349,12 +373,12 @@ class FaceEmbedder:
                                 ly = int(round(float(best_face[idx + 1]) / scale))
                                 full_lms.append((lx, ly))
                                 crop_lms.append((lx - x1, ly - y1))
-                            logger.info("Successfully detected and cropped face (%dx%d) for embedding enrollment", x2 - x1, y2 - y1)
+                            logger.info("Successfully detected and cropped face (%dx%d, conf=%.3f) for embedding enrollment", x2 - x1, y2 - y1, best_score)
                             return cropped, crop_lms, full_lms
             except Exception as e:
                 logger.warning("Face cropping detection encountered warning: %s", str(e))
 
-        return image, None, None
+        return None, None, None
 
     def validate_enrollment_quality(
         self,

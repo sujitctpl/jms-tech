@@ -42,7 +42,7 @@ class Settings(BaseSettings):
 
     # Face Embedding & Identity Recovery Settings
     ARCFACE_MODEL_PATH: str = "models/w600k_r50.onnx"
-    FACE_SIMILARITY_THRESHOLD: float = 0.32  # Calibrated operating threshold for high precision
+    FACE_SIMILARITY_THRESHOLD: float = 0.65  # Calibrated operating threshold for ArcFace cosine similarity (>= 0.65)
     VISITOR_REID_THRESHOLD: float = 0.65  # Calibrated biometric threshold for cross-camera visitor re-identification
     FACE_MATCH_MARGIN: float = 0.030  # Minimum difference between Top-1 and Top-2 distinct candidate matches
     FACE_MIN_SIZE: int = 16  # Minimum face width/height in pixels (calibrated for seated/back-row staff)

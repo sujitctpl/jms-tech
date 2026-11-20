@@ -76,9 +76,14 @@ class PersonIdentityRepository:
         visit_purpose: Optional[str] = None,
         assigned_salesperson: Optional[str] = None,
     ) -> PersonIdentity:
+        # Backward compatibility if 3rd positional argument was timestamp
+        if isinstance(body_embedding, datetime) and timestamp is None:
+            timestamp = body_embedding
+            body_embedding = None
+
         ts = timestamp or datetime.now(timezone.utc)
         vec_data = embedding.astype(np.float32).tolist() if embedding is not None else None
-        body_vec_data = body_embedding.astype(np.float32).tolist() if body_embedding is not None else None
+        body_vec_data = body_embedding.astype(np.float32).tolist() if (body_embedding is not None and hasattr(body_embedding, "astype")) else None
 
         try:
             record = self.get_by_person_id(person_id)

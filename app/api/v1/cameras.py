@@ -100,7 +100,7 @@ def get_camera_config(
     data.setdefault("confidence", 0.31)
     data.setdefault("imgsz", 960)
     data.setdefault("face_confidence", 0.36)
-    data.setdefault("face_similarity_threshold", 0.32)
+    data.setdefault("face_similarity_threshold", 0.65)
     data.setdefault("face_scale", 1.05)
     data.setdefault("box_smoothing", True)
     data.setdefault("smoothing_alpha", 0.35)

@@ -18,7 +18,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from app.core.config import settings
 from app.vision.cross_camera_tracker import CrossCameraTracker
@@ -88,11 +88,19 @@ def mask_credentials(url: Any) -> str:
 class DashboardSyncClient:
     """Non-blocking background client sending footfall events & telemetry to FastAPI."""
 
-    def __init__(self, base_url: str, camera_id: str, camera_name: str = "Entrance Camera", is_entrance: bool = True):
+    def __init__(
+        self,
+        base_url: str,
+        camera_id: str,
+        camera_name: str = "Entrance Camera",
+        is_entrance: bool = True,
+        on_visitor_registered: Optional[Callable[[str, str], None]] = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.camera_id = camera_id
         self.camera_name = camera_name
         self.is_entrance = is_entrance
+        self.on_visitor_registered = on_visitor_registered
         self.queue: queue.Queue = queue.Queue(maxsize=1000)
         self.stop_event = threading.Event()
         self.is_connected = False
@@ -222,7 +230,7 @@ class DashboardSyncClient:
         except queue.Full:
             pass
 
-    def _post(self, endpoint: str, data: dict, timeout: float = 2.5) -> bool:
+    def _post_json(self, endpoint: str, data: dict, timeout: float = 3.5) -> Tuple[bool, Optional[dict]]:
         url = f"{self.base_url}{endpoint}"
         body = json.dumps(data).encode("utf-8")
         req = urllib.request.Request(
@@ -235,12 +243,21 @@ class DashboardSyncClient:
             with urllib.request.urlopen(req, timeout=timeout) as response:
                 if response.status in (200, 201):
                     self.is_connected = True
-                    return True
+                    raw = response.read().decode("utf-8")
+                    try:
+                        resp_json = json.loads(raw)
+                    except Exception:
+                        resp_json = {}
+                    return True, resp_json
         except Exception as e:
             self.is_connected = False
             self.last_error = str(e)
-            return False
-        return False
+            return False, None
+        return False, None
+
+    def _post(self, endpoint: str, data: dict, timeout: float = 2.5) -> bool:
+        ok, _ = self._post_json(endpoint, data, timeout=timeout)
+        return ok
 
     def _worker_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -259,7 +276,15 @@ class DashboardSyncClient:
                 self._post(endpoint, payload)
             elif event_type == "visitor_detect":
                 endpoint = "/api/v1/visitors/detect"
-                self._post(endpoint, payload)
+                ok, resp = self._post_json(endpoint, payload)
+                if ok and resp and isinstance(resp, dict):
+                    returned_pid = resp.get("person_id")
+                    t_id = payload.get("tracker_id")
+                    if returned_pid and t_id and self.on_visitor_registered:
+                        try:
+                            self.on_visitor_registered(str(t_id), returned_pid)
+                        except Exception as cb_err:
+                            pass
             elif event_type == "visitor_zone_update":
                 endpoint = "/api/v1/visitors/update-zone"
                 self._post(endpoint, payload)
@@ -1593,7 +1618,7 @@ class VisitorZoneTracker:
             try:
                 if hasattr(self, "identity_manager") and self.identity_manager and getattr(self.identity_manager, "embedder", None):
                     c_face, c_lms, raw_lms = self.identity_manager.embedder.detect_and_crop_face(exit_image)
-                    if c_face is not None and c_face.size > 0:
+                    if c_face is not None and c_face.size > 0 and c_lms is not None:
                         exit_face_emb = self.identity_manager.embedder.extract_embedding(
                             c_face, c_lms, full_image=exit_image, raw_landmarks=raw_lms
                         )
@@ -1614,25 +1639,20 @@ class VisitorZoneTracker:
                         cand_emb = track_embs.get(int(cand_tid))
                     if cand_emb is not None:
                         sim = float(np.dot(exit_face_emb, cand_emb))
-                        if sim >= 0.55 and sim > best_sim:
+                        if sim >= 0.65 and sim > best_sim:
                             best_sim = sim
                             best_tid = cand_tid
                 if best_tid:
                     session = self.sessions[best_tid]
                     matched_cand_tid = best_tid
                     print(f"[*] Biometric face match on exit: track #{track_id} matches session #{best_tid} (sim={best_sim:.3f})")
-            elif len(self.sessions) == 1:
-                # Only fallback without face if exactly ONE visitor is active in the showroom and seen < 60s ago
-                lone_tid, lone_sess = next(iter(self.sessions.items()))
-                if (now_ts - lone_sess.get("last_seen_ts", 0)) < 60.0:
-                    session = lone_sess
-                    matched_cand_tid = lone_tid
-                    print(f"[*] Single-visitor turnaround detected: matched exit track #{track_id} to active session #{lone_tid}")
+            # If no continuous track and no verified face match, do NOT blindly guess based on recency.
+            # Delegate exit matching to the backend Dual-Factor Person Re-ID & Clothing verification engine.
 
         if session:
             dwell_total = max(0.0, now_ts - session.get("first_seen_ts", now_ts))
-            if dwell_total < 7.0:
-                print(f"[*] Suppressed premature exit for track #{track_id}: dwell {dwell_total:.1f}s < 7.0s threshold.")
+            if dwell_total < 5.0:
+                print(f"[*] Suppressed premature exit for track #{track_id}: dwell {dwell_total:.1f}s < 5.0s threshold.")
                 return
             # Confirmed genuine departure (stayed >= 7.0s): remove session and sync exit
             self.sessions.pop(tid_str, None)
@@ -1649,8 +1669,8 @@ class VisitorZoneTracker:
             if not pid and exit_face_emb is not None and hasattr(self, "identity_manager") and self.identity_manager:
                 vs = getattr(self.identity_manager, "vector_store", None)
                 if vs and hasattr(vs, "find_best_visitor_match"):
-                    m_pid, m_sim = vs.find_best_visitor_match(exit_face_emb, similarity_threshold=0.55)
-                    if m_pid and m_sim >= 0.55:
+                    m_pid, m_sim = vs.find_best_visitor_match(exit_face_emb, similarity_threshold=0.65)
+                    if m_pid and m_sim >= 0.65:
                         pid = m_pid
                         print(f"[*] Biometric face match in vector store: exit track #{track_id} -> {m_pid} (sim={m_sim:.3f})")
 
@@ -1846,12 +1866,15 @@ class ZoneManager:
 
     def find_section_for_box(self, box: Tuple[float, float, float, float]) -> Optional[Tuple[str, str]]:
         """
-        Returns (section_id, section_name) if the person's feet or base contact point is genuinely inside a department.
-        Uses ground-plane contact (feet position) to prevent false department assignment when a visitor walks down the aisle.
+        Returns (section_id, section_name) if the person's feet, torso center, or body area is inside a department.
+        Handles seated employees, visitors standing at desks/counters, and walking visitors.
         """
         x1, y1, x2, y2 = box
         feet_x = (x1 + x2) * 0.5
         feet_y = y2
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        person_area = max(1.0, (x2 - x1) * (y2 - y1))
 
         best_match = None
         max_overlap = 0.0
@@ -1861,15 +1884,23 @@ class ZoneManager:
             if (bx2 - bx1) <= 15 or (by2 - by1) <= 15:
                 continue
 
-            # Ground-plane contact: feet coordinates must be physically inside the department boundaries
+            # Ground-plane contact: feet coordinates inside department boundaries
             feet_inside = (bx1 <= feet_x <= bx2) and (by1 <= feet_y <= by2)
-            
-            # Lower-body base check (bottom 15% of bounding box)
-            lower_body_y = y2 - 0.15 * (y2 - y1)
+
+            # Torso center inside department boundaries
+            center_inside = (bx1 <= cx <= bx2) and (by1 <= cy <= by2)
+
+            # Lower-body base check (bottom 30% of bounding box)
+            lower_body_y = y2 - 0.30 * (y2 - y1)
             lower_inside = (bx1 <= feet_x <= bx2) and (by1 <= lower_body_y <= by2)
 
-            if feet_inside or lower_inside:
-                score = 1.0 if feet_inside else 0.8
+            # Compute intersection overlap ratio
+            inter_w = max(0.0, min(x2, bx2) - max(x1, bx1))
+            inter_h = max(0.0, min(y2, by2) - max(y1, by1))
+            overlap_ratio = (inter_w * inter_h) / person_area
+
+            if feet_inside or center_inside or lower_inside or overlap_ratio >= 0.20:
+                score = 1.0 if feet_inside else (0.9 if center_inside else (0.8 if lower_inside else overlap_ratio))
                 if score > max_overlap:
                     max_overlap = score
                     best_match = (s["id"], s["name"])
@@ -2150,9 +2181,9 @@ class ZoneManager:
             if has_entry_line:
                 prev_pos = self.track_positions.get(obj_id)
                 if prev_pos is not None:
-                    # Robust displacement filter of 6.0px to filter bounding box jitter while reliably capturing genuine line crossings
+                    # Displacement filter of >= 3.5px filters bounding box jitter while reliably capturing slow and fast crossings
                     disp = math.hypot(curr_pos[0] - prev_pos[0], curr_pos[1] - prev_pos[1])
-                    if disp >= 6.0 and self._segments_intersect(p1, p2, prev_pos, curr_pos):
+                    if disp >= 3.5 and self._segments_intersect(p1, p2, prev_pos, curr_pos):
                         cp_prev = self._cross_product(p1, p2, prev_pos)
                         cp_curr = self._cross_product(p1, p2, curr_pos)
 
@@ -2198,21 +2229,17 @@ class ZoneManager:
 
                     if is_in_this_sec:
                         self.live_occupancy[sid] = self.live_occupancy.get(sid, 0) + 1
-                        # Track consecutive frames inside department zone
+                        # Track frames inside department zone
                         self.person_section_dwell[dwell_key] = self.person_section_dwell.get(dwell_key, 0) + 1
-                        # Require sustained presence (>= 40 frames / ~2.0s) to register genuine department visit
-                        # Prevents hallway passersby from incrementing department visits.
-                        if self.person_section_dwell[dwell_key] >= 40:
+                        # Require 10 frames (~0.7-1.0s) of presence to register genuine department visit
+                        if self.person_section_dwell[dwell_key] >= 10:
                             # 1 visit per person during their showroom visit:
-                            # Avoid incrementing again if this person or active visitor already visited this department
                             already_visited = (
                                 (sid in visited)
-                                or (sid in self.active_visitor_visited_depts)
                                 or (pid and pid in self.counted_person_sections.get(pid, set()))
                             )
                             if not already_visited:
                                 visited.add(sid)
-                                self.active_visitor_visited_depts.add(sid)
                                 if pid:
                                     self.counted_person_sections.setdefault(pid, set()).add(sid)
                                 self.section_totals[sid] = self.section_totals.get(sid, 0) + 1
@@ -2220,7 +2247,8 @@ class ZoneManager:
                                 new_section_entries.append((obj_id, sid, s["name"]))
                     else:
                         if dwell_key in self.person_section_dwell:
-                            self.person_section_dwell[dwell_key] = 0
+                            # Gentle decay: don't wipe out dwell counter on a single dropped frame
+                            self.person_section_dwell[dwell_key] = max(0, self.person_section_dwell[dwell_key] - 2)
 
         # Decrement flash timers
         if self.line_flash_timer > 0:
@@ -3075,6 +3103,7 @@ def estimate_torso_appearance(
     """
     Extracts central upper-body torso patch to identify clothing color tag.
     Assists showroom floor staff and reception with fast visual identification.
+    Filters out background wood laminate flooring and walls using chromatic masking.
     """
     if frame is None or frame.size == 0:
         return "Casual Attire"
@@ -3085,46 +3114,57 @@ def estimate_torso_appearance(
         if h < 20 or w < 10:
             return "Casual Attire"
 
-        # Torso crop: 22% to 60% of person height, inset 15% from sides
-        ty1 = max(0, min(frame.shape[0] - 1, y1 + int(h * 0.22)))
-        ty2 = max(ty1 + 5, min(frame.shape[0], y1 + int(h * 0.60)))
-        tx1 = max(0, min(frame.shape[1] - 1, x1 + int(w * 0.15)))
-        tx2 = max(tx1 + 5, min(frame.shape[1], x2 - int(w * 0.15)))
+        # Torso crop: 24% to 52% of person height, inset 30% from sides to avoid floor/walls/door frames
+        ty1 = max(0, min(frame.shape[0] - 1, y1 + int(h * 0.24)))
+        ty2 = max(ty1 + 5, min(frame.shape[0], y1 + int(h * 0.52)))
+        tx1 = max(0, min(frame.shape[1] - 1, x1 + int(w * 0.30)))
+        tx2 = max(tx1 + 5, min(frame.shape[1], x2 - int(w * 0.30)))
 
         torso = frame[ty1:ty2, tx1:tx2]
         if torso.size == 0:
             return "Casual Attire"
 
         hsv = cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
-        th, tw = hsv.shape[:2]
-        inner = hsv[int(th * 0.15):int(th * 0.85), int(tw * 0.15):int(tw * 0.85)]
-        if inner.size == 0:
-            inner = hsv
+        h_chan = hsv[:, :, 0].flatten()
+        s_chan = hsv[:, :, 1].flatten()
+        v_chan = hsv[:, :, 2].flatten()
 
-        mean_h = float(np.mean(inner[:, :, 0]))
-        mean_s = float(np.mean(inner[:, :, 1]))
-        mean_v = float(np.mean(inner[:, :, 2]))
+        mean_v = float(np.mean(v_chan))
+        mean_s = float(np.mean(s_chan))
 
-        if mean_v < 48:
+        # Saturated chromatic pixels (sufficient saturation S >= 35 and brightness V >= 45)
+        chroma_mask = (s_chan >= 35) & (v_chan >= 45)
+        chroma_pct = float(np.sum(chroma_mask)) / float(len(h_chan)) if len(h_chan) > 0 else 0.0
+
+        # Chromatic classification: requires >= 25% chromatic pixels AND mean saturation >= 26
+        # This cleanly rejects dark/black/gray garments where a small 5-10% wood frame or skin patch
+        # might otherwise corrupt the classification
+        if chroma_pct >= 0.25 and mean_s >= 26:
+            median_h = float(np.median(h_chan[chroma_mask]))
+            # Hue ranges in OpenCV HSV: [0, 180]
+            if median_h < 12 or median_h >= 165:
+                return "Red / Maroon Top"
+            if 12 <= median_h < 22:
+                return "Orange / Rust Top"
+            if 22 <= median_h < 38:
+                return "Yellow / Mustard Top"
+            if 38 <= median_h < 85:
+                return "Green Top"
+            if 85 <= median_h < 135:
+                return "Blue / Navy Top"
+            if 135 <= median_h < 165:
+                return "Purple / Violet Top"
+
+        # Achromatic garments (Black, Gray, White, Cream)
+        # Under indoor CCTV illumination, black/dark shirts typically exhibit V in 40-118 with low saturation
+        if mean_v < 118 and mean_s < 26:
             return "Black / Dark Attire"
-        if mean_s < 38 and mean_v > 175:
+        if mean_s < 22 and mean_v >= 140:
             return "White / Light Shirt"
-        if mean_s < 42:
+        if mean_s < 26:
             return "Gray Attire"
-
-        # Hue ranges in OpenCV HSV: [0, 180]
-        if mean_h < 10 or mean_h >= 170:
-            return "Red / Maroon Top"
-        if 10 <= mean_h < 26:
-            return "Orange / Brown Top"
-        if 26 <= mean_h < 36:
-            return "Yellow / Mustard Top"
-        if 36 <= mean_h < 85:
-            return "Green Top"
-        if 85 <= mean_h < 135:
-            return "Blue / Navy Top"
-        if 135 <= mean_h < 165:
-            return "Purple / Violet Top"
+        if mean_s < 38 and mean_v >= 105:
+            return "Cream / Khaki Shirt"
 
         return "Casual Attire"
     except Exception:
@@ -3643,6 +3683,20 @@ def run_local_detector(
         cooldown_frames=6,
     )
     visitor_zone_tracker.identity_manager = identity_manager
+
+    def on_visitor_registered_callback(t_id_str: str, p_id_str: str):
+        try:
+            tid_val = int(t_id_str) if t_id_str.isdigit() else None
+        except Exception:
+            tid_val = None
+        identity_manager.associate_identity(t_id_str, p_id_str)
+        if tid_val is not None:
+            zone_manager.set_identity(tid_val, p_id_str)
+            visitor_zone_tracker.link_track_pid(tid_val, p_id_str)
+            if tid_val in track_best_snapshots:
+                track_best_snapshots[tid_val]["person_id"] = p_id_str
+
+    sync_client.on_visitor_registered = on_visitor_registered_callback
     employee_recognizer = EmployeeRecognitionManager(
         embedder=face_embedder,
         vector_store=employee_vector_store,
@@ -4439,7 +4493,7 @@ def run_local_detector(
                                             if ret_enc:
                                                 import base64
                                                 b64_crop = base64.b64encode(buf_enc).decode('utf-8')
-                                                clothing_color = estimate_torso_appearance(get_clean_frame(), (x1, y1, x2, y2))
+                                                clothing_color = estimate_torso_appearance(snap_info["portrait"], (0, 0, snap_info["portrait"].shape[1], snap_info["portrait"].shape[0])) if (snap_info.get("portrait") is not None and snap_info["portrait"].size > 0) else estimate_torso_appearance(get_clean_frame(), (x1, y1, x2, y2))
                                                 cur_sec_match = zone_manager.find_section_for_box((x1, y1, x2, y2))
                                                 cur_sec_zone = cur_sec_match[1] if cur_sec_match else "Main Showroom"
                                                 track_emb = identity_manager.track_embeddings.get(str(obj_id))
@@ -4778,7 +4832,7 @@ def run_local_detector(
                                 if ret_s:
                                     import base64
                                     b64_s = base64.b64encode(buf_s).decode('utf-8')
-                                    clothing = estimate_torso_appearance(clean_f, (x1, y1, x2, y2))
+                                    clothing = estimate_torso_appearance(sla_portrait, (0, 0, sla_portrait.shape[1], sla_portrait.shape[0])) if (sla_portrait is not None and sla_portrait.size > 0) else estimate_torso_appearance(clean_f, (x1, y1, x2, y2))
                                     z_name = cand_dept[1] if cand_dept else "Main Showroom"
                                     track_emb = identity_manager.track_embeddings.get(str(obj_id))
                                     if track_emb is None and isinstance(obj_id, int):
@@ -4812,7 +4866,7 @@ def run_local_detector(
                                 if ret_b:
                                     import base64
                                     b64_b = base64.b64encode(buf_b).decode('utf-8')
-                                    clothing = estimate_torso_appearance(get_clean_frame(), (x1, y1, x2, y2))
+                                    clothing = estimate_torso_appearance(body_portrait, (0, 0, body_portrait.shape[1], body_portrait.shape[0])) if (body_portrait is not None and body_portrait.size > 0) else estimate_torso_appearance(get_clean_frame(), (x1, y1, x2, y2))
                                     z_name = cand_dept[1] if cand_dept else "Main Showroom"
                                     track_emb = identity_manager.track_embeddings.get(str(obj_id))
                                     if track_emb is None and isinstance(obj_id, int):
@@ -4945,7 +4999,12 @@ def run_local_detector(
                             print(f"[!] Warning: Failed to encode portrait crop: {e}")
 
                     c_box_now = tracked_objects.get(cid, cdata.get("box"))
-                    clothing = estimate_torso_appearance(get_clean_frame(), c_box_now) if c_box_now else "Walk-in Visitor"
+                    if port_img is not None and port_img.size > 0:
+                        clothing = estimate_torso_appearance(port_img, (0, 0, port_img.shape[1], port_img.shape[0]))
+                    elif c_box_now:
+                        clothing = estimate_torso_appearance(get_clean_frame(), c_box_now)
+                    else:
+                        clothing = "Walk-in Visitor"
                     sec_m = zone_manager.find_section_for_box(c_box_now) if c_box_now else None
                     z_name = sec_m[1] if sec_m else "Main Showroom"
                     track_emb = identity_manager.track_embeddings.get(str(cid))
