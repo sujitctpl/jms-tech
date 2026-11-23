@@ -23,6 +23,8 @@ class EntryLineCounter:
         self.counted_track_ids: Set[str] = set()
         # Duplicate prevention set for persistent person identities across tracking sessions
         self.counted_person_ids: Set[str] = set()
+        # Duplicate prevention set for exit events
+        self.counted_exit_track_ids: Set[str] = set()
 
     def update_config(self, config: Dict[str, Any]) -> None:
         self.config = config
@@ -54,32 +56,35 @@ class EntryLineCounter:
         Returns a list of TrackedPerson instances that just crossed the entry line
         in the configured direction for the FIRST time.
         """
+        entries, _ = self.process_events(tracked_persons)
+        return entries
+
+    def process_events(
+        self, tracked_persons: List[TrackedPerson]
+    ) -> Tuple[List[TrackedPerson], List[TrackedPerson]]:
+        """
+        Evaluates tracked persons against the virtual line.
+        Returns a tuple: (new_entries, new_exits).
+        """
         if not self.is_configured:
-            return []
+            return [], []
 
         new_entries: List[TrackedPerson] = []
+        new_exits: List[TrackedPerson] = []
         current_frame_track_ids: Set[str] = set()
 
         for person in tracked_persons:
             tid = str(person.tracker_id)
             current_frame_track_ids.add(tid)
             curr_point = person.bottom_center
-
-            # If already counted, never count again (duplicate prevention)
-            if tid in self.counted_track_ids:
-                self.track_positions[tid] = curr_point
-                continue
-
-            # If persistent person identity has already been counted, link and suppress duplicate
-            pid = getattr(person, "person_id", None)
-            if pid and pid in self.counted_person_ids:
-                self.counted_track_ids.add(tid)
-                self.track_positions[tid] = curr_point
-                continue
-
             prev_point = self.track_positions.get(tid)
+
+            pid = getattr(person, "person_id", None)
+            is_already_counted = (tid in self.counted_track_ids) or (pid and pid in self.counted_person_ids)
+
             if prev_point is not None:
-                if self._check_crossing(prev_point, curr_point):
+                # 1. Ingress Crossing
+                if not is_already_counted and self._check_crossing(prev_point, curr_point):
                     logger.info(
                         "Valid entry line crossing detected for track ID %s (person: %s) from %s to %s",
                         tid,
@@ -92,6 +97,18 @@ class EntryLineCounter:
                         self.counted_person_ids.add(pid)
                     new_entries.append(person)
 
+                # 2. Egress / Reverse Crossing
+                elif tid not in self.counted_exit_track_ids and self._check_exit_crossing(prev_point, curr_point):
+                    logger.info(
+                        "Valid exit line crossing detected for track ID %s (person: %s) from %s to %s",
+                        tid,
+                        pid or "unresolved",
+                        prev_point,
+                        curr_point,
+                    )
+                    self.counted_exit_track_ids.add(tid)
+                    new_exits.append(person)
+
             # Update tracked position for next frame
             self.track_positions[tid] = curr_point
 
@@ -100,10 +117,10 @@ class EntryLineCounter:
         if len(self.track_positions) > stale_threshold:
             # retain tracks seen in this frame or recently counted
             for tid in list(self.track_positions.keys()):
-                if tid not in current_frame_track_ids and tid not in self.counted_track_ids:
+                if tid not in current_frame_track_ids and tid not in self.counted_track_ids and tid not in self.counted_exit_track_ids:
                     del self.track_positions[tid]
 
-        return new_entries
+        return new_entries, new_exits
 
     def _check_crossing(
         self, p_prev: Tuple[float, float], p_curr: Tuple[float, float]
@@ -120,6 +137,21 @@ class EntryLineCounter:
 
         # Direction verification
         return self._matches_direction(p_prev, p_curr)
+
+    def _check_exit_crossing(
+        self, p_prev: Tuple[float, float], p_curr: Tuple[float, float]
+    ) -> bool:
+        """
+        Tests if trajectory from p_prev to p_curr intersects line segment (p1, p2)
+        in the reverse departure direction.
+        """
+        if self.p1 is None or self.p2 is None:
+            return False
+
+        if not self._segments_intersect(self.p1, self.p2, p_prev, p_curr):
+            return False
+
+        return self._matches_exit_direction(p_prev, p_curr)
 
     def _matches_direction(
         self, p_prev: Tuple[float, float], p_curr: Tuple[float, float]
@@ -141,13 +173,39 @@ class EntryLineCounter:
             return dy > 0
         elif dir_name == "bottom_to_top":
             return dy < 0
-        elif dir_name in ("positive_to_negative", "inward"):
+        elif dir_name in ("positive_to_negative", "inward", "forward"):
             return cp_prev >= 0 and cp_curr < 0
-        elif dir_name in ("negative_to_positive", "outward"):
+        elif dir_name in ("negative_to_positive", "outward", "backward"):
             return cp_prev <= 0 and cp_curr > 0
 
         # Default fallback: any crossing of segment
         return True
+
+    def _matches_exit_direction(
+        self, p_prev: Tuple[float, float], p_curr: Tuple[float, float]
+    ) -> bool:
+        """Validates that movement from p_prev to p_curr matches reverse exit direction."""
+        dir_name = self.direction
+        dx = p_curr[0] - p_prev[0]
+        dy = p_curr[1] - p_prev[1]
+
+        cp_prev = self._cross_product(self.p1, self.p2, p_prev)
+        cp_curr = self._cross_product(self.p1, self.p2, p_curr)
+
+        if dir_name == "left_to_right":
+            return dx < 0
+        elif dir_name == "right_to_left":
+            return dx > 0
+        elif dir_name == "top_to_bottom":
+            return dy < 0
+        elif dir_name == "bottom_to_top":
+            return dy > 0
+        elif dir_name in ("positive_to_negative", "inward", "forward"):
+            return (cp_prev <= 0 and cp_curr > 0) or (cp_prev < 0 and cp_curr >= 0)
+        elif dir_name in ("negative_to_positive", "outward", "backward"):
+            return (cp_prev >= 0 and cp_curr < 0) or (cp_prev > 0 and cp_curr <= 0)
+
+        return False
 
     @staticmethod
     def _cross_product(
@@ -201,3 +259,5 @@ class EntryLineCounter:
         """Resets tracker state."""
         self.track_positions.clear()
         self.counted_track_ids.clear()
+        self.counted_person_ids.clear()
+        self.counted_exit_track_ids.clear()

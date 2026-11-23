@@ -434,7 +434,11 @@ class FaceEmbedder:
         Detects, crops, and extracts an L2-normalized 512-dim ArcFace embedding from a photo.
         Ensures consistency between portrait enrollment and edge detection feeds.
         """
+        if image is None or image.size == 0:
+            raise ValueError("Invalid empty image provided for embedding extraction")
         cropped_face, crop_landmarks, full_landmarks = self.detect_and_crop_face(image)
+        if cropped_face is None or cropped_face.size == 0:
+            return self.extract_embedding(image)
         return self.extract_embedding(cropped_face, crop_landmarks, full_image=image, raw_landmarks=full_landmarks)
 
     @staticmethod

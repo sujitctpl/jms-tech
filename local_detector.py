@@ -165,6 +165,7 @@ class DashboardSyncClient:
         zone: Optional[str] = None,
         appearance: Optional[str] = None,
         face_embedding: Optional[List[float]] = None,
+        body_embedding: Optional[List[float]] = None,
         is_waiting: Optional[bool] = True,
         waiting_seconds: Optional[int] = 0,
     ) -> None:
@@ -172,6 +173,7 @@ class DashboardSyncClient:
         payload = {
             "face_image_base64": face_image_base64,
             "face_embedding": face_embedding,
+            "body_embedding": body_embedding,
             "camera_id": self.camera_id if self.camera_id and len(self.camera_id) == 36 else None,
             "camera_name": self.camera_name,
             "tracker_id": str(tracker_id) if tracker_id else None,
@@ -1649,10 +1651,23 @@ class VisitorZoneTracker:
             # If no continuous track and no verified face match, do NOT blindly guess based on recency.
             # Delegate exit matching to the backend Dual-Factor Person Re-ID & Clothing verification engine.
 
+        # Absolute biometric face consistency check: if continuous track has a known face and exit has a face, ensure they match!
+        if session and exit_face_emb is not None and hasattr(self, "identity_manager") and self.identity_manager:
+            track_embs = getattr(self.identity_manager, "track_embeddings", {})
+            s_tid = session.get("track_id", tid_str)
+            s_emb = track_embs.get(str(s_tid))
+            if s_emb is None and str(s_tid).isdigit():
+                s_emb = track_embs.get(int(s_tid))
+            if s_emb is not None:
+                sim = float(np.dot(exit_face_emb, s_emb))
+                if sim < 0.50:
+                    print(f"[*] Suppressing exit match for track #{track_id}: face similarity {sim:.3f} contradicts session #{s_tid}.")
+                    session = None
+
         if session:
             dwell_total = max(0.0, now_ts - session.get("first_seen_ts", now_ts))
-            if dwell_total < 5.0:
-                print(f"[*] Suppressed premature exit for track #{track_id}: dwell {dwell_total:.1f}s < 5.0s threshold.")
+            if dwell_total < 7.0:
+                print(f"[*] Suppressed premature exit for track #{track_id}: dwell {dwell_total:.1f}s < 7.0s threshold.")
                 return
             # Confirmed genuine departure (stayed >= 7.0s): remove session and sync exit
             self.sessions.pop(tid_str, None)
@@ -1816,6 +1831,7 @@ class ZoneManager:
         # Track history & persistent identity linking
         self.counted_attendance_ids: Set[int] = set()
         self.counted_person_ids: Set[str] = set()
+        self.counted_person_times: Dict[str, float] = {}
         self.track_identities: Dict[int, str] = {}
         self.person_visited_sections: Dict[int, Set[str]] = {}
         self.counted_person_sections: Dict[str, Set[str]] = {}
@@ -2023,6 +2039,7 @@ class ZoneManager:
             self.track_identities[obj_id] = pid
             if obj_id in self.counted_attendance_ids:
                 self.counted_person_ids.add(pid)
+                self.counted_person_times[pid] = time.time()
             if pid in self.counted_person_sections:
                 self.person_visited_sections.setdefault(obj_id, set()).update(self.counted_person_sections[pid])
             for sid, occupants in self.section_occupants.items():
@@ -2040,6 +2057,7 @@ class ZoneManager:
         self.counted_attendance_ids.add(obj_id)
         if pid:
             self.counted_person_ids.add(pid)
+            self.counted_person_times[pid] = time.time()
         self.attendance_total += 1
         self.line_flash_timer = 35
 
@@ -2177,7 +2195,10 @@ class ZoneManager:
 
             # 1. Check Entry Line Crossing
             pid = self.track_identities.get(obj_id)
-            is_already_counted = (obj_id in self.counted_attendance_ids) or (pid and pid in self.counted_person_ids)
+            now_cur = time.time()
+            is_already_counted = (obj_id in self.counted_attendance_ids) or (
+                pid and (now_cur - self.counted_person_times.get(pid, 0.0)) < 25.0
+            )
             if has_entry_line:
                 prev_pos = self.track_positions.get(obj_id)
                 if prev_pos is not None:
@@ -2212,8 +2233,9 @@ class ZoneManager:
                             self.exit_flash_timer = 25
                             self.active_visitor_visited_depts.clear()
                             self.counted_attendance_ids.discard(obj_id)
-                            if pid and pid in self.counted_person_ids:
+                            if pid:
                                 self.counted_person_ids.discard(pid)
+                                self.counted_person_times.pop(pid, None)
                             new_exit_crossings.append(obj_id)
 
             self.track_positions[obj_id] = curr_pos
@@ -3103,7 +3125,7 @@ def estimate_torso_appearance(
     """
     Extracts central upper-body torso patch to identify clothing color tag.
     Assists showroom floor staff and reception with fast visual identification.
-    Filters out background wood laminate flooring and walls using chromatic masking.
+    Uses BodyEmbedder.estimate_clothing_appearance for unified clothing tags.
     """
     if frame is None or frame.size == 0:
         return "Casual Attire"
@@ -3114,59 +3136,12 @@ def estimate_torso_appearance(
         if h < 20 or w < 10:
             return "Casual Attire"
 
-        # Torso crop: 24% to 52% of person height, inset 30% from sides to avoid floor/walls/door frames
-        ty1 = max(0, min(frame.shape[0] - 1, y1 + int(h * 0.24)))
-        ty2 = max(ty1 + 5, min(frame.shape[0], y1 + int(h * 0.52)))
-        tx1 = max(0, min(frame.shape[1] - 1, x1 + int(w * 0.30)))
-        tx2 = max(tx1 + 5, min(frame.shape[1], x2 - int(w * 0.30)))
-
-        torso = frame[ty1:ty2, tx1:tx2]
-        if torso.size == 0:
+        crop = frame[max(0, y1):min(frame.shape[0], y2), max(0, x1):min(frame.shape[1], x2)]
+        if crop.size == 0:
             return "Casual Attire"
 
-        hsv = cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
-        h_chan = hsv[:, :, 0].flatten()
-        s_chan = hsv[:, :, 1].flatten()
-        v_chan = hsv[:, :, 2].flatten()
-
-        mean_v = float(np.mean(v_chan))
-        mean_s = float(np.mean(s_chan))
-
-        # Saturated chromatic pixels (sufficient saturation S >= 35 and brightness V >= 45)
-        chroma_mask = (s_chan >= 35) & (v_chan >= 45)
-        chroma_pct = float(np.sum(chroma_mask)) / float(len(h_chan)) if len(h_chan) > 0 else 0.0
-
-        # Chromatic classification: requires >= 25% chromatic pixels AND mean saturation >= 26
-        # This cleanly rejects dark/black/gray garments where a small 5-10% wood frame or skin patch
-        # might otherwise corrupt the classification
-        if chroma_pct >= 0.25 and mean_s >= 26:
-            median_h = float(np.median(h_chan[chroma_mask]))
-            # Hue ranges in OpenCV HSV: [0, 180]
-            if median_h < 12 or median_h >= 165:
-                return "Red / Maroon Top"
-            if 12 <= median_h < 22:
-                return "Orange / Rust Top"
-            if 22 <= median_h < 38:
-                return "Yellow / Mustard Top"
-            if 38 <= median_h < 85:
-                return "Green Top"
-            if 85 <= median_h < 135:
-                return "Blue / Navy Top"
-            if 135 <= median_h < 165:
-                return "Purple / Violet Top"
-
-        # Achromatic garments (Black, Gray, White, Cream)
-        # Under indoor CCTV illumination, black/dark shirts typically exhibit V in 40-118 with low saturation
-        if mean_v < 118 and mean_s < 26:
-            return "Black / Dark Attire"
-        if mean_s < 22 and mean_v >= 140:
-            return "White / Light Shirt"
-        if mean_s < 26:
-            return "Gray Attire"
-        if mean_s < 38 and mean_v >= 105:
-            return "Cream / Khaki Shirt"
-
-        return "Casual Attire"
+        from app.vision.body_embedder import BodyEmbedder
+        return BodyEmbedder.estimate_clothing_appearance(crop)
     except Exception:
         return "Casual Attire"
 
@@ -3177,7 +3152,7 @@ def extract_upper_torso_histogram(
     """
     Extracts a normalized 2D HSV color histogram of the upper torso patch (20% - 58% height).
     Counter-proof: excludes legs, waist, and lower body to avoid counter-top occlusions.
-    Executes in < 0.05ms using standard OpenCV matrix operations (Zero GPU overhead).
+    Uses salient torso extraction to eliminate doorway background and wall reflections.
     """
     if frame is None or frame.size == 0:
         return None
@@ -3188,15 +3163,20 @@ def extract_upper_torso_histogram(
         if h < 20 or w < 10:
             return None
 
-        # Upper torso: 20% to 58% of person height, inset 15% from sides
-        ty1 = max(0, min(frame.shape[0] - 1, y1 + int(h * 0.20)))
-        ty2 = max(ty1 + 5, min(frame.shape[0], y1 + int(h * 0.58)))
-        tx1 = max(0, min(frame.shape[1] - 1, x1 + int(w * 0.15)))
-        tx2 = max(tx1 + 5, min(frame.shape[1], x2 - int(w * 0.15)))
-
-        torso = frame[ty1:ty2, tx1:tx2]
-        if torso.size == 0:
+        crop = frame[max(0, y1):min(frame.shape[0], y2), max(0, x1):min(frame.shape[1], x2)]
+        if crop.size == 0:
             return None
+
+        from app.vision.body_embedder import BodyEmbedder
+        torso = BodyEmbedder.extract_salient_torso_patch(crop)
+        if torso is None or torso.size == 0:
+            ty1 = max(0, min(frame.shape[0] - 1, y1 + int(h * 0.20)))
+            ty2 = max(ty1 + 5, min(frame.shape[0], y1 + int(h * 0.58)))
+            tx1 = max(0, min(frame.shape[1] - 1, x1 + int(w * 0.15)))
+            tx2 = max(tx1 + 5, min(frame.shape[1], x2 - int(w * 0.15)))
+            torso = frame[ty1:ty2, tx1:tx2]
+            if torso.size == 0:
+                return None
 
         hsv = cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
         # 16 Hue bins, 8 Saturation bins
@@ -3650,10 +3630,17 @@ def run_local_detector(
     zone_manager.visitor_tracker = visitor_zone_tracker
 
     # Face Embedding & Identity Recovery System (ArcFace + pgvector + 14-Day Retention)
+    from app.vision.body_embedder import BodyEmbedder
     from app.vision.face_embedder import FaceEmbedder
     from app.vision.vector_store import PgVectorStoreManager
     from app.vision.identity_tracker import IdentityRecoveryManager
     from app.vision.employee_recognizer import EmployeeRecognitionManager
+
+    try:
+        edge_body_embedder = BodyEmbedder()
+    except Exception as e_be:
+        print(f"[!] Warning: Could not initialize edge BodyEmbedder: {e_be}")
+        edge_body_embedder = None
 
     # Open database session if PostgreSQL is running locally
     db_session = None
@@ -4011,9 +3998,22 @@ def run_local_detector(
                         track_start_times[obj_id] = float(matched_cand.get("first_seen_ts", now_ts))
                         m_pid = matched_cand.get("person_id")
                         if m_pid:
-                            identity_manager.associate_identity(str(obj_id), m_pid)
-                            zone_manager.set_identity(obj_id, m_pid)
-                            visitor_zone_tracker.link_track_pid(obj_id, m_pid)
+                            # At the entrance/exit camera tripwire, NEVER blindly transfer person_id without biometric verification!
+                            # Handing off person_id across tracks at the entrance door risks linking unrelated visitors entering and exiting.
+                            transferred = False
+                            if hasattr(identity_manager, "track_embeddings"):
+                                track_emb = identity_manager.track_embeddings.get(str(obj_id))
+                                if track_emb is None:
+                                    track_emb = identity_manager.track_embeddings.get(obj_id)
+                                if track_emb is not None and hasattr(identity_manager, "vector_store") and identity_manager.vector_store:
+                                    v_pid, v_sim = identity_manager.vector_store.find_best_visitor_match(track_emb, similarity_threshold=0.65)
+                                    if v_pid == m_pid and v_sim >= 0.65:
+                                        identity_manager.associate_identity(str(obj_id), m_pid)
+                                        zone_manager.set_identity(obj_id, m_pid)
+                                        visitor_zone_tracker.link_track_pid(obj_id, m_pid)
+                                        transferred = True
+                            if not transferred:
+                                m_pid = None
                         track_display_aliases[obj_id] = matched_cand.get("display_id", matched_cand["track_id"])
                         cand_max_dwell = max(0.0, now_ts - track_start_times[obj_id])
                         w_inherited = min(float(matched_cand.get("waiting_seconds", 0.0)), cand_max_dwell)
@@ -4872,6 +4872,16 @@ def run_local_detector(
                                     if track_emb is None and isinstance(obj_id, int):
                                         track_emb = identity_manager.track_embeddings.get(obj_id)
                                     emb_list = track_emb.tolist() if (track_emb is not None and hasattr(track_emb, "tolist")) else None
+
+                                    body_emb_list = None
+                                    if edge_body_embedder is not None and body_portrait is not None:
+                                        try:
+                                            b_emb = edge_body_embedder.extract_embedding(body_portrait)
+                                            if b_emb is not None:
+                                                body_emb_list = b_emb.tolist()
+                                        except Exception:
+                                            pass
+
                                     sync_client.send_visitor_detect(
                                         face_image_base64=b64_b,
                                         tracker_id=str(obj_id),
@@ -4880,6 +4890,7 @@ def run_local_detector(
                                         appearance=clothing,
                                         zone=z_name,
                                         face_embedding=emb_list,
+                                        body_embedding=body_emb_list,
                                     )
                                     track_best_snapshots[obj_id] = {
                                         "best_score": 0.35,

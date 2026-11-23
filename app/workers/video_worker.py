@@ -83,6 +83,8 @@ class VideoWorker(threading.Thread):
         from app.repositories.employee_attendance_repo import EmployeeAttendanceRepository
         from app.repositories.employee_repo import EmployeeRepository
         from app.repositories.person_identity_repo import PersonIdentityRepository
+        from app.schemas.visitor import VisitorZoneUpdateRequest
+        from app.services.visitor_service import VisitorService, IST
         from app.vision.employee_recognizer import EmployeeRecognitionManager
         from app.vision.face_embedder import FaceEmbedder
         from app.vision.identity_tracker import IdentityRecoveryManager
@@ -91,6 +93,7 @@ class VideoWorker(threading.Thread):
         identity_repo = PersonIdentityRepository(db)
         emp_repo = EmployeeRepository(db)
         emp_attendance_repo = EmployeeAttendanceRepository(db)
+        visitor_service = VisitorService(db)
         face_embedder = FaceEmbedder()
         visitor_vector_store = PgVectorStoreManager(db=db, similarity_threshold=settings.FACE_SIMILARITY_THRESHOLD)
         employee_vector_store = PgVectorStoreManager(db=db, similarity_threshold=settings.FACE_SIMILARITY_THRESHOLD)
@@ -133,6 +136,7 @@ class VideoWorker(threading.Thread):
         try:
             last_db_sync = time.time()
             frame_counter = 0
+            track_arrival_times: Dict[str, float] = {}
 
             while not self.stop_event.is_set():
                 success, frame = stream_reader.read_frame()
@@ -222,6 +226,7 @@ class VideoWorker(threading.Thread):
                 for person in tracked_persons:
                     try:
                         str_tid = str(person.tracker_id)
+                        track_arrival_times.setdefault(str_tid, time.time())
                         # Attempt face identity recovery if face region is available
                         px1, py1, px2, py2 = map(int, person.box)
                         h_box = py2 - py1
@@ -314,8 +319,8 @@ class VideoWorker(threading.Thread):
                     except Exception as e:
                         logger.error("Failed to persist track %s: %s", person.tracker_id, str(e))
 
-                # Evaluate entry line crossing
-                new_entries = entry_counter.process_frame(tracked_persons)
+                # Evaluate directional entry and exit line crossings
+                new_entries, new_exits = entry_counter.process_events(tracked_persons)
                 for entry_person in new_entries:
                     # Suppress visitor entry count if the person is a recognized showroom employee
                     if employee_recognizer.is_track_employee(str(entry_person.tracker_id)):
@@ -341,6 +346,66 @@ class VideoWorker(threading.Thread):
                             )
                         except Exception as e:
                             logger.error("Failed to record footfall event: %s", str(e))
+
+                for exit_person in new_exits:
+                    tid_str = str(exit_person.tracker_id)
+                    # 1. Showroom Employee departure: Clock CHECK_OUT punch
+                    if employee_recognizer.is_track_employee(tid_str):
+                        emp_id = employee_recognizer.get_employee_id(tid_str)
+                        try:
+                            emp_attendance_repo.record_attendance_event(
+                                employee_id=emp_id,
+                                camera_id=self.camera_id,
+                                event_type="CHECK_OUT",
+                                confidence=0.95,
+                            )
+                            logger.info("Staff member %s clocked CHECK_OUT on camera %s", emp_id, self.camera_id)
+                        except Exception as ex:
+                            logger.error("Failed to record employee checkout for %s: %s", emp_id, str(ex))
+                        continue
+
+                    # 2. Visitor departure: 7.0s minimum dwell verification (premature exit suppression)
+                    arr_ts = track_arrival_times.get(tid_str, time.time())
+                    dwell_sec = max(0.0, time.time() - arr_ts)
+                    if dwell_sec < 7.0:
+                        logger.info("Suppressed premature exit for track %s: dwell %.1fs < 7.0s", tid_str, dwell_sec)
+                        continue
+
+                    # Extract exit body crop & base64 encode
+                    exit_b64 = None
+                    try:
+                        ex1, ey1, ex2, ey2 = map(int, exit_person.box)
+                        ex1 = max(0, min(ex1, frame.shape[1] - 1))
+                        ey1 = max(0, min(ey1, frame.shape[0] - 1))
+                        ex2 = max(0, min(ex2, frame.shape[1]))
+                        ey2 = max(0, min(ey2, frame.shape[0]))
+                        if ey2 > ey1 and ex2 > ex1:
+                            exit_crop = frame[ey1:ey2, ex1:ex2]
+                            ret_e, buf_e = cv2.imencode('.jpg', exit_crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                            if ret_e:
+                                import base64
+                                exit_b64 = base64.b64encode(buf_e).decode('utf-8')
+                    except Exception as ex:
+                        logger.warning("Failed to extract exit crop for %s: %s", tid_str, str(ex))
+
+                    exit_time_str = datetime.now(IST).strftime("%I:%M %p")
+                    try:
+                        update_req = VisitorZoneUpdateRequest(
+                            person_id=exit_person.person_id,
+                            tracker_id=tid_str,
+                            exit_time=exit_time_str,
+                            exit_image_base64=exit_b64,
+                        )
+                        visitor_service.update_visitor_zone(update_req)
+                        logger.info(
+                            "Recorded visitor departure on camera %s for track %s (person: %s) at %s",
+                            self.camera_id,
+                            tid_str,
+                            exit_person.person_id or "unresolved",
+                            exit_time_str,
+                        )
+                    except Exception as ex:
+                        logger.error("Failed to record visitor exit zone update: %s", str(ex))
 
                 # Periodically sync frame count to DB (e.g. every 5 seconds or 50 frames)
                 if time.time() - last_db_sync > 5.0:

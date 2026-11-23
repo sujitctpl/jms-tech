@@ -106,8 +106,8 @@ class VisitorService:
                 except Exception:
                     pass
             elif last_seen_ist:
-                # If visitor hasn't been seen in > 15 minutes today, mark departed
-                if (now_ist - last_seen_ist).total_seconds() > 900:
+                # If visitor hasn't been seen in > 4 hours today, mark departed
+                if (now_ist - last_seen_ist).total_seconds() > 14400:
                     exit_time_val = last_seen_str
                     record.exit_time = exit_time_val
                     record.is_waiting = False
@@ -135,8 +135,8 @@ class VisitorService:
                 except Exception:
                     end_time = last_seen_ist or now_ist
             elif last_seen_ist:
-                # Active inside if seen within 15 mins, otherwise departed when last seen
-                is_active = (now_ist - last_seen_ist).total_seconds() <= 900
+                # Active inside if seen within 4 hours, otherwise departed when last seen
+                is_active = (now_ist - last_seen_ist).total_seconds() <= 14400
                 end_time = now_ist if is_active else last_seen_ist
             else:
                 end_time = now_ist
@@ -288,10 +288,8 @@ class VisitorService:
                 .order_by(PersonIdentity.last_seen_at.desc())
                 .first()
             )
-            if cand and cand.last_seen_at:
-                time_diff = (now_utc - cand.last_seen_at).total_seconds()
-                if time_diff < 45.0:
-                    record = cand
+            if cand:
+                record = cand
 
         # Extract exit image crop & embeddings (Face + Body Person Re-ID)
         exit_img_b64 = getattr(payload, "exit_image_base64", None)
@@ -327,27 +325,33 @@ class VisitorService:
             except Exception as e:
                 logger.warning("Could not extract exit image embeddings: %s", e)
 
+        vetoed_pids = set()
         # Verify biometric consistency if candidate record has a stored face embedding and exit photo has a face
         if record and payload.exit_time and exit_face_emb is not None:
             cand_emb = record.get_embedding_vector()
             if cand_emb is not None:
                 sim = FaceEmbedder.compute_similarity(exit_face_emb, cand_emb)
-                if sim < 0.55:
+                if sim < 0.50:
                     logger.warning(
-                        "Biometric mismatch on exit for visitor %s: similarity %.3f < 0.55. Refusing to attach exit to this visitor.",
+                        "Biometric mismatch on exit for visitor %s: similarity %.3f < 0.50. Refusing to attach exit to this visitor.",
                         record.person_id,
                         sim,
                     )
+                    vetoed_pids.add(record.person_id)
                     record = None
 
         # Verify body appearance & clothing consistency if candidate record has an entry crop / body embedding
         if record and payload.exit_time and exit_body_emb is not None:
-            cand_b_emb = record.get_body_embedding_vector()
             cand_crop = None
             if getattr(record, "avatar_url", None):
                 c_path = record.avatar_url.lstrip("/").split("?")[0]
                 if os.path.isfile(c_path):
                     cand_crop = cv2.imread(c_path)
+            cand_b_emb = None
+            if cand_crop is not None:
+                cand_b_emb = self.body_embedder.extract_embedding(cand_crop)
+            elif record:
+                cand_b_emb = record.get_body_embedding_vector()
             if cand_b_emb is not None or cand_crop is not None:
                 reid_s, clothing_s, app_score, is_match = self.body_embedder.verify_appearance(
                     crop1=exit_crop_img,
@@ -355,6 +359,7 @@ class VisitorService:
                     emb1=exit_body_emb,
                     emb2=cand_b_emb,
                 )
+                # Strict verification: if body/clothing does not match, veto candidate
                 if not is_match:
                     logger.warning(
                         "Body appearance mismatch on exit for visitor %s: reid=%.3f, clothing=%.3f, is_match=False. Refusing to attach exit to this visitor.",
@@ -362,6 +367,7 @@ class VisitorService:
                         reid_s,
                         clothing_s,
                     )
+                    vetoed_pids.add(record.person_id)
                     record = None
 
         # Fallback for store exit: if tracker ID was reset on 180-deg turnaround (e.g. #2 became #6)
@@ -387,44 +393,59 @@ class VisitorService:
             if stale_prior_day:
                 self.db.commit()
 
+            from sqlalchemy import or_
             active_cands = (
                 self.db.query(PersonIdentity)
                 .filter(
                     PersonIdentity.is_expired.is_(False),
-                    PersonIdentity.exit_time.is_(None),
                     PersonIdentity.created_at >= today_start_utc,
+                    or_(
+                        PersonIdentity.exit_time.is_(None),
+                        PersonIdentity.exit_time == "Timed out",
+                        PersonIdentity.exit_avatar_url.is_(None),
+                    ),
                 )
                 .order_by(PersonIdentity.last_seen_at.desc())
                 .all()
             )
 
             # 1. If exit face embedding is available, search active candidates for a biometric face match
-            # Calibrated threshold for CCTV face match: >= 0.65 with top-margin check to avoid ambiguous matches
+            # Calibrated threshold for CCTV face match: >= 0.52 with top-margin check to avoid ambiguous matches
             if exit_face_emb is not None:
                 best_match = None
                 best_sim = 0.0
                 second_sim = 0.0
                 for active_cand in active_cands:
+                    if active_cand.person_id in vetoed_pids:
+                        continue
                     cand_emb = active_cand.get_embedding_vector()
                     if cand_emb is not None:
                         sim = FaceEmbedder.compute_similarity(exit_face_emb, cand_emb)
+                        if sim < 0.50:
+                            # Absolute face veto: record known to have non-matching face
+                            vetoed_pids.add(active_cand.person_id)
+                            continue
                         if sim > best_sim:
                             second_sim = best_sim
                             best_sim = sim
                             best_match = active_cand
                         elif sim > second_sim:
                             second_sim = sim
-                if best_match and best_sim >= 0.55:
+                if best_match and best_sim >= 0.52:
                     if len(active_cands) == 1 or (best_sim - second_sim >= 0.035):
                         # Appearance cross-check: ensure body/clothing does not contradict face match
                         appearance_ok = True
                         if exit_body_emb is not None:
-                            cand_b_emb = best_match.get_body_embedding_vector()
                             cand_crop = None
                             if getattr(best_match, "avatar_url", None):
                                 c_path = best_match.avatar_url.lstrip("/").split("?")[0]
                                 if os.path.isfile(c_path):
                                     cand_crop = cv2.imread(c_path)
+                            cand_b_emb = None
+                            if cand_crop is not None:
+                                cand_b_emb = self.body_embedder.extract_embedding(cand_crop)
+                            elif best_match:
+                                cand_b_emb = best_match.get_body_embedding_vector()
                             if cand_b_emb is not None or cand_crop is not None:
                                 reid_s, clothing_s, _, is_m = self.body_embedder.verify_appearance(
                                     crop1=exit_crop_img,
@@ -432,7 +453,8 @@ class VisitorService:
                                     emb1=exit_body_emb,
                                     emb2=cand_b_emb,
                                 )
-                                if not is_m and (clothing_s < 0.25 or reid_s < 0.55):
+                                # Biometric face match takes priority: only reject if clothing is a clear contradiction
+                                if not is_m and (clothing_s < 0.20 and reid_s < 0.40):
                                     logger.warning(
                                         "Exit face match (sim=%.3f) rejected due to conflicting body/clothing appearance for %s (reid=%.3f, cloth=%.3f)",
                                         best_sim,
@@ -451,20 +473,34 @@ class VisitorService:
                             )
 
             # 2. Dual-Factor Appearance Match: OSNet Person Re-ID + Multi-Part 3D Clothing Color Correlation
+            # ABSOLUTE VETO: Never evaluate appearance if candidate face contradicts the exiting person's face!
             if not record and exit_body_emb is not None:
                 best_body_match = None
                 best_body_sim = 0.0
                 best_color_sim = 0.0
                 for active_cand in active_cands:
-                    cand_b_emb = active_cand.get_body_embedding_vector()
-                    if cand_b_emb is not None:
-                        # Load candidate entry image to verify clothing color distribution
-                        cand_crop = None
-                        if getattr(active_cand, "avatar_url", None):
-                            c_path = active_cand.avatar_url.lstrip("/").split("?")[0]
-                            if os.path.isfile(c_path):
-                                cand_crop = cv2.imread(c_path)
+                    if active_cand.person_id in vetoed_pids:
+                        continue
+                    cand_emb = active_cand.get_embedding_vector()
+                    if exit_face_emb is not None and cand_emb is not None:
+                        f_sim = FaceEmbedder.compute_similarity(exit_face_emb, cand_emb)
+                        if f_sim < 0.50:
+                            # Hard biometric face rejection: proven different human beings
+                            vetoed_pids.add(active_cand.person_id)
+                            continue
 
+                    cand_crop = None
+                    if getattr(active_cand, "avatar_url", None):
+                        c_path = active_cand.avatar_url.lstrip("/").split("?")[0]
+                        if os.path.isfile(c_path):
+                            cand_crop = cv2.imread(c_path)
+                    cand_b_emb = None
+                    if cand_crop is not None:
+                        cand_b_emb = self.body_embedder.extract_embedding(cand_crop)
+                    elif active_cand:
+                        cand_b_emb = active_cand.get_body_embedding_vector()
+
+                    if cand_b_emb is not None or cand_crop is not None:
                         reid_s, clothing_s, app_score, is_match = self.body_embedder.verify_appearance(
                             crop1=exit_crop_img,
                             crop2=cand_crop,
@@ -473,11 +509,11 @@ class VisitorService:
                         )
 
                         # Genuine exit verification:
-                        # 1. is_match enforces calibrated Re-ID + multi-part torso/legs clothing correlation
-                        # 2. clothing_s must be >= 0.36 to strictly rule out different attire
+                        # 1. is_match enforces calibrated Re-ID + torso/legs clothing correlation
+                        # 2. clothing_s must be >= 0.38 to strictly rule out different attire
                         # 3. Minimum time in store must be >= 5.0 seconds (matches entrance bounce window)
                         time_in_store = (now_utc - active_cand.created_at).total_seconds() if active_cand.created_at else 30.0
-                        if is_match and clothing_s >= 0.36 and time_in_store >= 5.0 and app_score > best_body_sim:
+                        if is_match and clothing_s >= 0.35 and time_in_store >= 5.0 and app_score > best_body_sim:
                             best_body_sim = app_score
                             best_color_sim = clothing_s
                             best_body_match = active_cand
@@ -901,9 +937,9 @@ class VisitorService:
                     c_last_ist = to_ist(cand.last_seen_at) or cand_ist
                     if cand_ist and cand_ist.date() == now_ist.date():
                         time_since_creation = (now_ist - cand_ist).total_seconds()
-                        if not is_cam_entrance or time_since_creation <= 900.0:
-                            # If customer hasn't been seen for > 30 minutes, prior visit timed out: close it out
-                            if c_last_ist and (now_ist - c_last_ist).total_seconds() > 1800.0:
+                        if not is_cam_entrance or time_since_creation <= 14400.0:
+                            # If customer hasn't been seen for > 2 hours, prior visit timed out: close it out
+                            if c_last_ist and (now_ist - c_last_ist).total_seconds() > 7200.0:
                                 cand.exit_time = c_last_ist.strftime("%I:%M %p")
                                 cand.is_waiting = False
                                 self.db.add(cand)
@@ -949,7 +985,9 @@ class VisitorService:
                                 if os.path.isfile(c_path):
                                     cand_crop = cv2.imread(c_path)
                             cand_b_emb = history_cand.get_body_embedding_vector()
-                            if face_img is not None and (cand_crop is not None or cand_b_emb is not None):
+                            is_body1 = bool(face_img is not None and face_img.shape[0] >= 160 and face_img.shape[1] >= 80)
+                            is_body2 = bool(cand_crop is not None and cand_crop.shape[0] >= 160 and cand_crop.shape[1] >= 80)
+                            if is_body1 and is_body2:
                                 _, _, _, is_app_match = self.body_embedder.verify_appearance(
                                     crop1=face_img,
                                     crop2=cand_crop,
@@ -974,8 +1012,11 @@ class VisitorService:
                                     self.db.add(history_cand)
                                     self.db.commit()
                             else:
-                                # Same day and not marked exited: check if absent for > 30 minutes
-                                if h_last_ist and (now_ist - h_last_ist).total_seconds() > 1800.0:
+                                # Same day and not marked exited:
+                                # If at entrance camera and absent for > 90s, or inside absent for > 30 mins:
+                                # auto-close the previous visit and treat as returning customer
+                                cutoff_sec = 90.0 if is_cam_entrance else 1800.0
+                                if h_last_ist and (now_ist - h_last_ist).total_seconds() > cutoff_sec:
                                     history_cand.exit_time = h_last_ist.strftime("%I:%M %p")
                                     history_cand.is_waiting = False
                                     self.db.add(history_cand)
@@ -1018,8 +1059,8 @@ class VisitorService:
                             emb1=curr_body_emb,
                             emb2=cand_b_emb,
                         )
-                        # High-confidence same-person check: Re-ID >= 0.82 and clothing >= 0.40
-                        if is_m and r_sim >= 0.82 and c_sim >= 0.40:
+                        # High-confidence same-person check: Re-ID >= 0.65 and clothing >= 0.28 (or strong Re-ID >= 0.74)
+                        if is_m and ((r_sim >= 0.65 and c_sim >= 0.28) or r_sim >= 0.74):
                             matched_person_id = cand.person_id
                             matched_similarity = app_score
                             is_active_session = True

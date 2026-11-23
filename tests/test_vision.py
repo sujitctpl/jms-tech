@@ -63,3 +63,37 @@ def test_tracking_person_attributes():
     assert tp.tracker_id == "t_1"
     assert tp.bottom_center == (100.0, 300.0)
     assert tp.center == (100.0, 200.0)
+
+
+def test_body_embedder_portrait_and_fullbody_adaptive_matching():
+    from app.vision.body_embedder import BodyEmbedder
+
+    embedder = BodyEmbedder()
+
+    # Create full body crop: 300 height x 120 width (aspect ratio 2.5) with blue shirt
+    full_body = np.zeros((300, 120, 3), dtype=np.uint8)
+    full_body[50:150, 30:90] = [180, 50, 20]  # Blue shirt (torso)
+    full_body[170:270, 30:90] = [30, 30, 30]  # Dark pants
+
+    # Create portrait bust crop: 100 height x 100 width (aspect ratio 1.0) with matching blue shirt
+    portrait_bust = np.zeros((100, 100, 3), dtype=np.uint8)
+    portrait_bust[40:90, 25:75] = [180, 50, 20]  # Blue shirt (chest)
+
+    # Synthetic identical embeddings
+    emb1 = np.ones(512, dtype=np.float32) / np.sqrt(512)
+    emb2 = np.ones(512, dtype=np.float32) / np.sqrt(512)
+
+    reid_s, clothing_s, app_s, is_m = embedder.verify_appearance(
+        crop1=full_body,
+        crop2=portrait_bust,
+        emb1=emb1,
+        emb2=emb2,
+    )
+
+    # Adaptive matching must recognize the shared shirt without penalizing missing legs in the portrait!
+    t1 = embedder.extract_body_part_hist(full_body, 0.18, 0.52)
+    t2 = embedder.extract_body_part_hist(portrait_bust, 0.38, 0.90)
+    torso_sim = embedder.compute_color_similarity(t1, t2)
+    assert torso_sim > 0.50
+    assert clothing_s >= 0.35
+    assert is_m is True

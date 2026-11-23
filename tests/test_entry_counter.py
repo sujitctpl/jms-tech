@@ -100,3 +100,31 @@ def test_non_crossing_movements():
     p4 = TrackedPerson(tracker_id="2", box=(600.0, 300.0, 650.0, 350.0), confidence=0.9, class_id=0)
     counter.process_frame([p3])
     assert len(counter.process_frame([p4])) == 0
+
+
+def test_entry_and_exit_events_crossing():
+    config = {
+        "line": [[100.0, 300.0], [500.0, 300.0]],
+        "direction": "top_to_bottom",
+    }
+    counter = EntryLineCounter(config)
+
+    # Frame 1: Person above line (y=250)
+    p1 = TrackedPerson(tracker_id="track_1", box=(200.0, 150.0, 250.0, 250.0), confidence=0.9, class_id=0)
+    entries, exits = counter.process_events([p1])
+    assert len(entries) == 0
+    assert len(exits) == 0
+
+    # Frame 2: Person crosses line into showroom (y=350)
+    p2 = TrackedPerson(tracker_id="track_1", box=(200.0, 250.0, 250.0, 350.0), confidence=0.9, class_id=0)
+    entries, exits = counter.process_events([p2])
+    assert len(entries) == 1
+    assert len(exits) == 0
+    assert entries[0].tracker_id == "track_1"
+
+    # Frame 3: Person walks back across line out of showroom (y=250)
+    p3 = TrackedPerson(tracker_id="track_1", box=(200.0, 150.0, 250.0, 250.0), confidence=0.9, class_id=0)
+    entries, exits = counter.process_events([p3])
+    assert len(entries) == 0
+    assert len(exits) == 1
+    assert exits[0].tracker_id == "track_1"
