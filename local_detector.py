@@ -1621,9 +1621,11 @@ class VisitorZoneTracker:
                 if hasattr(self, "identity_manager") and self.identity_manager and getattr(self.identity_manager, "embedder", None):
                     c_face, c_lms, raw_lms = self.identity_manager.embedder.detect_and_crop_face(exit_image)
                     if c_face is not None and c_face.size > 0 and c_lms is not None:
-                        exit_face_emb = self.identity_manager.embedder.extract_embedding(
-                            c_face, c_lms, full_image=exit_image, raw_landmarks=raw_lms
-                        )
+                        eye_d = float(np.linalg.norm(raw_lms[0] - raw_lms[1])) if (raw_lms is not None and len(raw_lms) >= 2) else 0.0
+                        if eye_d >= 16.0 and c_face.shape[1] >= 42:
+                            exit_face_emb = self.identity_manager.embedder.extract_embedding(
+                                c_face, c_lms, full_image=exit_image, raw_landmarks=raw_lms
+                            )
             except Exception:
                 pass
 
@@ -1660,15 +1662,22 @@ class VisitorZoneTracker:
                 s_emb = track_embs.get(int(s_tid))
             if s_emb is not None:
                 sim = float(np.dot(exit_face_emb, s_emb))
-                if sim < 0.50:
+                if sim < 0.40:
                     print(f"[*] Suppressing exit match for track #{track_id}: face similarity {sim:.3f} contradicts session #{s_tid}.")
                     session = None
 
         if session:
             dwell_total = max(0.0, now_ts - session.get("first_seen_ts", now_ts))
-            if dwell_total < 7.0:
+            if dwell_total < 7.0 and not matched_cand_tid:
+                # If this track ID was newly assigned on turnaround (< 7s), forward to backend appearance engine
+                # so active showroom visitors who entered earlier can be matched!
+                print(f"[*] Turnaround track #{track_id} (active {dwell_total:.1f}s) crossed exit line. Forwarding to backend appearance matcher.")
+                session = None
+            elif dwell_total < 7.0 and matched_cand_tid:
                 print(f"[*] Suppressed premature exit for track #{track_id}: dwell {dwell_total:.1f}s < 7.0s threshold.")
                 return
+
+        if session:
             # Confirmed genuine departure (stayed >= 7.0s): remove session and sync exit
             self.sessions.pop(tid_str, None)
             if matched_cand_tid:
@@ -4453,6 +4462,10 @@ def run_local_detector(
                                         )
                                         snap_info = track_best_snapshots.get(obj_id)
                                         should_send = False
+                                        bw_curr = max(1, x2 - x1)
+                                        bh_curr = max(1, y2 - y1)
+                                        ar_curr = float(bw_curr) / float(bh_curr)
+                                        is_box_unoccluded = False
 
                                         if snap_info is None:
                                             snap_info = {
@@ -4463,13 +4476,16 @@ def run_local_detector(
                                                 "person_id": pid_val_track,
                                                 "portrait": body_crop,
                                                 "conf": float(matched_face["conf"]),
+                                                "box_aspect": ar_curr,
                                             }
                                             track_best_snapshots[obj_id] = snap_info
                                         else:
-                                            if q_score > snap_info["best_score"]:
-                                                snap_info["best_score"] = q_score
+                                            is_box_unoccluded = (snap_info.get("box_aspect", 0.5) < 0.30 and ar_curr >= 0.32 and bw_curr >= 50)
+                                            if q_score > snap_info["best_score"] or is_box_unoccluded:
+                                                snap_info["best_score"] = max(snap_info["best_score"], q_score)
                                                 snap_info["portrait"] = body_crop
                                                 snap_info["conf"] = float(matched_face["conf"])
+                                                snap_info["box_aspect"] = ar_curr
 
                                         # Only dispatch photo to backend visitor registry if this person crossed the entry line
                                         if obj_id in confirmed_visitor_tracks:
@@ -4481,7 +4497,7 @@ def run_local_detector(
                                             else:
                                                 track_age = now_ts - snap_info["first_seen_ts"]
                                                 time_since_send = now_ts - snap_info["last_sent_ts"]
-                                                is_quality_upgrade = (q_score >= snap_info["best_score"] * 1.25) or (q_score >= snap_info["best_score"] + 0.15)
+                                                is_quality_upgrade = (q_score >= snap_info["best_score"] * 1.25) or (q_score >= snap_info["best_score"] + 0.15) or is_box_unoccluded
                                                 if track_age <= 4.0 and is_quality_upgrade and time_since_send >= 0.40 and snap_info["sent_count"] < 4:
                                                     should_send = True
                                                     snap_info["best_score"] = max(snap_info["best_score"], q_score)

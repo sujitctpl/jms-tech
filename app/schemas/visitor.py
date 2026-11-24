@@ -22,6 +22,7 @@ class VisitorResponse(BaseModel):
     ageGroupEstimated: Optional[str] = "26-35"
     zoneEntered: Optional[str] = "Main Showroom"
     confidenceScore: float = 0.95
+    exitMatchConfidence: Optional[float] = None
     cameraSource: Optional[str] = "Entrance Camera"
     zoneDwell: Optional[Dict[str, str]] = None
     waitingSeconds: int = 0

@@ -2,6 +2,7 @@ import base64
 from datetime import datetime, timezone, timedelta
 import json
 import os
+import re
 from typing import Dict, List, Optional, Tuple
 import uuid
 import cv2
@@ -202,6 +203,29 @@ class VisitorService:
         w_secs = waiting_sec % 60
         waiting_formatted = f"{w_mins}m {w_secs:02d}s" if w_mins > 0 else f"{w_secs}s"
 
+        # Resolve Entry-Exit matching confidence score for debugging and verification
+        exit_match_conf = None
+        if exit_avatar_url_res:
+            notes_str = record.notes or ""
+            m_pct = re.search(r"Exit Match:\s*([0-9.]+)\s*%", notes_str)
+            if m_pct:
+                try:
+                    exit_match_conf = round(float(m_pct.group(1)) / 100.0, 3)
+                except Exception:
+                    pass
+            elif avatar_url_res:
+                try:
+                    clean_c1 = avatar_url_res.lstrip("/").split("?")[0]
+                    clean_c2 = exit_avatar_url_res.lstrip("/").split("?")[0]
+                    if os.path.isfile(clean_c1) and os.path.isfile(clean_c2):
+                        im1 = cv2.imread(clean_c1)
+                        im2 = cv2.imread(clean_c2)
+                        if im1 is not None and im2 is not None:
+                            _, _, score, _ = self.body_embedder.verify_appearance(im1, im2)
+                            exit_match_conf = round(score, 3)
+                except Exception:
+                    pass
+
         return VisitorResponse(
             id=str(record.id),
             visitorId=record.person_id,
@@ -221,6 +245,7 @@ class VisitorService:
             ageGroupEstimated=record.age_group_estimated or "26-35",
             zoneEntered=record.zone_entered or "Main Showroom",
             confidenceScore=0.96,
+            exitMatchConfidence=exit_match_conf,
             cameraSource=record.camera_source or "Entrance Camera",
             zoneDwell=zone_dwell_dict,
             waitingSeconds=waiting_sec,
@@ -299,6 +324,7 @@ class VisitorService:
         exit_crop_img = None
         exit_face_emb = None
         exit_body_emb = None
+        is_reliable_exit_face = False
         if exit_img_b64:
             try:
                 b64_str = exit_img_b64
@@ -315,25 +341,32 @@ class VisitorService:
                     try:
                         c_face, c_lms, raw_lms = self.embedder.detect_and_crop_face(exit_crop_img)
                         if c_face is not None and c_face.size > 0 and c_lms is not None:
+                            eye_d = 0.0
+                            if raw_lms is not None and len(raw_lms) >= 2:
+                                pt1 = np.array(raw_lms[0], dtype=np.float32)
+                                pt2 = np.array(raw_lms[1], dtype=np.float32)
+                                eye_d = float(np.linalg.norm(pt1 - pt2))
+                            face_w = c_face.shape[1]
+                            is_reliable_exit_face = (face_w >= 28)
                             exit_face_emb = self.embedder.extract_embedding(
                                 c_face, c_lms, full_image=exit_crop_img, raw_landmarks=raw_lms
                             )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("Could not extract exit face embedding: %s", e)
                     # Extract full-body OSNet Person Re-ID embedding from exit crop
                     exit_body_emb = self.body_embedder.extract_embedding(exit_crop_img)
             except Exception as e:
                 logger.warning("Could not extract exit image embeddings: %s", e)
 
         vetoed_pids = set()
-        # Verify biometric consistency if candidate record has a stored face embedding and exit photo has a face
-        if record and payload.exit_time and exit_face_emb is not None:
+        # Verify biometric consistency if candidate record has a stored face embedding and exit photo has a reliable frontal face
+        if record and payload.exit_time and exit_face_emb is not None and is_reliable_exit_face:
             cand_emb = record.get_embedding_vector()
             if cand_emb is not None:
                 sim = FaceEmbedder.compute_similarity(exit_face_emb, cand_emb)
-                if sim < 0.50:
+                if sim < 0.40:
                     logger.warning(
-                        "Biometric mismatch on exit for visitor %s: similarity %.3f < 0.50. Refusing to attach exit to this visitor.",
+                        "Biometric mismatch on exit for visitor %s: similarity %.3f < 0.40. Refusing to attach exit to this visitor.",
                         record.person_id,
                         sim,
                     )
@@ -359,10 +392,11 @@ class VisitorService:
                     emb1=exit_body_emb,
                     emb2=cand_b_emb,
                 )
-                # Strict verification: if body/clothing does not match, veto candidate
-                if not is_match:
+                # Direct continuous track verification: only veto if body/clothing is a proven contradiction (reid < 0.45 and cloth < 0.15)
+                # Front-to-back turnarounds naturally reduce clothing match due to collars/lanyards.
+                if not is_match and (reid_s < 0.45 and clothing_s < 0.15):
                     logger.warning(
-                        "Body appearance mismatch on exit for visitor %s: reid=%.3f, clothing=%.3f, is_match=False. Refusing to attach exit to this visitor.",
+                        "Body appearance contradiction on exit for visitor %s: reid=%.3f, clothing=%.3f. Vetoing continuous track.",
                         record.person_id,
                         reid_s,
                         clothing_s,
@@ -421,8 +455,8 @@ class VisitorService:
                     cand_emb = active_cand.get_embedding_vector()
                     if cand_emb is not None:
                         sim = FaceEmbedder.compute_similarity(exit_face_emb, cand_emb)
-                        if sim < 0.50:
-                            # Absolute face veto: record known to have non-matching face
+                        if is_reliable_exit_face and sim < 0.40:
+                            # Absolute face veto: ONLY for proven clear near-frontal face contradictions
                             vetoed_pids.add(active_cand.person_id)
                             continue
                         if sim > best_sim:
@@ -465,6 +499,9 @@ class VisitorService:
                                     appearance_ok = False
                         if appearance_ok:
                             record = best_match
+                            match_note = f"Exit Match: {best_sim*100:.1f}% (Face Sim: {best_sim*100:.1f}%)"
+                            if match_note not in (record.notes or ""):
+                                record.notes = f"{record.notes} | {match_note}" if record.notes else match_note
                             logger.info(
                                 "Resolved entrance exit event to active showroom visitor %s via biometric face match (sim=%.3f, margin=%.3f).",
                                 record.person_id,
@@ -477,23 +514,40 @@ class VisitorService:
             if not record and exit_body_emb is not None:
                 best_body_match = None
                 best_body_sim = 0.0
+                best_reid_score = 0.0
                 best_color_sim = 0.0
+                second_body_sim = 0.0
                 for active_cand in active_cands:
                     if active_cand.person_id in vetoed_pids:
                         continue
                     cand_emb = active_cand.get_embedding_vector()
-                    if exit_face_emb is not None and cand_emb is not None:
-                        f_sim = FaceEmbedder.compute_similarity(exit_face_emb, cand_emb)
-                        if f_sim < 0.50:
-                            # Hard biometric face rejection: proven different human beings
-                            vetoed_pids.add(active_cand.person_id)
-                            continue
-
                     cand_crop = None
                     if getattr(active_cand, "avatar_url", None):
                         c_path = active_cand.avatar_url.lstrip("/").split("?")[0]
                         if os.path.isfile(c_path):
                             cand_crop = cv2.imread(c_path)
+
+                    # Extract face embedding from candidate crop if not stored in DB
+                    if cand_emb is None and cand_crop is not None:
+                        try:
+                            c_cf, c_clms, raw_clms = self.embedder.detect_and_crop_face(cand_crop)
+                            if c_cf is not None and c_cf.size > 0:
+                                cand_emb = self.embedder.extract_embedding(c_cf, c_clms, full_image=cand_crop, raw_landmarks=raw_clms)
+                        except Exception:
+                            pass
+
+                    if exit_face_emb is not None and cand_emb is not None:
+                        f_sim = FaceEmbedder.compute_similarity(exit_face_emb, cand_emb)
+                        if f_sim < 0.38:
+                            # Hard biometric face rejection: proven different human beings
+                            vetoed_pids.add(active_cand.person_id)
+                            logger.info(
+                                "Exit face veto: candidate %s face similarity %.3f < 0.38 contradicts exiting person.",
+                                active_cand.person_id,
+                                f_sim,
+                            )
+                            continue
+
                     cand_b_emb = None
                     if cand_crop is not None:
                         cand_b_emb = self.body_embedder.extract_embedding(cand_crop)
@@ -509,21 +563,30 @@ class VisitorService:
                         )
 
                         # Genuine exit verification:
-                        # 1. is_match enforces calibrated Re-ID + torso/legs clothing correlation
-                        # 2. clothing_s must be >= 0.38 to strictly rule out different attire
-                        # 3. Minimum time in store must be >= 5.0 seconds (matches entrance bounce window)
+                        # 1. is_match enforces calibrated Re-ID + non-conflicting clothing
+                        # 2. Minimum time in store >= 7.0 seconds (filters momentary edge bounces)
+                        # 3. Minimum combined appearance score >= 0.48
                         time_in_store = (now_utc - active_cand.created_at).total_seconds() if active_cand.created_at else 30.0
-                        if is_match and clothing_s >= 0.35 and time_in_store >= 5.0 and app_score > best_body_sim:
-                            best_body_sim = app_score
-                            best_color_sim = clothing_s
-                            best_body_match = active_cand
+                        if is_match and time_in_store >= 7.0 and app_score >= 0.48:
+                            if app_score > best_body_sim:
+                                second_body_sim = best_body_sim
+                                best_body_sim = app_score
+                                best_color_sim = clothing_s
+                                best_reid_score = reid_s
+                                best_body_match = active_cand
+                            elif app_score > second_body_sim:
+                                second_body_sim = app_score
 
                 if best_body_match:
                     record = best_body_match
+                    match_note = f"Exit Match: {best_body_sim*100:.1f}% (Re-ID: {best_reid_score*100:.0f}%, Cloth: {best_color_sim*100:.0f}%)"
+                    if match_note not in (record.notes or ""):
+                        record.notes = f"{record.notes} | {match_note}" if record.notes else match_note
                     logger.info(
-                        "Resolved entrance exit event to active showroom visitor %s via Dual-Factor Re-ID & Clothing Match (score=%.3f, color=%.3f).",
+                        "Resolved entrance exit event to active showroom visitor %s via Dual-Factor Re-ID & Clothing Match (score=%.3f, reid=%.3f, color=%.3f).",
                         record.person_id,
                         best_body_sim,
+                        best_reid_score,
                         best_color_sim,
                     )
 

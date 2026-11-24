@@ -161,7 +161,7 @@ class PersonIdentityRepository:
             query = query.filter(PersonIdentity.tagging_status == tagging_status)
         if visit_purpose and visit_purpose.lower() != "all":
             query = query.filter(PersonIdentity.visit_purpose == visit_purpose)
-        return query.order_by(PersonIdentity.last_seen_at.desc()).limit(limit).all()
+        return query.order_by(PersonIdentity.created_at.desc(), PersonIdentity.last_seen_at.desc()).limit(limit).all()
 
     def update_visitor_tag(
         self,

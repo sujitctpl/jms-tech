@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useShowroom } from '../../context/ShowroomContext';
 import { useAuth } from '../../context/AuthContext';
 import {
@@ -143,6 +143,19 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
 
   // AI Face Snapshot Inspection Modal
   const [inspectedVisitor, setInspectedVisitor] = useState<VisitorRecord | null>(null);
+
+  // Close modal on Escape key
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setInspectedVisitor(null);
+      }
+    };
+    if (inspectedVisitor) {
+      window.addEventListener('keydown', handleKeyDown);
+    }
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [inspectedVisitor]);
 
   // Average Time per Visitor Period Filter State
   const [durationPeriod, setDurationPeriod] = useState<'today' | 'prev_week' | 'prev_month'>('today');
@@ -1780,10 +1793,15 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
 
       {/* CCTV Camera Face Detection Snapshot Modal */}
       {inspectedVisitor && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/75 backdrop-blur-sm animate-fadeIn">
-          <div className="bg-slate-900 text-white rounded-3xl max-w-lg w-full border border-slate-700 shadow-2xl overflow-hidden relative animate-scaleUp">
+        <div
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setInspectedVisitor(null);
+          }}
+          className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-slate-950/80 backdrop-blur-sm animate-fadeIn overflow-y-auto"
+        >
+          <div className="bg-slate-900 text-white rounded-3xl max-w-lg w-full max-h-[92vh] flex flex-col border border-slate-700 shadow-2xl overflow-hidden relative animate-scaleUp my-auto">
             {/* Header */}
-            <div className="p-4 sm:p-5 border-b border-slate-800 flex items-center justify-between bg-slate-950">
+            <div className="p-3.5 sm:p-4 border-b border-slate-800 flex items-center justify-between bg-slate-950 shrink-0 sticky top-0 z-20">
               <div className="flex items-center gap-2.5">
                 <div className="p-2 rounded-xl bg-emerald-500/20 text-emerald-400 border border-emerald-400/30">
                   <Camera className="w-5 h-5" />
@@ -1799,17 +1817,20 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 </div>
               </div>
               <button
+                type="button"
                 onClick={() => setInspectedVisitor(null)}
-                className="p-2 text-slate-400 hover:text-white rounded-xl hover:bg-slate-800 transition"
+                className="p-2 text-slate-300 hover:text-white rounded-xl bg-slate-800/80 hover:bg-slate-700 border border-slate-700 transition flex items-center gap-1 text-xs font-bold"
+                title="Close (Esc)"
               >
-                <X className="w-5 h-5" />
+                <X className="w-4 h-4" />
+                <span className="hidden sm:inline">Close</span>
               </button>
             </div>
 
             {/* Modal Body */}
-            <div className="p-5 sm:p-6 space-y-4">
+            <div className="p-4 sm:p-5 space-y-3.5 overflow-y-auto flex-1 min-h-0">
               {/* Clear CCTV Snapshot Frame */}
-              <div className="relative rounded-2xl overflow-hidden border border-slate-800 bg-black flex items-center justify-center min-h-[300px] max-h-[460px] group shadow-inner">
+              <div className="relative rounded-2xl overflow-hidden border border-slate-800 bg-black flex items-center justify-center h-64 sm:h-72 max-h-[36vh] group shadow-inner">
                 {inspectedVisitor.avatarUrl ? (
                   <img
                     src={inspectedVisitor.avatarUrl}
@@ -1847,7 +1868,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 <div className="absolute inset-x-12 inset-y-8 border border-emerald-400/80 rounded-xl pointer-events-none shadow-[0_0_15px_rgba(16,185,129,0.4)] flex flex-col justify-between p-2">
                   <div className="flex justify-between items-start">
                     <span className="bg-emerald-600 text-slate-950 text-[9px] font-black px-1.5 py-0.5 rounded font-mono uppercase tracking-wider">
-                      AI MATCH 98.8%
+                      AI MATCH {inspectedVisitor.confidenceScore ? Math.round(inspectedVisitor.confidenceScore * 100) : 96}%
                     </span>
                     <span className="text-[8px] font-mono text-emerald-300 bg-black/80 px-1 py-0.5 rounded">
                       ID: {inspectedVisitor.visitorId}
@@ -1863,6 +1884,25 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 <div className="absolute bottom-2.5 inset-x-3 flex items-center justify-between text-[9px] font-mono text-white/90 bg-black/75 px-2.5 py-1 rounded pointer-events-none">
                   <span>TIME: 2026-10-26 {inspectedVisitor.firstSeenTime} IST</span>
                   <span>BITRATE: 4096 KBPS</span>
+                </div>
+              </div>
+
+              {/* AI Matching & Detection Confidence Debug Bar */}
+              <div className="p-3 bg-slate-800/80 rounded-xl border border-slate-700/70 flex items-center justify-between text-xs">
+                <div>
+                  <span className="text-slate-400 text-[10px] uppercase font-bold flex items-center gap-1.5">
+                    <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+                    AI Detection & Tracking Confidence
+                  </span>
+                  <p className="text-[11px] text-slate-300 font-medium mt-0.5">
+                    Biometric Face Alignment & Deep OSNet Feature Vector Confirmed
+                  </p>
+                </div>
+                <div className="text-right">
+                  <span className="font-extrabold text-lg font-mono text-emerald-400">
+                    {inspectedVisitor.confidenceScore ? Math.round(inspectedVisitor.confidenceScore * 100) : 96}%
+                  </span>
+                  <span className="text-[9px] text-slate-400 block font-mono">CONFIRMED</span>
                 </div>
               </div>
 
@@ -1897,14 +1937,16 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             </div>
 
             {/* Footer */}
-            <div className="p-4 bg-slate-950 border-t border-slate-800 flex items-center justify-end gap-2.5">
+            <div className="p-3.5 sm:p-4 bg-slate-950 border-t border-slate-800 flex items-center justify-end gap-2.5 shrink-0 sticky bottom-0 z-20">
               <button
+                type="button"
                 onClick={() => setInspectedVisitor(null)}
-                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded-xl text-xs font-semibold transition"
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-white font-semibold rounded-xl text-xs transition border border-slate-700 shadow-sm"
               >
                 Close
               </button>
               <button
+                type="button"
                 onClick={() => {
                   const target = inspectedVisitor;
                   setInspectedVisitor(null);

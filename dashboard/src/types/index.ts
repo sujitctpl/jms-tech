@@ -44,6 +44,7 @@ export interface VisitorRecord {
   ageGroupEstimated?: '18-25' | '26-35' | '36-50' | '50+';
   zoneEntered?: string;
   confidenceScore?: number;
+  exitMatchConfidence?: number;
   cameraSource?: string;
   zoneDwell?: Record<string, string>; // e.g. { "Sales Section": "8 mins", "Main Showroom": "2 mins" }
   waitingSeconds?: number;
