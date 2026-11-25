@@ -18,13 +18,13 @@ graph TD
             Detector["Person Detector\n• Roboflow RF-DETR (v2)\n• Ultralytics YOLO26s (v1)\n• RTMDet (ONNX)"]
             FaceDet["Face Detector\n• SCRFD (2.5G ONNX)\n• OpenCV YuNet (Anatomical Validation)"]
             Embedder["Biometric Face Extractor\n• ArcFace ResNet50 (512-D)\n• Calibrated Cosine Operating Thresh (>= 0.65)\n• Landmark Affine Alignment"]
-            BodyEmbedder["Body Re-ID & Appearance\n• OSNet Feature Extractor (512-D)\n• Multi-Part 3D HSV Histograms (512 bins)\n• Upper-Torso Attire Classifier\n• Multi-Factor Appearance Verification"]
+            BodyEmbedder["Body Re-ID & Appearance\n• OSNet Feature Extractor (512-D)\n• Adaptive Salient Torso & Legs Patches\n• Multi-Part 3D HSV Histograms (512 bins)\n• Inverted Polarity & Lower-Body Hard Vetoes\n• Multi-Factor Appearance Verification"]
             Tracker["Multi-Object Tracker\n• ByteTrack (bytetrack.yaml)\n• BoT-SORT + GMC (botsort.yaml)\n• Fallback Kalman Tracker"]
             Handoff["Spatial-Temporal Handoff Tracker\n• 25s Multi-Cue Coasting Pool\n• Torso HSV Color Correlation\n• Unbroken Waiting Timers"]
             StaffClassifier["Employee vs Visitor Classifier\n• Cosine Similarity (thresh = 0.65)\n• Temporal Voting Buffer (win = 5)"]
             EntryGate["Entry-Line Gating & Ghost Elimination\n• Confirmed vs Unconfirmed Passersby\n• Neutral Slate (180,180,180) Bboxes\n• 7s Dwell Bounce Filter\n• Interior Ingress Suppression"]
-            PhotoPipeline["Visitor Photo & Exit Optimization\n• Multi-Frame Best-Shot Scoring\n• Progressive Upgrades (3.5s)\n• CLAHE Backlight & HSV Attire\n• Departure Snapshot Capture (exit_avatar_url)"]
-            ZoneTracker["Visitor Zone & Dwell Tracker\n• Live Zone Dwell Accumulator\n• Reverse Exit Line Detector\n• 2-Param Waiting SLA Monitor"]
+            PhotoPipeline["Visitor Photo & Exit Optimization\n• Multi-Frame Best-Shot Scoring\n• Occlusion-Aware Upgrades (3.5s)\n• CLAHE Backlight & HSV Attire\n• Departure Capture & Turnaround Forwarding"]
+            ZoneTracker["Visitor Zone & Dwell Tracker\n• Live Zone Dwell Accumulator\n• Reverse Exit Line Detector\n• 2-Param Waiting SLA Monitor\n• Cross-Camera Waiting Sync"]
             LineZone["Spatial Analytics Engine\n• Directional Entry-Line Crossing\n• Dynamic Department Dwell Timers"]
             MJPEG["Local MJPEG Live Stream Server"]
             HotReload["Config Hot-Reloader\n(Watches camera_config.json mtime)"]
@@ -35,7 +35,7 @@ graph TD
 
     subgraph Central Backend [FastAPI & Express Backend]
         API["FastAPI Backend (:8000)\n• /api/v1/cameras (Config, CRUD, Stream Testing)\n• /api/v1/visitors (Detect, Tag, Dwell, Walk-In)\n• /api/v1/departments (Dynamic CRUD)\n• /api/v1/employees (Profiles, Photos, Gallery)\n• /api/v1/attendance (Punch & Daily Report)\n• /api/v1/analytics (Footfall & Heatmaps)\n• /api/v1/identity (Retention & Cleanup)"]
-        RetentionWorker["Scheduled Retention Worker\n(14-Day Rolling Biometric Purge\n& Physical Snapshot Cleanup)"]
+        RetentionWorker["Scheduled Retention Worker\n(7-Day Rolling Biometric Purge\n& Physical Snapshot Cleanup)"]
         AuthSrv["Express Auth Server (:5000)\n• /api/auth/login & /register\n• Admin Role-Based Access"]
         ServerWorker["Optional Server VideoWorker\n(app/workers/video_worker.py)"]
     end
@@ -119,34 +119,42 @@ For validated faces:
   - Candidate Match Margin: Minimum margin between Top-1 and Top-2 candidate matches $\ge 0.030$.
 
 ### 2.5 Deep Full-Body Re-Identification & Multi-Part Appearance Modeling (`BodyEmbedder`)
-In overhead showroom CCTV feeds, visitors frequently turn 180° away from the entrance, bend over jewelry showcases, or wear hats/masks where facial biometrics are temporarily unavailable. The system deploys `BodyEmbedder` for deep full-body Re-ID combined with multi-part 3D color histograms:
+In overhead showroom CCTV feeds, visitors frequently turn 180° away from the entrance, bend over jewelry showcases, or wear hats/masks where facial biometrics are temporarily unavailable. The system deploys `BodyEmbedder` for deep full-body Re-ID combined with multi-part 3D color histograms, adaptive salient patch extraction, and hard contrast/polarity vetoes:
 
 1. **OSNet Feature Extraction**:
    - Built on Omni-Scale Network (`osnet_x1_0` or `osnet_x0_25` ONNX/PyTorch models).
-   - Generates a **512-dimensional L2-normalized deep appearance vector** capturing multi-scale bodily features and clothing patterns.
-2. **Multi-Part 3D HSV Color Histograms**:
-   - Rather than simple 1D hue histograms, extracts full 3D joint Hue-Saturation-Value histograms ($8 \times 8 \times 8 = 512\text{ bins}$) normalized via L1-norm ($\|\mathbf{h}\|_1 = 1.0$).
-   - **Upper-Torso Region**: $y \in [0.22, 0.52]$, with $30\%$ horizontal insets ($x \in [0.30, 0.70]$) to cleanly isolate shirts/tops and eliminate background walls, door frames, or laminate flooring.
-   - **Lower-Body / Legs Region**: $y \in [0.55, 0.90]$, with $30\%$ horizontal insets.
-   - **Composite Clothing Similarity**:
-     $$\text{clothing\_sim} = \begin{cases} 
-     0.65 \cdot \text{torso\_sim} + 0.35 \cdot \text{legs\_sim}, & \text{if } \text{torso\_sim} \ge 0.20 \text{ and } \text{legs\_sim} > 0.0 \\
-     \text{torso\_sim}, & \text{if } \text{torso\_sim} \ge 0.20 \\
-     0.0, & \text{otherwise (unmatching shirt rejects clothing match)}
-     \end{cases}$$
-3. **Upper-Torso Attire Classification (`estimate_clothing_appearance`)**:
-   - Isolates central chest fabric ($y \in [0.24, 0.52]$, $x \in [0.30, 0.70]$).
-   - **Chromatic vs Achromatic Gating**: Evaluates chromatic saturation ($S \ge 35, V \ge 45$). Chromatic classification requires $\ge 25\%$ chromatic pixels and mean saturation $\ge 26$, rejecting dark/black shirts with tiny wood frame reflections.
-   - Classifies into high-contrast human-readable badges (*Red / Maroon Top*, *Orange / Rust Top*, *Yellow / Mustard Top*, *Green Top*, *Blue / Navy Top*, *Purple / Violet Top*, *Black / Dark Attire*, *White / Light Shirt*, *Gray Attire*, *Cream / Khaki Shirt*).
-4. **Multi-Factor Appearance Verification Matrix (`verify_appearance`)**:
-   - Prevents false Re-ID merges when static doorway backgrounds artificially inflate OSNet embeddings:
-     - **Hard Contrast Conflict**: Instantly rejects matches between chromatic and achromatic garments (e.g. Red vs Black, Black vs White, Black vs Cream).
-     - **Direct Torso Luminance Verification**: Rejects matches if median torso luminance difference $|V_1 - V_2| > 65.0$.
-     - **Calibrated Multi-Factor Decision**:
-       - Strict floor: Under no circumstances may `is_match` be True if $\text{clothing\_sim} < 0.36$ or $\text{torso\_sim} < 0.22$.
-       - Identical confirmed attire tags: Requires $\text{ReID} \ge 0.70$ and $\text{clothing\_sim} \ge 0.36$.
-       - High Re-ID confidence: Requires $\text{ReID} \ge 0.75$, $\text{clothing\_sim} \ge 0.36$, and $\text{torso\_sim} \ge 0.28$.
-       - Moderate Re-ID confidence: Requires $\text{ReID} \ge 0.68$, $\text{clothing\_sim} \ge 0.48$, and $\text{torso\_sim} \ge 0.35$.
+   - Generates a **512-dimensional L2-normalized deep appearance vector** capturing multi-scale bodily features, proportions, and clothing patterns.
+2. **Aspect-Ratio Adaptive Salient Torso Extraction (`extract_salient_torso_patch`)**:
+   - Evaluates bounding box aspect ratio $AR = h / w$:
+     - For bust / portrait crops ($AR < 1.20$), torso fabric resides in the lower half: band $y \in [0.35 h, 0.85 h]$.
+     - For full-body crops ($AR \ge 1.20$), torso fabric resides in the upper-body band: $y \in [0.18 h, 0.50 h]$.
+   - Operates a horizontal sliding window ($w_{\text{win}} = \max(20, \text{int}(bw \times 0.35))$) across horizontal columns from $0.08 bw$ to $0.92 bw - w_{\text{win}}$.
+   - Computes fabric prominence against neutral/white showroom walls using chromatic saturation $S$ and darkness contrast $V$:
+     $$\text{prominence} = \bar{S} + \max(0.0, \; 140.0 - \bar{V}) \times 0.40$$
+     $$\text{score} = \text{prominence} \times \left(1.0 - 0.40 \cdot \frac{|x + 0.5 w_{\text{win}} - c_x|}{0.5 bw}\right)$$
+   - The column window with the highest score isolates the actual shirt/top fabric, eliminating background walls, door frames, or reflections.
+3. **Salient Lower-Body Legs Patch Extraction (`extract_salient_legs_patch`)**:
+   - Slides across the lower-body band ($y \in [0.54 h, 0.90 h]$) with center-prior weighting to isolate trousers, jeans, or skirts ($w_{\text{win}} = \max(20, \text{int}(bw \times 0.35))$).
+   - Rejects non-clothing background floor tiles, door mats, and carpet patterns.
+4. **Pose-Located Garment Regions (`app/vision/clothing_color.py`)**:
+   - A YOLO pose model (`CLOTHING_POSE_MODEL_PATH`, default `models/yolo11n-pose.pt`, auto-downloaded on first use) finds shoulders, hips, knees and ankles in the person crop.
+   - **Torso** = the shoulder→hip quad from 12% to 80% of the way down, shrunk 18% from each side (keeps out collar/head, arms and background). Hidden hips are extrapolated as $1.4\times$ shoulder width below the shoulders.
+   - **Legs** = thick strokes hip→knee→ankle. Without a usable pose the code falls back to a fixed central box (bust crops: $y \in [0.45, 0.85]$; full body: $y \in [0.24, 0.46]$).
+   - Fixed-fraction boxes were dropped because on the Main Gate camera they were mostly wall and the person's head: white shirts read Gray/Cream, and every person's torso histogram matched every other person's.
+5. **Garment Colour (`estimate_clothing_appearance` → `clothing_color.describe`)**:
+   - **White balance** against bright neutral background pixels; **lightness relative to the wall**: $L_{rel} = L^*_{\text{garment}} / P_{90}(L^*_{\text{background}})$, so the same shirt reads the same lit in the doorway and in shadow.
+   - Dominant colour = largest of 3 k-means clusters in CIE Lab. **Patterned** if $\sigma_{L} \ge 19$ and $P_{90}-P_{10} \ge 50$.
+   - Naming (chroma $C = \sqrt{a^2+b^2}$, hue $h$): $C \ge 12$ → Red / Yellow / Green / Blue / Purple by hue; navy if $b \le -6.4$ (dark garments carry a camera blue cast of $b \approx -4$); Pink, Brown / Rust, Cream / Khaki, Green / Olive (sage: $a \le -1.6$) for muted tones; otherwise Black ($L_{rel} < 0.33$), Gray ($< 0.62$), White.
+   - Tags: *Black / Dark Attire*, *Gray Attire*, *White / Light Shirt*, *Cream / Khaki Shirt*, *Brown / Rust Top*, *Red / Maroon Top*, *Pink / Peach Top*, *Yellow / Mustard Top*, *Green / Olive Top*, *Blue / Navy Top*, *Purple / Violet Top*, *Checked / Patterned Shirt*.
+   - Measured on 90 hand-labelled Main Gate snapshots: 62% exact / 89% acceptable (vs. 20% / 38% before). The thresholds were fitted on that same set.
+6. **Verification (`verify_appearance`)**:
+   - Similarity = Bhattacharyya coefficient of soft $(L_{rel}, a^*, b^*)$ histograms. $\text{clothing\_sim} = 0.65\,\text{torso} + 0.35\,\text{legs}$ (torso only if either crop lacks legs). Legs weigh less because most visitors wear dark trousers.
+   - **Face veto** (unchanged): both faces frontal and sharp and ArcFace $< 0.40$ → reject.
+   - **Incompatible colour veto**: torso tags not equal and not lighting neighbours (e.g. Gray↔White/Cream/Green/Black, Blue↔Black) and $\text{reid} < 0.82$ → reject. A patterned top is compatible with any neutral (prints are often front-only, and exits show the back).
+   - **Trouser veto**: $|L_{rel,1} - L_{rel,2}| \ge 0.40$ with the darker $\le 0.35$ (dark trousers vs light jeans) and $\text{reid} < 0.85$ → reject. Applied only when both crops have *reliable* legs (both knees at confidence $\ge 0.75$ and the two legs within 0.25 of each other in lightness; side-on walkers get knees placed between the legs, which samples the floor) and never when $\text{reid} \ge 0.78 \land \text{torso\_sim} \ge 0.85$.
+   - **Match** only if $\text{reid} \ge 0.70 \land \text{torso\_sim} \ge 0.40$ (score $0.6\,\text{reid} + 0.4\,\text{clothing}$). There is deliberately no low-reid branch: dark tops with jeans are too common, and a reid 0.62-0.70 \"clothing agrees\" branch departed the wrong visitor (a long-sleeve shirt matched to a short-sleeve tee). A missed exit is preferred to a wrong one.
+   - **Weak Re-ID band (backend exit resolver, `visitor_service.update_visitor_zone`)**: front-in vs side/back-out views of the same person often score $0.60 \le \text{reid} < 0.70$. When no candidate passes the main rule, the top band candidate is accepted only if (a) $\text{torso\_sim} \ge 0.80$, colours are compatible, sleeves (short = warm skin-coloured forearms, long = fabric) do not contradict, and reliable trousers do not contradict (`clothing_color.weak_reid_support`); and (b) its reid beats every other in-store visitor by $\ge 0.08$ (with a single visitor, against a stranger baseline of 0.50). Logged in `exit_debug_backend.jsonl` under `weak_band`. Non-matches are capped at 0.45, below the backend's 0.48 exit-eligibility bar.
+   - Known limit: two different people in the same plain colours (white shirt + dark trousers) are only separated by reid.
 
 ---
 
@@ -304,9 +312,12 @@ $$Q = 0.35 \cdot S_{\text{sharpness}} + 0.25 \cdot S_{\text{resolution}} + 0.20 
 3. **Frontality & Pose Symmetry ($S_{\text{pose}}$)**: Evaluates roll tilt angle via eye landmarks ($\text{atan2}(\Delta y, \Delta x)$) and yaw offset from nose-to-eye horizontal center. Frontal poses receive scores close to $1.0$.
 4. **Illumination Balance ($S_{\text{illumination}}$)**: Penalizes severe silhouettes ($\text{mean lum} < 85$) and camera lens glare ($\text{mean lum} > 175$).
 
-### 5.2 Dynamic Progressive Upgrade Policy
+### 5.2 Dynamic Progressive Upgrade & Occlusion Recovery Policy
 * **Zero-Latency Ingress**: The first valid face observation is dispatched immediately to the dashboard to avoid any delay in displaying new walk-ins.
-* **3.5-Second Walk-In Window**: During the visitor's first 3.5 seconds of trajectory, any frame with $Q \ge 1.25 \cdot Q_{\text{best}}$ (or $Q \ge Q_{\text{best}} + 0.15$) with at least $500\text{ ms}$ separation triggers a seamless progressive photo upgrade.
+* **3.5-Second Walk-In Window**: During the visitor's first 3.5 seconds of trajectory, any frame with $Q \ge 1.25 \cdot Q_{\text{best}}$ (or $Q \ge Q_{\text{best}} + 0.15$) with at least $400\text{ ms}$ separation triggers a seamless progressive photo upgrade.
+* **Occlusion Recovery Gating**: When visitors enter through doorway thresholds or turnstiles, initial frames often capture a narrow, partially occluded sliver of the body (aspect ratio $AR = w / h < 0.30$). The engine evaluates bounding box geometry:
+  $$\text{is\_box\_unoccluded} = (AR_{\text{prev}} < 0.30) \land (AR_{\text{curr}} \ge 0.32) \land (w_{\text{curr}} \ge 50\text{ px})$$
+  When an unoccluded box appears, an immediate progressive upgrade is fired even if raw facial scores are comparable, replacing doorway slivers with clean, full-width visitor portraits.
 
 ### 5.3 Contextual Bust Framing & CLAHE Backlight Compensation
 * **Bust & Torso Framing**: To enable floor staff to instantly recognize customers from a distance, portrait crops extend beyond the face boundary:
@@ -318,12 +329,22 @@ $$Q = 0.35 \cdot S_{\text{sharpness}} + 0.25 \cdot S_{\text{resolution}} + 0.20 
 ### 5.4 Torso HSV Attire Classification
 The upper-torso region ($22\%$ to $60\%$ of total body height) is sampled in HSV color space to classify dominant attire colors (e.g. *Blue / Navy Top*, *White / Light Shirt*, *Red / Maroon Top*, *Black Attire*). This clothing tag is passed into the visitor record and rendered as a visual badge in the dashboard for instant customer association.
 
-### 5.5 Departure Snapshot Capture & Dual-Photo Lightbox UX
-When a visitor completes their visit and crosses the entrance line in reverse (with confirmed showroom dwell $\ge 7.0\text{s}$):
+### 5.5 Departure Snapshot Capture, Turnaround Forwarding & Dual-Photo Lightbox UX
+When a visitor completes their visit and crosses the entrance line in reverse:
 * **High-Resolution Exit Capture**: The edge engine grabs an un-annotated high-resolution portrait crop of the departing person and dispatches it via `exit_image_base64` in the departure update payload.
-* **Biometric & Appearance Validation**: The backend extracts facial and body embeddings from the exit crop, verifying identity ($\ge 0.55$ face cosine similarity and multi-factor appearance match via `BodyEmbedder.verify_appearance`).
+* **Turnaround Track Departure Forwarding**: When a customer turns 180° around towards the exit door, ByteTrack or BoT-SORT may allocate a fresh local tracker ID with local dwell $< 7.0\text{s}$. Instead of discarding the departure, `local_detector.py` forwards the departure crop to the backend appearance engine so active showroom visitors who entered earlier can be matched and departed!
+* **Reliable Exit Face Biometric Gating**: Departing visitors often walk with head tilted downward or face angled away. Biometric face checks on exit are strictly gated by reliability criteria:
+  - In `local_detector.py`: Inter-ocular distance $eye\_d \ge 16.0\text{ px}$ and face crop width $w \ge 42\text{ px}$.
+  - In `VisitorService`: Inter-ocular distance $eye\_d \ge 16.0\text{ px}$ and face crop width $w \ge 28\text{ px}$.
+  - Face similarity rejection threshold is calibrated to $< 0.40$. If exit face is angled or non-frontal, biometric veto is bypassed and identity is resolved via deep body Re-ID and appearance matching.
+* **Entry-Exit Match Confidence Reporting (`exitMatchConfidence`)**: The backend parses matching confidence from record notes (e.g. `Exit Match: 82.5%`) or computes live verification score using `BodyEmbedder.verify_appearance(entry_crop, exit_crop)`, exposing `exitMatchConfidence` (e.g. `0.825`) in `VisitorResponse`.
 * **Storage & Persistence**: Saved to `static/uploads/visitors/` as `VIS-..._exit_<timestamp>.jpg` and stored in `person_identities.exit_avatar_url`.
-* **Dashboard Dual-Photo Lightbox**: In `VisitorsView.tsx`, visitor cards display a **"+1 Exit Image"** badge. Clicking the photo opens an interactive high-resolution modal with **Entry Snapshot** and **Departure Snapshot** toggle tabs, enabling management to visually verify customer arrival and departure attire and context side-by-side.
+* **Dashboard Dual-Photo Lightbox UX (`VisitorsView.tsx` & `OverviewView.tsx`)**:
+  - Visitor cards display a **"+1 Exit Image"** pill.
+  - Interactive **Entry Snapshot** vs **Departure Snapshot** toggle tabs.
+  - Live animated pulse badge: `ENTRY-EXIT MATCH [XX]%` (or `AI MATCH [XX]%` for entry).
+  - AI Matching & Verification Debug Card detailing verification method (e.g. *"Verified via Deep OSNet Re-ID & Multi-Part Clothing Color Correlation"*).
+  - Keyboard accessibility with Escape key support, backdrop click-to-dismiss, and sticky modal header/footer with scrollable content.
 
 ---
 
@@ -367,19 +388,19 @@ sequenceDiagram
     
     rect rgb(240, 248, 255)
     Note over API: Multi-Factor Exit Verification Pipeline
-    API->>API: Extract exit_face_emb (YuNet + ArcFace) & exit_body_emb (OSNet)
-    API->>API: Verify Face Sim >= 0.55 & Body Appearance (verify_appearance)
+    API->>API: Extract exit_face_emb (Reliable YuNet + ArcFace) & exit_body_emb (OSNet)
+    API->>API: Verify Reliable Face Sim >= 0.40 & Body Appearance (verify_appearance)
     alt Candidate matches Face & Clothing Appearance
         API->>Storage: Save VIS-2026-1042_exit_1795180767.jpg
-        API->>DB: UPDATE person_identities SET exit_time = "04:45 PM", exit_avatar_url = "..."
+        API->>DB: UPDATE person_identities SET exit_time = "04:45 PM", exit_avatar_url = "...", notes = "... (Exit Match: 82.5%)"
     else Tracker ID flipped on turnaround
-        API->>DB: Fallback search across today's active visitors (Face >= 0.65 or Appearance match)
+        API->>DB: Fallback search across today's still-inside visitors (Reliable Face >= 0.52 + margin, or unambiguous Appearance match)
         API->>DB: Auto-close stale prior-day unclosed visits ("Timed out")
         API->>Storage: Save exit snapshot to matched visitor profile
         API->>DB: UPDATE person_identities SET exit_time = "04:45 PM", exit_avatar_url = "..."
     end
     end
-    API-->>UI: Dashboard updates visitor row with departure stamp, dwell breakdown & "+1 Exit Image" badge!
+    API-->>UI: Dashboard updates visitor row with departure stamp, dwell breakdown, "+1 Exit Image" badge & match %!
 ```
 
 ### 6.1 Dwell Accumulation & Duration Formatting
@@ -393,18 +414,30 @@ sequenceDiagram
 * **Periodic Synchronization**: The edge client bundles the dwell breakdown and flushes updates every `sync_interval = 4.0` seconds to `/api/v1/visitors/update-zone`.
 
 ### 6.2 Reverse Line Crossing, Premature Exit Suppression & Departure Verification
-* **Directional Reversal**: An entrance line configured for ingress (`direction = "top_to_bottom"`) monitors the opposing cross-product trajectory ($y_{\text{curr}} < y_{\text{prev}}$ or reverse vector orientation).
+* **Directional Reversal & `EntryLineCounter.process_events`**: An entrance line configured for ingress monitors opposing cross-product trajectory ($y_{\text{curr}} < y_{\text{prev}}$ or reverse vector orientation). `EntryLineCounter.process_events()` evaluates both ingress crossings and egress crossings in a single pass.
+* **Server-Side Video Worker Ingress & Egress (`VideoWorker`)**:
+  The background ingestion worker (`app/workers/video_worker.py`) handles both events:
+  - For showroom employees: clocks `CHECK_OUT` punch via `EmployeeAttendanceRepository.record_attendance_event`.
+  - For visitors: enforces $7.0\text{s}$ minimum dwell window (`track_arrival_times`), extracts JPEG Q95 exit crop, converts to Base64, and calls `VisitorService.update_visitor_zone()` with `VisitorZoneUpdateRequest(exit_time, exit_image_base64)`.
 * **7.0-Second Premature Exit Suppression**:
-  To eliminate tracker noise, doorway turnarounds, or delivery people pacing at the threshold from triggering premature exits, `record_visitor_exit` enforces a minimum physical dwell threshold ($\text{dwell} \ge 7.0\text{ seconds}$). If reverse crossing fires with dwell $< 7.0\text{s}$, the exit update is suppressed and not dispatched to the backend.
+  To eliminate tracker noise, doorway turnarounds, or delivery people pacing at the threshold from triggering premature exits, `record_visitor_exit` enforces a minimum physical dwell threshold ($\text{dwell} \ge 7.0\text{ seconds}$). If reverse crossing fires with dwell $< 7.0\text{s}$ for an existing active session, the exit update is suppressed and not dispatched to the backend.
+* **Turnaround Forwarding to Backend Appearance Engine**:
+  If a turnaround track was newly assigned on departure ($< 7.0\text{s}$ presence) and was not part of an existing local session, it is forwarded directly to the backend appearance matcher so that an active showroom visitor who entered earlier can be matched and departed!
 * **Multi-Factor Departure Verification**:
   When departure update is dispatched with `exit_image_base64`, the backend validates the exit crop:
-  - If a face is detected in the exit crop, cosine similarity with the candidate visitor must be $\ge 0.55$.
-  - If a full-body crop is available, `BodyEmbedder.verify_appearance` validates OSNet Re-ID and clothing color consistency.
-  - If appearance contradicts (e.g. different clothing colors), the exit is rejected, preventing accidental attachment of departure timestamps to wrong visitors.
+  - If a reliable face is detected in the exit crop ($eye\_d \ge 16.0\text{ px}$, $w \ge 28\text{ px}$), cosine similarity with the candidate visitor must be $\ge 0.40$.
+  - If a full-body crop is available, `BodyEmbedder.verify_appearance` validates OSNet Re-ID and multi-part clothing color consistency.
+  - If appearance contradicts (e.g. inverted attire polarity, different clothing tags, or lower-body conflict), the exit is rejected, preventing accidental attachment of departure timestamps to wrong visitors.
 * **Turnaround Fallback Search & Stale Record Auto-Closure**:
   If tracker ID flipped on a 180° exit turnaround (e.g. #2 became #6):
   - Stale unclosed visitor records from prior calendar days are automatically closed (`exit_time = "Timed out"`, `is_expired = True`) to prevent contamination.
-  - Active candidates from today are searched using biometric face matching ($\ge 0.65$ with top-margin check) and/or body appearance consistency.
+  - Only visitors created today who have **not yet departed** (`exit_time IS NULL`) are candidates, so a later stranger's exit can never overwrite an earlier departure.
+  - **Face path**: used only when the exit face is reliable ($eye\_d \ge 16\text{ px}$ and $w \ge 28\text{ px}$). Match requires cosine $\ge 0.52$ and a Top-1 vs Top-2 margin $\ge 0.035$ (or a single candidate), plus no clear body/clothing contradiction. Blurry or side-profile faces skip this path, because ArcFace scores on them are poorly separated.
+  - **Body path**: `verify_appearance` must pass with combined score $\ge 0.48$ and time in store $\ge 7.0\text{s}$. If the runner-up candidate scores within $0.03$ of the best (two similarly dressed visitors), the exit is left unattached rather than departing the wrong person.
+  - Any candidate whose reliable face contradicts the exit face ($< 0.40$, or $< 0.38$ on the body path) is vetoed, as is any `exclude_person_id` sent by the edge.
+* **Exact Tracker Lookup**: When the payload has no `person_id`, the backend resolves `tracker_id` against the `Tracker #N` note with an exact token match (`Tracker #4` never matches `Tracker #42`).
+* **Edge Face-Contradiction Exclusion**: If the exit face contradicts the local session ($< 0.40$), the edge drops that visitor (it no longer falls back to the track's own `person_id`) and sends `exclude_person_id` so the backend cannot re-select it.
+* **Persisted Match Score**: Direct-path departures write `Exit Match: XX% (...)` to notes, so `exitMatchConfidence` is read from notes instead of recomputing OSNet on every dashboard poll.
 * **Indian Standard Time (IST) Clock**: When reverse crossing is confirmed, the departure timestamp is calculated in `Asia/Kolkata` time (`UTC+05:30`) and recorded:
   ```python
   exit_time = datetime.fromtimestamp(now_ts, tz=IST).strftime("%I:%M %p")
@@ -574,7 +607,7 @@ The edge engine's `check_and_reload_config()` checks the file modification times
 * Active video stream loops continue uninterrupted without needing process termination or restarts.
 
 ### 8.3 Profile Archiving on Deletion
-When a camera channel is deleted via `DELETE /api/v1/cameras/channels/{channel_or_id}`:
+When a camera channel is deleted via `DELETE /api/v1/cameras/channel/{channel_or_id}`:
 * The camera configuration (including custom polygonal exclusion zones, floor filters, and calibrated line coordinates) is copied into `archived_camera_profiles`.
 * The channel is deactivated in the database rather than destroyed, allowing one-click restoration if a camera is reconnected.
 
@@ -616,7 +649,7 @@ sequenceDiagram
 1. **Dual-Factor Ingress & Interior Re-Identification**:
    - **ArcFace Facial Biometrics**: Operating threshold $\ge 0.65$ (`FACE_SIMILARITY_THRESHOLD = 0.65`) ensures high biometric confidence.
    - **OSNet Body Appearance Vector**: Vector searches via `find_best_visitor_body_match()` in pgvector compare 512-D normalized body embeddings.
-   - **Active 15-Minute Re-ID Window**: If a customer's face is looking down at jewelry counters or tilted away from high-mounted CCTV cameras, active visitors from the past 15 minutes are evaluated via `BodyEmbedder.verify_appearance`. If $\text{ReID} \ge 0.82$ and $\text{clothing} \ge 0.40$, the track is automatically linked without waiting for a frontal face.
+   - **Active 15-Minute Re-ID Window**: If a customer's face is looking down at jewelry counters or tilted away from high-mounted CCTV cameras, not-yet-departed visitors who entered (`created_at`) within the past 15 minutes are evaluated via `BodyEmbedder.verify_appearance`. If it passes and ($\text{ReID} \ge 0.65$ and $\text{clothing} \ge 0.28$) or $\text{ReID} \ge 0.74$, the track is automatically linked without waiting for a frontal face.
 2. **Persistent Cross-Camera State (`.cross_camera_state.json`)**:
    Tracks global identities across processes with atomic lock-free JSON serialization, storing `entity_type` (`staff` or `visitor`), `entity_id`, `global_track_id`, `first_seen_ts`, `last_seen_ts`, `first_camera`, and `last_camera`.
 3. **Synchronized Identity Linking Callback (`on_visitor_registered_callback`)**:
@@ -628,29 +661,29 @@ sequenceDiagram
 
 ---
 
-## 9. Biometric Privacy & 14-Day Rolling Retention
+## 9. Biometric Privacy & 7-Day Rolling Retention
 
 To comply with global data privacy regulations (GDPR and national biometric privacy principles):
 
 ```mermaid
 flowchart TD
-    Start["Daily Retention Scheduler (Runs every 24h)"] --> Query["Query person_identities where last_seen_at < NOW() - 14 Days"]
+    Start["Daily Retention Scheduler (Runs every 24h)"] --> Query["Query person_identities where last_seen_at < NOW() - 7 Days\nAND (face OR body vector OR entry/exit photo still present)"]
     Check{"Found Expired Visitor Identities?"}
     Query --> Check
     Check -- No --> ScanOrphaned["Scan & Purge Orphaned Physical Snapshots on Disk"]
     ScanOrphaned --> Finish["Log: Retention cleanup completed"]
-    Check -- Yes --> PurgeDB["Set face_embedding = NULL\nSet avatar_url = NULL\nSet is_expired = TRUE\nSet expired_at = NOW()"]
+    Check -- Yes --> PurgeDB["Set face_embedding = NULL\nSet body_embedding = NULL\nSet avatar_url / exit_avatar_url = NULL\nSet is_expired = TRUE\nSet expired_at = NOW()"]
     PurgeDB --> PurgeVectors["Purge expired vectors from pgvector / HNSW index"]
     PurgeVectors --> DeleteFiles["Delete Physical Snapshot Files from static/uploads/visitors/"]
-    DeleteFiles --> PurgeOrphaned["Purge unlinked orphaned snapshot images older than 14 days"]
+    DeleteFiles --> PurgeOrphaned["Purge unlinked orphaned snapshot images older than 7 days"]
     PurgeOrphaned --> KeepStats["PRESERVE visitor_tracks, footfall_events & visit purpose\n(Aggregate analytics & counts remain intact!)"]
     KeepStats --> ExemptStaff["EXEMPT: Registered employee embeddings remain permanently active"]
     ExemptStaff --> Report["Generate RetentionCleanupReport & Log Summary"]
 ```
 
-* **Visitor Biometric Isolation**: Face embeddings extracted from unidentified visitors are assigned an automatic 14-day rolling expiration window.
+* **Visitor Biometric Isolation**: Face and body embeddings extracted from unidentified visitors are assigned an automatic 7-day rolling expiration window (`FACE_RETENTION_DAYS`, default `7`). Body-only visitors (face never captured) expire too.
 * **Dual Database & Physical Disk Cleanup**:
-  - Sets `face_embedding = NULL`, `avatar_url = NULL`, and `is_expired = TRUE` in PostgreSQL `person_identities`.
+  - Sets `face_embedding = NULL`, `body_embedding = NULL`, `avatar_url = NULL`, `exit_avatar_url = NULL`, and `is_expired = TRUE` in PostgreSQL `person_identities`.
   - Physically unlinks and deletes corresponding JPEG portrait crops from `static/uploads/visitors/`.
   - Executes `_purge_orphaned_snapshots(directory, retention_days)` to clean up any orphaned or unlinked image files on disk exceeding the retention threshold.
 * **Permanent Employee Exemption**: Registered staff embeddings stored in the `employees` table and their gallery photos in `static/uploads/employees/` are permanent and strictly exempt from the purge.
@@ -749,7 +782,7 @@ erDiagram
         varchar exit_avatar_url "Retina 320x320 departure snapshot"
         varchar visit_purpose "Vehicle Enquiry / Booking / Test Ride / Service"
         varchar assigned_salesperson "Staff name"
-        varchar notes "CRM notes & appearance badge"
+        varchar notes "CRM notes, appearance badge & Exit Match %"
         varchar visitor_type "New / Returning"
         varchar tagging_status "Tagged / Untagged"
         varchar gender_estimated
@@ -862,7 +895,7 @@ erDiagram
                                                 ├─► CLAHE Backlight Compensation (Shadow lifting)
                                                 ├─► Torso HSV Attire Extraction (e.g. "Blue / Navy Top")
                                                 ├─► High-DPI Snapshot Dispatch (@ 320x320 Q95) to /visitors/detect
-                                                ├─► Progressive Upgrade Window (3.5s trajectory)
+                                                ├─► Progressive Upgrade & Occlusion Recovery (3.5s window, ar >= 0.32)
                                                 ├─► Non-blocking HTTP POST to /visitors/detect & /footfall
                                                 │
                                                 ├─► Store Interior: Real-time department dwell accumulation
@@ -878,9 +911,12 @@ erDiagram
                                                 │   └─► 15m Active Window: Merges tracker flips without frontal face
                                                 ├─► Receptionist UI: 1-click purpose & staff assignment
                                                 │   ├─► HTTP PATCH to /visitors/{person_id}/tag
-                                                │   └─► Dual-Photo Lightbox: Review arrival vs departure snapshots
+                                                │   └─► Dual-Photo Lightbox: Entry vs Exit photo toggle & match % badge
                                                 └─► Egress: Reverse line crossing detection (Exit Door, dwell >= 7s)
+                                                    ├─► Turnaround Track Departure Forwarding (< 7s fresh tracks)
                                                     ├─► Grab high-DPI departure portrait crop (exit_avatar_url)
-                                                    ├─► Biometric & Body Appearance Verification on Exit
+                                                    ├─► Reliable Face Biometrics (eye_d >= 16px, w >= 42px) & Appearance Check
+                                                    ├─► Inverted Attire Polarity & Lower-Body Contradiction Vetoes
+                                                    ├─► Resolve Entry-Exit Match Confidence (exitMatchConfidence)
                                                     └─► HTTP POST to /visitors/update-zone (exit_time in IST)
 ```

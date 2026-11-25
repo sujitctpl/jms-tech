@@ -76,6 +76,7 @@ class VisitorZoneUpdateRequest(BaseModel):
     face_image_base64: Optional[str] = Field(None, description="Optional Base64 encoded snapshot captured on SLA breach or zone update")
     exit_image_base64: Optional[str] = Field(None, description="Optional Base64 encoded snapshot captured when visitor departs through entrance")
     body_embedding: Optional[List[float]] = Field(None, description="Optional 512-dim OSNet body ReID embedding vector")
+    exclude_person_id: Optional[str] = Field(None, description="Visitor the edge already ruled out for this exit (face contradiction); never attach the exit to it")
 
 
 

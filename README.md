@@ -60,9 +60,12 @@ Detailed architectural flows, mathematical models, and sequence diagrams are doc
   - **Interior Camera Guard**: Non-entrance cameras (`is_entrance: false`) suppress minting new walk-ins (`IGNORED_INTERIOR`) unless verified via cross-camera biometric matching against an entered visitor.
 - **Dual-Factor Re-Identification & Deep Body Embedding (`BodyEmbedder`)**:
   - **OSNet Deep Feature Extraction**: Full-body appearance modeling via Omni-Scale Network (`osnet_x1_0` / `osnet_x0_25`) generating 512-dimensional L2-normalized feature embeddings.
-  - **Multi-Part 3D HSV Color Histograms**: Full 3D joint Hue-Saturation-Value histograms ($8 \times 8 \times 8 = 512$ bins, L1-normalized) for upper-torso ($y \in [0.22, 0.52]$, inset $30\%$) and legs ($y \in [0.55, 0.90]$, inset $30\%$) to isolate clothing fabric and eliminate floor/wall reflections.
-  - **Multi-Factor Appearance Verification (`verify_appearance`)**: Evaluates OSNet Re-ID combined with composite clothing color similarity ($0.65 \times \text{torso} + 0.35 \times \text{legs}$) and direct torso luminance gating ($|V_1 - V_2| \le 65.0$). Eliminates false positive Re-ID merges between different individuals wearing contrasting attire.
-  - **15-Minute Ingress Turnaround Re-ID**: Automatically re-identifies active showroom visitors who turned around or whose tracker IDs flipped under overhead CCTV occlusion ($\text{ReID} \ge 0.82$, $\text{clothing} \ge 0.40$) without requiring frontal facial biometrics.
+  - **Aspect-Ratio Adaptive Salient Torso Extraction (`extract_salient_torso_patch`)**: Differentiates bust/portrait crops ($h/w < 1.20$, sampling lower torso band $35\% - 85\%$) from full-body CCTV frames ($h/w \ge 1.20$, sampling upper torso band $18\% - 50\%$). Uses a sliding column window with chromatic saturation and darkness contrast weighting against white doorway walls and floor mats.
+  - **Salient Lower-Body Legs Patch Extraction (`extract_salient_legs_patch`)**: Slides across lower-body band ($54\% - 90\%$) with center-prior weighting to isolate trousers, jeans, or skirts and reject background floor tiles.
+  - **Pose-Located Clothing Colour** (`app/vision/clothing_color.py`): a YOLO pose model (`models/yolo11n-pose.pt`, auto-downloaded) finds the shoulder→hip torso and the hip→ankle legs, so samples exclude the head, arms and doorway wall. Colours are white-balanced against the wall and measured in CIE Lab with lightness *relative to the wall*, so a shirt reads the same lit and in shadow. Clothing similarity is the Bhattacharyya overlap of soft Lab histograms: $0.65 	imes \text{torso} + 0.35 	imes \text{legs}$.
+  - **Clothing Vetoes**: incompatible upper-garment colours (lighting neighbours such as Gray↔White/Cream/Green are allowed; patterned tops are compatible with neutrals) unless $\text{ReID} \ge 0.82$; dark vs light trousers (relative lightness gap $\ge 0.40$) unless $\text{ReID} \ge 0.85$.
+  - **Appearance Verification (`verify_appearance`)**: match only when $\text{ReID} \ge 0.70$ and torso similarity $\ge 0.40$; there is no low-ReID branch, because similar dark outfits caused wrong departures. See `flow.md` for the full rules.
+  - **15-Minute Ingress Turnaround Re-ID**: Automatically re-identifies showroom visitors who entered within the last 15 minutes and turned around or whose tracker IDs flipped under overhead CCTV occlusion. Requires a passing `verify_appearance` plus ($\text{ReID} \ge 0.65$ and $\text{clothing} \ge 0.28$) or $\text{ReID} \ge 0.74$, without requiring frontal facial biometrics.
 - **Biometric Face Recognition & Staff vs. Visitor Segregation**:
   - Neural face detection via **SCRFD** (`scrfd_2.5g_bnkps.onnx`) or **YuNet** with anatomical bounding box validation (aspect ratio $0.45$–$1.55$, vertical center $c_y \le 0.50 \cdot h$ on standing crops, eliminating false triggers on floor items, shoes, and dustbins).
   - **ArcFace** (`w600k_r50.onnx`) 512-dimensional feature embedding extraction.
@@ -70,16 +73,19 @@ Detailed architectural flows, mathematical models, and sequence diagrams are doc
   - Temporal voting buffers (`EMPLOYEE_VOTE_WINDOW = 5`) ensuring zero false-positive visitor misclassifications.
 - **Optimized Visitor Photo Capture, Departure Verification & Lightbox UX**:
   - **Multi-Frame Best-Shot Selection**: Evaluates Laplacian sharpness, pixel area, pose frontality (eye horizontal symmetry and nose centering), and illumination balance into a unified quality score $Q$.
-  - **Dynamic Progressive Upgrades**: Dispatches an instant snapshot on first frame for zero-latency UI updates, then automatically upgrades to a higher-resolution, frontal shot if quality improves by $\ge 25\%$ during the first 3.5s walk-in window.
+  - **Dynamic Progressive Upgrades & Occlusion Recovery**: Dispatches an instant snapshot on first frame for zero-latency UI updates, then automatically upgrades if quality improves by $\ge 25\%$ during the first 3.5s walk-in window. Detects partially occluded doorway slivers (box aspect ratio $w/h < 0.30$) and seamlessly upgrades when an unoccluded, wider box appears ($w/h \ge 0.32$, width $\ge 50\text{ px}$).
   - **Adaptive Bust & Torso Framing**: Expanded portrait crop capturing head, hair, collar, and upper-chest context at $320\times320\text{ px}$ (JPEG Q95) for effortless visual recognition by showroom staff.
   - **CLAHE Backlight Compensation**: Corrects severe silhouettes caused by sunny showroom glass facades via adaptive histogram equalization on the LAB luminance channel.
-  - **Automatic Clothing Appearance Tagging**: Central torso HSV color sampling isolates fabric and generates human-readable attire badges (e.g. *Blue / Navy Top*, *White / Light Shirt*, *Black Attire*).
-  - **High-Resolution Departure Snapshot (`exit_avatar_url`)**: Grabs an un-annotated high-resolution exit crop when visitors cross the entrance line in reverse (after dwell $\ge 7.0$s), validates candidate identity via biometrics ($\ge 0.55$) and appearance consistency, and auto-closes stale prior-day records.
-  - **Dual-Photo Lightbox UX**: Visitor cards display an intuitive **"+1 Exit Image"** badge, with interactive Entry Snapshot vs Departure Snapshot toggle tabs in `VisitorsView.tsx` and 1-click purpose tagging in `TagVisitorModal`.
+  - **Automatic Clothing Appearance Tagging**: Pose-located torso colour generates human-readable attire badges (e.g. *Blue / Navy Top*, *White / Light Shirt*, *Green / Olive Top*, *Checked / Patterned Shirt*).
+  - **High-Resolution Departure Snapshot (`exit_avatar_url`) & Turnaround Departure Forwarding**: Grabs an un-annotated high-resolution exit crop when visitors cross the entrance line in reverse (after dwell $\ge 7.0$s). If a visitor was assigned a fresh turnaround track ID ($< 7.0$s), it is forwarded to the backend appearance engine so active showroom visitors are properly departed.
+  - **Reliable Exit Face Biometric Gating**: Requires minimum eye distance ($eye\_d \ge 16.0\text{ px}$) and face width ($w \ge 42\text{ px}$) before face biometrics can veto an exit crop, preventing blurry or side-profile departure frames from rejecting valid departures.
+  - **Entry-Exit Match Confidence (`exitMatchConfidence`) & Verification Badge**: Calculates verified match confidence (e.g. `82%`) and surfaces an interactive **`ENTRY-EXIT MATCH [XX]%`** pill with live status pulses on visitor cards.
+  - **Dual-Photo Lightbox UX**: Visitor cards display an intuitive **"+1 Exit Image"** badge, with interactive Entry Snapshot vs Departure Snapshot toggle tabs in `VisitorsView.tsx`, an AI matching & verification debug breakdown card, Escape key dismissal, click-outside modal close, and sticky scrollable headers.
 - **Real-Time Visitor Journey & Zone Dwell Tracking**:
-  - **`VisitorZoneTracker`**: Continuously tracks customer movement and accumulates dwell time across custom departments (e.g. Sales Section, Luxury Lounge, Diamond Counter) and the general showroom floor (`Main Showroom`).
+  - **`VisitorZoneTracker` & Dual Line Crossing**: Continuously tracks customer movement and accumulates dwell time across custom departments (e.g. Sales Section, Luxury Lounge, Diamond Counter) and the general showroom floor (`Main Showroom`).
   - **Live Dwell Formatting & Periodic Sync**: Synchronizes formatted durations (e.g. `12m 45s`, `35s`) with FastAPI backend (`POST /api/v1/visitors/update-zone`) every 4.0 seconds.
   - **Directional Reverse Exit Detection & 7s Premature Exit Suppression**: Crossing the entrance line in reverse detects visitor departure in Indian Standard Time (IST, UTC+05:30), logs final dwell breakdown across all visited zones, and persists departure time to CRM. Exits under 7 seconds are suppressed to eliminate doorway bounce jitter.
+  - **Server-Side Video Worker Ingress & Egress (`VideoWorker`)**: Server-side video worker leverages `EntryLineCounter.process_events()` to clock staff `CHECK_OUT` attendance punches and record visitor exits with automated crop extraction.
   - **Bounced Visitor Removal (`DELETE /api/v1/visitors/{person_id}`)**: Single-click removal of bounced or cancelled visitors, purging linked footfall events, detection rows, and physical snapshot files on disk.
 - **Visitor Waiting Timer & Unattended SLA Breach Monitoring**:
   - **Perspective-Calibrated Staff Proximity Filter (`is_staff_near_box`)**: Dynamically measures ground-plane distance in meters between visitor feet and staff feet using bounding box height scaling ($\text{Scale}_{\text{px/m}} = \frac{\bar{h}}{1.70}$). A visitor within $2.2\text{ m}$ is considered actively attended.
@@ -95,7 +101,7 @@ Detailed architectural flows, mathematical models, and sequence diagrams are doc
 - **Dynamic Multi-Camera Handover & Dual-Factor Cross-Camera Re-Identification**:
   - **CrossCameraTracker & Global Identity Synchronization**: Coordinates tracks between entrance cameras (`is_entrance: true`) and interior section cameras (`is_entrance: false`) via `.cross_camera_state.json`.
   - **Dual-Factor Biometric Matching**: Re-identifies customers moving from entrance to floor sections using both ArcFace facial biometrics ($\ge 0.65$) and OSNet 512-D body Re-ID vectors ($\ge 0.65$) via `PgVectorStoreManager.find_best_visitor_body_match()`, preventing duplicate footfall counts.
-  - **Active 15-Minute Re-ID Window**: Automatically merges tracker ID flips when visitors are looking down or occluded under overhead cameras ($\text{ReID} \ge 0.82$, $\text{clothing} \ge 0.40$).
+  - **Active 15-Minute Re-ID Window**: Automatically merges tracker ID flips for visitors who entered in the last 15 minutes and are looking down or occluded under overhead cameras (passing `verify_appearance` plus $\text{ReID} \ge 0.65$ and $\text{clothing} \ge 0.28$, or $\text{ReID} \ge 0.74$).
   - **Synchronized Identity Linking Callback (`on_visitor_registered_callback`)**: Automatically updates local tracker IDs, zone manager, and snapshots as soon as the persistent ID is minted by the backend.
   - **Cross-Camera Waiting Sync**: Seamlessly syncs accumulated waiting seconds and breach flags between camera streams.
   - **Isolated GPU VRAM Allocation**: Automatic memory fraction limit ($42\%$) ensures multi-camera instances run concurrently on 4GB consumer GPUs without OOM errors.
@@ -112,8 +118,8 @@ Detailed architectural flows, mathematical models, and sequence diagrams are doc
 - **Dynamic Department Management**:
   - Showroom zones/departments can be created, updated, and color-coded dynamically via API (`/api/v1/departments`) or Dashboard UI.
   - Associate specific departments with cameras or configure global showroom sections.
-- **14-Day Rolling Biometric Retention & Physical Snapshot Purge (GDPR / Privacy Compliance)**:
-  - Automated daily background scheduler (`retention_scheduler`) purging visitor facial embeddings and tracks inactive for > 14 days while preserving aggregated footfall numbers.
+- **7-Day Rolling Biometric Retention & Physical Snapshot Purge (GDPR / Privacy Compliance)**:
+  - Automated daily background scheduler (`retention_scheduler`) purging visitor face embeddings, OSNet body Re-ID vectors, and entry/exit snapshots for identities inactive for > 7 days (`FACE_RETENTION_DAYS`, default `7`) while preserving aggregated footfall numbers.
   - Automatically deletes physical snapshot files (`static/uploads/visitors/`) and purges orphaned snapshot images older than retention period.
 - **Virtual Entry-Line Crossing**:
   - 2D ground-plane foot contact point calculation ($\frac{x_1 + x_2}{2}, y_2$) with strict directional validation (`top_to_bottom`, `bottom_to_top`, `left_to_right`, `right_to_left`).
@@ -172,7 +178,7 @@ jms/
 │   │       ├── department.py            # Dynamic showroom department entity
 │   │       ├── employee.py              # Employee entity & gallery embeddings
 │   │       ├── employee_attendance.py   # Raw punches & daily attendance roll
-│   │       ├── person_identity.py       # 14-day rolling biometric identity (pgvector 512 face + 512 body Re-ID, exit_avatar_url)
+│   │       ├── person_identity.py       # 7-day rolling biometric identity (pgvector 512 face + 512 body Re-ID, exit_avatar_url)
 │   │       ├── visitor_track.py         # Visitor tracklets
 │   │       ├── footfall_event.py        # Footfall events (UNIQUE constraint)
 │   │       ├── detection_event.py       # Frame-by-frame detections
@@ -185,7 +191,8 @@ jms/
 │   │   ├── tracker.py                   # Multi-object tracker integration
 │   │   ├── cross_camera_tracker.py      # Cross-camera entity coordination & global ID state
 │   │   ├── face_embedder.py             # ArcFace 512-D embedding extractor
-│   │   ├── body_embedder.py             # OSNet Re-ID embedding & multi-part HSV clothing appearance engine
+│   │   ├── body_embedder.py             # OSNet Re-ID embedding & appearance verification
+│   │   ├── clothing_color.py            # Pose-located garment colour tags & clothing similarity
 │   │   ├── employee_recognizer.py       # Biometric matching & voting manager
 │   │   └── vector_store.py              # pgvector search manager
 │   └── workers/
@@ -193,7 +200,7 @@ jms/
 ├── dashboard/                           # Modern React 19 Web Dashboard
 │   ├── src/
 │   │   ├── components/
-│   │   │   ├── cameras/                 # Live camera feeds, grids & overlays
+│   │   │   ├── camera/                  # Live camera feeds, grids & overlays
 │   │   │   ├── modals/                  # TagVisitorModal (portrait card, dwell, tagging)
 │   │   │   ├── settings/                # CameraSettingsSection (RTSP configuration & hot reload)
 │   │   │   ├── visit-purpose/           # VisitPurposeView (visitor table, zoom lightbox, filters)
@@ -224,7 +231,8 @@ jms/
 │   ├── test_waiting_timer.py            # Unit tests for waiting timer, handoff, SLA breach & monotonic bounds
 │   ├── test_cross_camera_tracker.py     # Cross-camera tracking & re-ID tests
 │   ├── test_returning_visitor.py        # Returning visitor recognition tests
-│   └── test_identity_and_retention.py   # 14-day retention & biometric purge tests
+│   ├── test_identity_and_retention.py   # Rolling retention & biometric purge tests
+│   └── test_entry_exit_fixes.py         # Exit matching, visitor ID minting & body-only retention regressions
 ├── .cross_camera_state.json             # Cross-camera persistent state registry
 ├── alembic/                             # Database migration scripts
 ├── local_detector.py                    # Standalone Local Edge AI Video Processing Engine
@@ -291,11 +299,11 @@ DETECTION_IMGSZ=1024
 DEVICE="cuda:0"  # Or "cpu" for non-GPU environments
 TRACKER_TYPE="bytetrack.yaml"
 
-# Biometrics, Deep Re-ID & 14-Day Rolling Retention
+# Biometrics, Deep Re-ID & 7-Day Rolling Retention
 ARCFACE_MODEL_PATH="models/w600k_r50.onnx"
 FACE_SIMILARITY_THRESHOLD=0.65
 VISITOR_REID_THRESHOLD=0.65
-FACE_RETENTION_DAYS=14
+FACE_RETENTION_DAYS=7
 RETENTION_AUTO_CLEANUP_ENABLED=true
 ```
 
@@ -488,7 +496,7 @@ flowchart TD
         I2 --> I3{"Cosine Match against Database?"}
         DB -.->|Query Active Embeddings| I3
         I3 -->|Staff Match| I4["Tagged as STAFF [Name] #ID<br/>Logs Section Dwell Time"]
-        I3 -->|Visitor Match >= 0.55| I5["Matched to VIS-2026-1043<br/>Links Track & Updates Zone Dwell"]
+        I3 -->|Visitor Match: edge >= 0.55, backend >= 0.65| I5["Matched to VIS-2026-1043<br/>Links Track & Updates Zone Dwell"]
         I5 --> I6["POST /api/v1/visitors/update-zone<br/>Footfall count is NOT duplicated"]
     end
 ```
@@ -500,7 +508,7 @@ flowchart TD
 2. **Interior Floor Camera (Channel 201, `is_entrance: false`)**:
    - Runs neural detection and face embedding extraction locally.
    - Queries the active showroom visitor gallery via `visitor_vector_store.find_best_visitor_match()`.
-   - When cosine similarity is $\ge 0.55$, the track is automatically linked to `VIS-2026-1043`.
+   - The edge identity manager links the track locally at cosine similarity $\ge 0.55$; the backend (`/visitors/detect`) confirms cross-camera visitor matches at $\ge 0.65$ (`VISITOR_REID_THRESHOLD`) before the track is linked to `VIS-2026-1043`.
    - The HUD label updates to `Person #ID | VIS-2026-1043 | [Zone Name]`.
    - `VisitorZoneTracker` sends periodic zone dwell updates to `/api/v1/visitors/update-zone` without incrementing walk-in footfall counts.
 
@@ -626,7 +634,7 @@ All registered endpoints exposed by the FastAPI backend:
 | `GET` | `/api/v1/cameras/config` | Retrieve dynamic camera & AI settings configuration from `camera_config.json` |
 | `POST` | `/api/v1/cameras/config` | Save dynamic settings to `camera_config.json` and hot-reload edge detector |
 | `POST` | `/api/v1/cameras/test-stream` | Test RTSP stream reachability, resolution ($W\times H$), and framerate (FPS) |
-| `DELETE` | `/api/v1/cameras/channels/{channel_or_id}` | Delete camera channel from configuration and archive its calibrated profile |
+| `DELETE` | `/api/v1/cameras/channel/{channel_or_id}` | Delete camera channel from configuration and archive its calibrated profile |
 | `GET` | `/api/v1/cameras/{camera_id}` | Retrieve single camera details |
 | `PATCH` | `/api/v1/cameras/{camera_id}` | Update camera settings / active status |
 | `POST` | `/api/v1/cameras/{camera_id}/start` | Start server-side background video ingestion worker |
@@ -640,10 +648,10 @@ All registered endpoints exposed by the FastAPI backend:
 ### Visitors & Visit Purpose Tagging
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/v1/visitors` | List detected visitors with photos, timestamps, dwell times, and tagging statuses |
+| `GET` | `/api/v1/visitors` | List detected visitors with photos (`avatarUrl`, `exitAvatarUrl`), timestamps, dwell times, `exitMatchConfidence`, and tagging statuses |
 | `POST` | `/api/v1/visitors/detect` | Ingest edge face and body detection with best-shot snapshot, clothing appearance, and 512-D OSNet Re-ID vector |
 | `PATCH` | `/api/v1/visitors/{person_id}/tag` | Tag visitor with visit purpose (Test Ride, Vehicle Enquiry, Booking, etc.), salesperson, and notes |
-| `POST` | `/api/v1/visitors/update-zone` | Update live visitor zone dwell times, departure timestamp, exit portrait crop (`exit_image_base64`), and department |
+| `POST` | `/api/v1/visitors/update-zone` | Update live visitor zone dwell times, departure timestamp, exit portrait crop (`exit_image_base64`), multi-factor departure verification, and department |
 | `POST` | `/api/v1/visitors/walk-in` | Manually register a walk-in visitor from showroom reception |
 | `DELETE` | `/api/v1/visitors/{person_id}` | Delete a single bounced or cancelled visitor record and purge its stored portrait snapshot |
 | `POST` | `/api/v1/visitors/clear` | Clear all visitor records and purge stored visitor snapshot images |
@@ -683,7 +691,7 @@ All registered endpoints exposed by the FastAPI backend:
 ### Biometric Privacy & Data Retention
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/api/v1/identity/cleanup` | Execute 14-day biometric rolling retention cleanup |
+| `POST` | `/api/v1/identity/cleanup` | Execute rolling biometric retention cleanup (default 7 days, `?retention_days=` overrides) |
 | `GET` | `/api/v1/identity/status` | Check retention policy status and active face counts |
 
 ---
@@ -704,7 +712,8 @@ The test suite validates:
 - Directional virtual entry-line crossing geometry & wrong-direction rejections
 - Duplicate footfall event suppression (in-memory and database levels)
 - Employee face embedding extraction and similarity thresholding
-- 14-day rolling retention cleanup logic
+- Rolling retention cleanup logic (including body-only visitors)
+- Entry-exit matching: exact tracker lookup, edge exclusion, and walk-in ID collision safety
 
 ### Multi-Object Tracker Benchmarking
 Benchmark ByteTrack vs BoT-SORT latency, ID switching, and FPS:

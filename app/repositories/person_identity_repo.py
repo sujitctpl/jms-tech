@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 import uuid
 import numpy as np
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 from app.core.logging import logger
 from app.db.models.person_identity import PersonIdentity
@@ -230,13 +230,20 @@ class PersonIdentityRepository:
     def get_expired_identities(self, cutoff: datetime) -> List[PersonIdentity]:
         """
         Returns identities whose last_seen_at is older than the cutoff timestamp
-        and whose embeddings have not yet been purged.
+        and that still hold any biometric data (face vector, body Re-ID vector,
+        or entry/exit snapshots). Body-only visitors (face never captured) must
+        expire too, otherwise their OSNet vectors and photos are kept forever.
         """
         return (
             self.db.query(PersonIdentity)
             .filter(
                 PersonIdentity.last_seen_at < cutoff,
-                PersonIdentity.face_embedding.isnot(None),
+                or_(
+                    PersonIdentity.face_embedding.isnot(None),
+                    PersonIdentity.body_embedding.isnot(None),
+                    PersonIdentity.avatar_url.isnot(None),
+                    PersonIdentity.exit_avatar_url.isnot(None),
+                ),
             )
             .all()
         )
@@ -247,9 +254,10 @@ class PersonIdentityRepository:
         expired_at: Optional[datetime] = None,
     ) -> int:
         """
-        Permanently purges face embeddings for specified person IDs.
-        Sets face_embedding = None and is_expired = True while preserving person records
-        and associated historical tracking events.
+        Permanently purges biometric data for specified person IDs.
+        Nulls the face and body Re-ID vectors and both snapshot URLs, and sets
+        is_expired = True, while preserving person records and associated
+        historical tracking events.
         """
         if not person_ids:
             return 0
@@ -264,6 +272,9 @@ class PersonIdentityRepository:
         count = 0
         for r in records:
             r.face_embedding = None
+            r.body_embedding = None
+            r.avatar_url = None
+            r.exit_avatar_url = None
             r.is_expired = True
             r.expired_at = ts
             count += 1

@@ -30,6 +30,7 @@ from app.schemas.visitor import (
 from app.services.employee_service import global_employee_recognizer
 from app.vision.face_embedder import FaceEmbedder
 from app.vision.body_embedder import BodyEmbedder
+from app.vision import clothing_color
 
 # Indian Standard Time (UTC+05:30)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -43,6 +44,27 @@ def to_ist(dt: Optional[datetime]) -> Optional[datetime]:
         # DB naive timestamps represent UTC
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(IST)
+
+
+EXIT_DEBUG_DIR = os.path.join("logs", "exit_debug")
+
+
+def _write_exit_debug(event: dict, exit_crop: Optional[np.ndarray] = None) -> None:
+    """Appends one JSON line per exit attempt (and saves the crop of unresolved exits) for diagnosis."""
+    if settings.APP_ENV == "testing":
+        return
+    try:
+        os.makedirs(EXIT_DEBUG_DIR, exist_ok=True)
+        stamp = datetime.now(IST)
+        event = {"ts": stamp.strftime("%H:%M:%S"), **event}
+        if exit_crop is not None and exit_crop.size > 0 and not event.get("resolved_to"):
+            crop_name = f"unresolved_{stamp.strftime('%H%M%S')}_t{event.get('tracker_id')}.jpg"
+            cv2.imwrite(os.path.join(EXIT_DEBUG_DIR, crop_name), exit_crop)
+            event["saved_crop"] = os.path.join(EXIT_DEBUG_DIR, crop_name)
+        with open(os.path.join("logs", "exit_debug_backend.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, default=str) + "\n")
+    except Exception:
+        pass
 
 
 def get_waiting_cutoff_seconds() -> int:
@@ -299,11 +321,15 @@ class VisitorService:
     def update_visitor_zone(self, payload: VisitorZoneUpdateRequest) -> Optional[VisitorResponse]:
         """Updates real-time zone dwell durations, active zone, and departure time for a visitor."""
         record = None
-        if payload.person_id:
+        excluded_pid = getattr(payload, "exclude_person_id", None)
+        if payload.person_id and payload.person_id != excluded_pid:
             record = self.repo.get_by_person_id(payload.person_id)
         now_utc = datetime.now(timezone.utc)
         if not record and payload.tracker_id:
-            cand = (
+            # LIKE alone is a substring match ("Tracker #4" also hits "Tracker #42"),
+            # so confirm the exact tracker token before trusting the candidate.
+            tracker_token = re.compile(rf"Tracker #{re.escape(str(payload.tracker_id))}(?!\d)")
+            like_cands = (
                 self.db.query(PersonIdentity)
                 .filter(
                     PersonIdentity.notes.like(f"%Tracker #{payload.tracker_id}%"),
@@ -311,10 +337,12 @@ class VisitorService:
                     PersonIdentity.exit_time.is_(None),
                 )
                 .order_by(PersonIdentity.last_seen_at.desc())
-                .first()
+                .all()
             )
-            if cand:
-                record = cand
+            for cand in like_cands:
+                if cand.person_id != excluded_pid and tracker_token.search(cand.notes or ""):
+                    record = cand
+                    break
 
         # Extract exit image crop & embeddings (Face + Body Person Re-ID)
         exit_img_b64 = getattr(payload, "exit_image_base64", None)
@@ -347,7 +375,9 @@ class VisitorService:
                                 pt2 = np.array(raw_lms[1], dtype=np.float32)
                                 eye_d = float(np.linalg.norm(pt1 - pt2))
                             face_w = c_face.shape[1]
-                            is_reliable_exit_face = (face_w >= 28)
+                            # Both gates are required: a wide-but-blurry or side-profile face
+                            # (tiny eye distance) must not veto or positively match an exit.
+                            is_reliable_exit_face = (face_w >= 28 and eye_d >= 16.0)
                             exit_face_emb = self.embedder.extract_embedding(
                                 c_face, c_lms, full_image=exit_crop_img, raw_landmarks=raw_lms
                             )
@@ -358,12 +388,28 @@ class VisitorService:
             except Exception as e:
                 logger.warning("Could not extract exit image embeddings: %s", e)
 
-        vetoed_pids = set()
+        vetoed_pids = {excluded_pid} if excluded_pid else set()
+        exit_match_note = None
+        dbg: Optional[dict] = None
+        if payload.exit_time:
+            dbg = {
+                "stage": "backend_exit",
+                "person_id_sent": payload.person_id,
+                "tracker_id": payload.tracker_id,
+                "exclude_person_id": excluded_pid,
+                "direct_record": record.person_id if record else None,
+                "has_exit_image": exit_crop_img is not None,
+                "exit_face_found": exit_face_emb is not None,
+                "exit_face_reliable": is_reliable_exit_face,
+                "exit_body_emb": exit_body_emb is not None,
+                "candidates": [],
+            }
         # Verify biometric consistency if candidate record has a stored face embedding and exit photo has a reliable frontal face
         if record and payload.exit_time and exit_face_emb is not None and is_reliable_exit_face:
             cand_emb = record.get_embedding_vector()
             if cand_emb is not None:
                 sim = FaceEmbedder.compute_similarity(exit_face_emb, cand_emb)
+                dbg["direct_face_sim"] = round(float(sim), 3)
                 if sim < 0.40:
                     logger.warning(
                         "Biometric mismatch on exit for visitor %s: similarity %.3f < 0.40. Refusing to attach exit to this visitor.",
@@ -372,6 +418,8 @@ class VisitorService:
                     )
                     vetoed_pids.add(record.person_id)
                     record = None
+                else:
+                    exit_match_note = f"Exit Match: {sim*100:.1f}% (Face Sim: {sim*100:.1f}%)"
 
         # Verify body appearance & clothing consistency if candidate record has an entry crop / body embedding
         if record and payload.exit_time and exit_body_emb is not None:
@@ -392,6 +440,8 @@ class VisitorService:
                     emb1=exit_body_emb,
                     emb2=cand_b_emb,
                 )
+                dbg["direct_body"] = {"reid": round(reid_s, 3), "cloth": round(clothing_s, 3),
+                                      "score": round(app_score, 3), "is_match": bool(is_match)}
                 # Direct continuous track verification: only veto if body/clothing is a proven contradiction (reid < 0.45 and cloth < 0.15)
                 # Front-to-back turnarounds naturally reduce clothing match due to collars/lanyards.
                 if not is_match and (reid_s < 0.45 and clothing_s < 0.15):
@@ -403,6 +453,9 @@ class VisitorService:
                     )
                     vetoed_pids.add(record.person_id)
                     record = None
+                    exit_match_note = None
+                elif exit_match_note is None:
+                    exit_match_note = f"Exit Match: {app_score*100:.1f}% (Re-ID: {reid_s*100:.0f}%, Cloth: {clothing_s*100:.0f}%)"
 
         # Fallback for store exit: if tracker ID was reset on 180-deg turnaround (e.g. #2 became #6)
         if not record and payload.exit_time:
@@ -427,25 +480,25 @@ class VisitorService:
             if stale_prior_day:
                 self.db.commit()
 
-            from sqlalchemy import or_
+            # Only visitors still inside the showroom may receive an exit. Including already-departed
+            # visitors (exit_time set but no exit photo) let a later stranger's exit overwrite their
+            # departure time and photo.
             active_cands = (
                 self.db.query(PersonIdentity)
                 .filter(
                     PersonIdentity.is_expired.is_(False),
                     PersonIdentity.created_at >= today_start_utc,
-                    or_(
-                        PersonIdentity.exit_time.is_(None),
-                        PersonIdentity.exit_time == "Timed out",
-                        PersonIdentity.exit_avatar_url.is_(None),
-                    ),
+                    PersonIdentity.exit_time.is_(None),
                 )
                 .order_by(PersonIdentity.last_seen_at.desc())
                 .all()
             )
 
-            # 1. If exit face embedding is available, search active candidates for a biometric face match
-            # Calibrated threshold for CCTV face match: >= 0.52 with top-margin check to avoid ambiguous matches
-            if exit_face_emb is not None:
+            # 1. If a RELIABLE exit face is available, search active candidates for a biometric face match
+            # Calibrated threshold for CCTV face match: >= 0.52 with top-margin check to avoid ambiguous matches.
+            # Unreliable (blurry / side-profile) faces give poorly separated ArcFace scores, so they are
+            # left to the body Re-ID path below instead of positively matching at 0.52.
+            if exit_face_emb is not None and is_reliable_exit_face:
                 best_match = None
                 best_sim = 0.0
                 second_sim = 0.0
@@ -455,6 +508,7 @@ class VisitorService:
                     cand_emb = active_cand.get_embedding_vector()
                     if cand_emb is not None:
                         sim = FaceEmbedder.compute_similarity(exit_face_emb, cand_emb)
+                        dbg["candidates"].append({"pid": active_cand.person_id, "path": "face", "face_sim": round(float(sim), 3)})
                         if is_reliable_exit_face and sim < 0.40:
                             # Absolute face veto: ONLY for proven clear near-frontal face contradictions
                             vetoed_pids.add(active_cand.person_id)
@@ -517,6 +571,8 @@ class VisitorService:
                 best_reid_score = 0.0
                 best_color_sim = 0.0
                 second_body_sim = 0.0
+                all_reids = {}  # person_id -> reid, every candidate scored (for the weak-band margin)
+                weak_band = []  # (reid, clothing, candidate, why) with 0.60 <= reid < 0.70 and clothing backing
                 for active_cand in active_cands:
                     if active_cand.person_id in vetoed_pids:
                         continue
@@ -536,10 +592,14 @@ class VisitorService:
                         except Exception:
                             pass
 
-                    if exit_face_emb is not None and cand_emb is not None:
+                    # Only a RELIABLE exit face may veto. Side-profile / blurry exit faces score low even
+                    # against the same person (observed: 0.358 for a true match), so they must not reject.
+                    if exit_face_emb is not None and is_reliable_exit_face and cand_emb is not None:
                         f_sim = FaceEmbedder.compute_similarity(exit_face_emb, cand_emb)
                         if f_sim < 0.38:
                             # Hard biometric face rejection: proven different human beings
+                            dbg["candidates"].append({"pid": active_cand.person_id, "path": "body",
+                                                      "vetoed_by_face_sim": round(float(f_sim), 3)})
                             vetoed_pids.add(active_cand.person_id)
                             logger.info(
                                 "Exit face veto: candidate %s face similarity %.3f < 0.38 contradicts exiting person.",
@@ -566,7 +626,21 @@ class VisitorService:
                         # 1. is_match enforces calibrated Re-ID + non-conflicting clothing
                         # 2. Minimum time in store >= 7.0 seconds (filters momentary edge bounces)
                         # 3. Minimum combined appearance score >= 0.48
-                        time_in_store = (now_utc - active_cand.created_at).total_seconds() if active_cand.created_at else 30.0
+                        time_in_store = (now_utc - to_ist(active_cand.created_at)).total_seconds() if active_cand.created_at else 30.0
+                        dbg["candidates"].append({
+                            "pid": active_cand.person_id, "path": "body", "reid": round(reid_s, 3),
+                            "cloth": round(clothing_s, 3), "score": round(app_score, 3), "is_match": bool(is_match),
+                            "in_store_s": int(time_in_store),
+                            "eligible": bool(is_match and time_in_store >= 7.0 and app_score >= 0.48),
+                        })
+                        all_reids[active_cand.person_id] = float(reid_s)
+                        if (not is_match and time_in_store >= 7.0 and cand_crop is not None
+                                and clothing_color.WEAK_REID_MIN <= reid_s < 0.70):
+                            ok_w, why_w = clothing_color.weak_reid_support(
+                                clothing_color.describe(exit_crop_img), clothing_color.describe(cand_crop))
+                            dbg["candidates"][-1]["weak_band"] = why_w if ok_w else f"rejected: {why_w}"
+                            if ok_w:
+                                weak_band.append((float(reid_s), float(clothing_s), active_cand, why_w))
                         if is_match and time_in_store >= 7.0 and app_score >= 0.48:
                             if app_score > best_body_sim:
                                 second_body_sim = best_body_sim
@@ -576,6 +650,40 @@ class VisitorService:
                                 best_body_match = active_cand
                             elif app_score > second_body_sim:
                                 second_body_sim = app_score
+
+                # Ambiguity guard: two similarly dressed visitors scoring within 0.03 of each other
+                # cannot be told apart reliably. Leave the exit unattached rather than depart the wrong one.
+                if best_body_match and second_body_sim > 0.0 and (best_body_sim - second_body_sim) < 0.03:
+                    logger.warning(
+                        "Ambiguous body exit match for tracker %s: best %s=%.3f vs runner-up=%.3f (margin < 0.03). Suppressed.",
+                        payload.tracker_id,
+                        best_body_match.person_id,
+                        best_body_sim,
+                        second_body_sim,
+                    )
+                    dbg["ambiguous"] = {"best": best_body_match.person_id, "best_score": round(best_body_sim, 3),
+                                        "runner_up_score": round(second_body_sim, 3)}
+                    best_body_match = None
+
+                # Weak-Re-ID fallback: front-in vs back/side-out views of the same person often score
+                # reid 0.60-0.70. Accept only when clothing strongly agrees without contradiction (sleeves,
+                # trousers, colour) AND the candidate clearly out-scores every other visitor in the store.
+                # With a single visitor in the store, typical stranger reid (~0.50) is the comparison.
+                if not best_body_match and weak_band and "ambiguous" not in dbg:
+                    w_reid, w_cloth, w_cand, w_why = max(weak_band, key=lambda t: t[0])
+                    runner_up = max([r for pid, r in all_reids.items() if pid != w_cand.person_id] + [0.50])
+                    w_margin = w_reid - runner_up
+                    dbg["weak_band"] = {"best": w_cand.person_id, "reid": round(w_reid, 3),
+                                        "runner_up_reid": round(runner_up, 3), "margin": round(w_margin, 3)}
+                    if w_margin >= 0.08:
+                        best_body_match = w_cand
+                        best_reid_score = w_reid
+                        best_color_sim = w_cloth
+                        best_body_sim = float(0.60 * w_reid + 0.40 * w_cloth)
+                        logger.info(
+                            "Exit resolved via weak Re-ID band: %s reid=%.3f (runner-up %.3f, margin %.3f), %s.",
+                            w_cand.person_id, w_reid, runner_up, w_margin, w_why,
+                        )
 
                 if best_body_match:
                     record = best_body_match
@@ -597,10 +705,17 @@ class VisitorService:
                     "Unmapped exit event for tracker %s could not be verified against any active visitor. Suppressed exit attachment.",
                     payload.tracker_id,
                 )
+                dbg["active_candidates"] = len(active_cands)
+                dbg["resolved_to"] = None
+                _write_exit_debug(dbg, exit_crop_img)
                 return None
 
         if not record:
             return None
+
+        if dbg is not None:
+            dbg["resolved_to"] = record.person_id
+            _write_exit_debug(dbg)
 
         record.last_seen_at = now_utc
         if payload.tracker_id and f"Tracker #{payload.tracker_id}" not in (record.notes or ""):
@@ -610,6 +725,10 @@ class VisitorService:
         if payload.exit_time:
             record.exit_time = payload.exit_time
             record.is_waiting = False
+            # Persist the direct-path verification score so list_visitors can read it from notes
+            # instead of re-running OSNet on both photos for every departed visitor on each poll.
+            if exit_match_note and "Exit Match:" not in (record.notes or ""):
+                record.notes = f"{record.notes} | {exit_match_note}" if record.notes else exit_match_note
         if payload.zone_dwell:
             record.zone_dwell = json.dumps(payload.zone_dwell)
 
@@ -667,12 +786,12 @@ class VisitorService:
         if payload.waiting_seconds is not None:
             new_wait = int(payload.waiting_seconds)
             if record.created_at:
-                phys_elapsed = max(0, int((now_utc - record.created_at).total_seconds()))
+                phys_elapsed = max(0, int((now_utc - to_ist(record.created_at)).total_seconds()))
                 # Allow a small 30s buffer for cross-camera handoff timing
                 new_wait = min(new_wait, phys_elapsed + 30)
             record.waiting_seconds = max(int(record.waiting_seconds or 0), new_wait)
         elif record.created_at:
-            phys_elapsed = max(0, int((now_utc - record.created_at).total_seconds()))
+            phys_elapsed = max(0, int((now_utc - to_ist(record.created_at)).total_seconds()))
             record.waiting_seconds = min(int(record.waiting_seconds or 0), phys_elapsed + 30)
 
         if payload.is_waiting is not None:
@@ -738,14 +857,16 @@ class VisitorService:
         record = self.repo.get_by_person_id(person_id)
         if not record:
             return False
-        if record.avatar_url:
+        for url in (record.avatar_url, record.exit_avatar_url):
+            if not url:
+                continue
             try:
-                rel_path = record.avatar_url.lstrip("/")
+                rel_path = url.lstrip("/").split("?")[0]
                 if os.path.exists(rel_path):
                     os.remove(rel_path)
             except Exception:
                 pass
-        tracks = self.db.query(VisitorTrack).filter(VisitorTrack.person_identity_id == record.id).all()
+        tracks =self.db.query(VisitorTrack).filter(VisitorTrack.person_identity_id == record.id).all()
         for t in tracks:
             self.db.query(FootfallEvent).filter(FootfallEvent.visitor_track_id == t.id).delete()
             self.db.delete(t)
@@ -754,9 +875,22 @@ class VisitorService:
         logger.info("Deleted bounced/cancelled visitor record %s and associated footfall events.", person_id)
         return True
 
+    def _mint_person_id(self) -> str:
+        """Returns the next free VIS-2026-xxxx ID.
+
+        Starts from the row count but skips any ID already in use: after a visitor
+        is deleted the count drops, so the count alone can collide with a live ID
+        (and create_or_update would then silently overwrite that visitor).
+        """
+        candidate_num = 1040 + self.db.query(PersonIdentity).count() + 1
+        new_pid = f"VIS-2026-{candidate_num}"
+        while self.repo.get_by_person_id(new_pid):
+            candidate_num += 1
+            new_pid = f"VIS-2026-{candidate_num}"
+        return new_pid
+
     def create_walk_in(self, payload: WalkInCreateRequest) -> VisitorResponse:
-        total_count = self.db.query(PersonIdentity).count()
-        new_pid = f"VIS-2026-{1040 + total_count + 1}"
+        new_pid = self._mint_person_id()
 
         record = self.repo.create_or_update(
             person_id=new_pid,
@@ -828,9 +962,27 @@ class VisitorService:
             cand = self.repo.get_by_person_id(req.person_id)
             if cand and cand.exit_time is None and not cand.is_expired:
                 existing_rec = cand
+                # The edge links tracks to visitors at a loose face threshold (0.55). Verify the new crop
+                # against the stored entry photo before trusting it: otherwise one false edge match
+                # overwrites another visitor's entry photo and breaks their later exit matching.
+                if face_img is not None and face_img.size > 0 and cand.avatar_url:
+                    c_path = cand.avatar_url.lstrip("/").split("?")[0]
+                    cand_crop = cv2.imread(c_path) if os.path.isfile(c_path) else None
+                    if cand_crop is not None:
+                        reid_s, cloth_s, _, same = self.body_embedder.verify_appearance(face_img, cand_crop)
+                        if not same:
+                            logger.warning(
+                                "Edge-supplied person_id %s rejected: appearance mismatch (reid=%.3f, cloth=%.3f). "
+                                "Treating tracker %s as a separate person.",
+                                cand.person_id, reid_s, cloth_s, req.tracker_id,
+                            )
+                            existing_rec = None
+                            req.person_id = None
         if not existing_rec and req.tracker_id:
-            # Only match the exact same track if it was active within the last 30 seconds and hasn't departed
-            cand = (
+            # Only match the exact same track if it was active within the last 30 seconds and hasn't departed.
+            # LIKE is a substring match ("Tracker #4" hits "Tracker #42"), so confirm the exact token.
+            tracker_token = re.compile(rf"Tracker #{re.escape(str(req.tracker_id))}(?!\d)")
+            like_cands = (
                 self.db.query(PersonIdentity)
                 .filter(
                     PersonIdentity.notes.like(f"%Tracker #{req.tracker_id}%"),
@@ -838,10 +990,11 @@ class VisitorService:
                     PersonIdentity.exit_time.is_(None),
                 )
                 .order_by(PersonIdentity.last_seen_at.desc())
-                .first()
+                .all()
             )
+            cand = next((c for c in like_cands if tracker_token.search(c.notes or "")), None)
             if cand and cand.last_seen_at:
-                time_diff = (now_utc - cand.last_seen_at).total_seconds()
+                time_diff = (now_utc - to_ist(cand.last_seen_at)).total_seconds()
                 if time_diff < 30.0:
                     existing_rec = cand
 
@@ -1234,12 +1387,7 @@ class VisitorService:
         # ---------------------------------------------------------------------
         # 3. New or Returning Customer Arrival -> Mint ID, Save Crisp Snapshot, Add to Visit Purpose
         # ---------------------------------------------------------------------
-        total_count = self.db.query(PersonIdentity).count()
-        candidate_num = 1040 + total_count + 1
-        new_person_id = f"VIS-2026-{candidate_num}"
-        while self.repo.get_by_person_id(new_person_id):
-            candidate_num += 1
-            new_person_id = f"VIS-2026-{candidate_num}"
+        new_person_id = self._mint_person_id()
 
         # Save full-body portrait snapshot to disk with high quality (quality 95)
         avatar_url = None

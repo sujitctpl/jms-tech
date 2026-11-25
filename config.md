@@ -76,11 +76,12 @@ The central FastAPI backend uses `pydantic-settings` (defined in [`app/core/conf
 
 ---
 
-### 1.5 Biometric Privacy & 14-Day Rolling Retention
+### 1.5 Biometric Privacy & 7-Day Rolling Retention
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `FACE_RETENTION_DAYS` | integer | `14` | Rolling retention period in days for unconfirmed visitor embeddings. |
+| `FACE_RETENTION_DAYS` | integer | `7` | Rolling retention period in days for visitor face/body embeddings and entry/exit snapshots. |
+| `SNAPSHOT_RETENTION_DAYS` | integer | `7` | Retention period in days for physical CCTV snapshot images. |
 | `RETENTION_CLEANUP_INTERVAL_HOURS` | integer | `24` | Frequency in hours at which the scheduled background cleanup job executes. |
 | `RETENTION_AUTO_CLEANUP_ENABLED` | boolean | `true` | Enables automatic background deletion of expired visitor biometrics. |
 

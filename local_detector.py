@@ -82,9 +82,34 @@ def mask_credentials(url: Any) -> str:
 
 
 
+EXIT_DEBUG_LOG = os.path.join("logs", "exit_debug_edge.jsonl")
+
+
+def log_exit_debug(event: dict) -> None:
+    """Appends one JSON line per entry/exit decision so failed departures can be diagnosed after a test."""
+    try:
+        os.makedirs(os.path.dirname(EXIT_DEBUG_LOG), exist_ok=True)
+        event = {"ts": datetime.now(IST).strftime("%H:%M:%S"), **event}
+        with open(EXIT_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, default=str) + "\n")
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Background HTTP Sync Client (Non-blocking Queue)
 # ---------------------------------------------------------------------------
+def _is_unreachable_error(exc: Exception) -> bool:
+    """True only when the request certainly never reached the backend (connection refused / no route),
+    so a retry cannot duplicate it. Timeouts are excluded: the backend may already have processed them."""
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, (ConnectionRefusedError, ConnectionAbortedError)):
+        return True
+    text = str(reason).lower()
+    return any(t in text for t in ("actively refused", "connection refused", "10061", "no route to host",
+                                   "network is unreachable", "getaddrinfo failed"))
+
+
 class DashboardSyncClient:
     """Non-blocking background client sending footfall events & telemetry to FastAPI."""
 
@@ -107,6 +132,7 @@ class DashboardSyncClient:
         self.last_heartbeat_time = 0.0
         self.total_synced_entries = 0
         self.last_error = ""
+        self.last_unreachable = False
 
         self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker_thread.start()
@@ -241,6 +267,7 @@ class DashboardSyncClient:
             headers={"Content-Type": "application/json", "User-Agent": "Capermint-Local-Edge/1.0"},
             method="POST",
         )
+        self.last_unreachable = False
         try:
             with urllib.request.urlopen(req, timeout=timeout) as response:
                 if response.status in (200, 201):
@@ -251,14 +278,48 @@ class DashboardSyncClient:
                     except Exception:
                         resp_json = {}
                     return True, resp_json
+        except urllib.error.HTTPError as e:
+            # The backend answered (e.g. 404 "no matching visitor"): a real result, never retried.
+            self.is_connected = True
+            self.last_error = str(e)
+            return False, None
         except Exception as e:
             self.is_connected = False
             self.last_error = str(e)
+            self.last_unreachable = _is_unreachable_error(e)
             return False, None
         return False, None
 
-    def _post(self, endpoint: str, data: dict, timeout: float = 2.5) -> bool:
-        ok, _ = self._post_json(endpoint, data, timeout=timeout)
+    # Events that must survive a backend restart (uvicorn --reload, crash, network blip).
+    _RETRY_EVENTS = ("entry", "section_entry", "employee_punch", "visitor_detect", "visitor_zone_update", "delete_visitor")
+    _RETRY_MAX_WAIT_S = 180.0
+
+    def _send_with_retry(self, event_type: str, send: Callable[[], Tuple[bool, Optional[dict]]]) -> Tuple[bool, Optional[dict]]:
+        """Send once; if the backend was unreachable (request never delivered), keep retrying the SAME event
+        with backoff so event order is preserved (entry before exit), for up to _RETRY_MAX_WAIT_S."""
+        ok, resp = send()
+        if ok or event_type not in self._RETRY_EVENTS or not self.last_unreachable:
+            return ok, resp
+        started = time.time()
+        delay = 1.0
+        attempts = 1
+        print(f"[!] Backend unreachable ({self.last_error}); holding {event_type} and retrying...")
+        while not self.stop_event.is_set() and time.time() - started < self._RETRY_MAX_WAIT_S:
+            self.stop_event.wait(delay)
+            delay = min(delay * 2.0, 10.0)
+            attempts += 1
+            ok, resp = send()
+            if ok or not self.last_unreachable:
+                if ok:
+                    print(f"[+] Backend reachable again; {event_type} delivered after {attempts} attempts.")
+                return ok, resp
+        log_exit_debug({"stage": "edge_send_dropped", "event": event_type, "attempts": attempts,
+                        "waited_s": round(time.time() - started, 1), "error": self.last_error})
+        print(f"[!] Dropped {event_type} after {attempts} attempts: backend unreachable for {self._RETRY_MAX_WAIT_S:.0f}s.")
+        return ok, resp
+
+    def _post(self, endpoint: str, data: dict, timeout: float = 2.5, event_type: str = "") -> bool:
+        ok, _ = self._send_with_retry(event_type, lambda: self._post_json(endpoint, data, timeout=timeout))
         return ok
 
     def _worker_loop(self) -> None:
@@ -270,15 +331,15 @@ class DashboardSyncClient:
 
             if event_type in ("entry", "section_entry"):
                 endpoint = f"/api/v1/cameras/{self.camera_id}/footfall"
-                ok = self._post(endpoint, payload)
+                ok = self._post(endpoint, payload, event_type=event_type)
                 if ok:
                     self.total_synced_entries += 1
             elif event_type == "employee_punch":
                 endpoint = "/api/v1/attendance/punch"
-                self._post(endpoint, payload)
+                self._post(endpoint, payload, event_type=event_type)
             elif event_type == "visitor_detect":
                 endpoint = "/api/v1/visitors/detect"
-                ok, resp = self._post_json(endpoint, payload)
+                ok, resp = self._send_with_retry(event_type, lambda: self._post_json(endpoint, payload))
                 if ok and resp and isinstance(resp, dict):
                     returned_pid = resp.get("person_id")
                     t_id = payload.get("tracker_id")
@@ -289,17 +350,35 @@ class DashboardSyncClient:
                             pass
             elif event_type == "visitor_zone_update":
                 endpoint = "/api/v1/visitors/update-zone"
-                self._post(endpoint, payload)
+                ok = self._post(endpoint, payload, event_type=event_type)
+                if payload.get("exit_time"):
+                    log_exit_debug({
+                        "stage": "edge_exit_sent",
+                        "person_id": payload.get("person_id"),
+                        "tracker_id": payload.get("tracker_id"),
+                        "has_exit_image": bool(payload.get("exit_image_base64")),
+                        "backend_accepted": ok,
+                        "error": None if ok else self.last_error,
+                    })
             elif event_type == "delete_visitor":
                 pid = payload.get("person_id")
                 if pid:
                     url = f"{self.base_url}/api/v1/visitors/{pid}"
-                    req = urllib.request.Request(url, headers={"User-Agent": "Capermint-Local-Edge/1.0"}, method="DELETE")
-                    try:
-                        with urllib.request.urlopen(req, timeout=2.5) as resp:
-                            pass
-                    except Exception:
-                        pass
+
+                    def _delete(url: str = url) -> Tuple[bool, Optional[dict]]:
+                        self.last_unreachable = False
+                        req = urllib.request.Request(url, headers={"User-Agent": "Capermint-Local-Edge/1.0"}, method="DELETE")
+                        try:
+                            with urllib.request.urlopen(req, timeout=2.5):
+                                return True, None
+                        except urllib.error.HTTPError:
+                            return False, None
+                        except Exception as e:
+                            self.last_error = str(e)
+                            self.last_unreachable = _is_unreachable_error(e)
+                            return False, None
+
+                    self._send_with_retry(event_type, _delete)
             elif event_type == "heartbeat":
                 endpoint = f"/api/v1/cameras/{self.camera_id}/heartbeat"
                 self._post(endpoint, payload)
@@ -1654,6 +1733,7 @@ class VisitorZoneTracker:
             # Delegate exit matching to the backend Dual-Factor Person Re-ID & Clothing verification engine.
 
         # Absolute biometric face consistency check: if continuous track has a known face and exit has a face, ensure they match!
+        contradicted_pid = None
         if session and exit_face_emb is not None and hasattr(self, "identity_manager") and self.identity_manager:
             track_embs = getattr(self.identity_manager, "track_embeddings", {})
             s_tid = session.get("track_id", tid_str)
@@ -1664,19 +1744,32 @@ class VisitorZoneTracker:
                 sim = float(np.dot(exit_face_emb, s_emb))
                 if sim < 0.40:
                     print(f"[*] Suppressing exit match for track #{track_id}: face similarity {sim:.3f} contradicts session #{s_tid}.")
+                    contradicted_pid = session.get("person_id") or self.track_to_pid.get(track_id)
                     session = None
 
         if session:
             dwell_total = max(0.0, now_ts - session.get("first_seen_ts", now_ts))
-            if dwell_total < 7.0 and not matched_cand_tid:
-                # If this track ID was newly assigned on turnaround (< 7s), forward to backend appearance engine
-                # so active showroom visitors who entered earlier can be matched!
-                print(f"[*] Turnaround track #{track_id} (active {dwell_total:.1f}s) crossed exit line. Forwarding to backend appearance matcher.")
-                session = None
-            elif dwell_total < 7.0 and matched_cand_tid:
-                print(f"[*] Suppressed premature exit for track #{track_id}: dwell {dwell_total:.1f}s < 7.0s threshold.")
-                return
+            has_assigned_pid = bool(session.get("person_id") or self.track_to_pid.get(track_id))
+            if dwell_total < 7.0:
+                if has_assigned_pid or matched_cand_tid:
+                    # Confirmed local visitor who left in under 7s -> premature bounce exit
+                    print(f"[*] Suppressed premature exit for track #{track_id}: dwell {dwell_total:.1f}s < 7.0s threshold.")
+                    log_exit_debug({"stage": "edge_exit_suppressed", "track": track_id, "reason": "dwell_under_7s",
+                                    "dwell_s": round(dwell_total, 1), "person_id": session.get("person_id")})
+                    return
+                else:
+                    # Unregistered tracklet newly assigned on turnaround (< 7s) without a known visitor ID:
+                    # forward to backend appearance engine so active showroom visitors who entered earlier can be matched!
+                    print(f"[*] Turnaround track #{track_id} (active {dwell_total:.1f}s) crossed exit line. Forwarding to backend appearance matcher.")
+                    session = None
 
+        log_exit_debug({
+            "stage": "edge_exit_resolved", "track": track_id,
+            "path": "local_session" if session else "forwarded_to_backend",
+            "person_id": (session or {}).get("person_id") if session else None,
+            "exit_face_found": exit_face_emb is not None,
+            "matched_other_session": matched_cand_tid, "contradicted_pid": contradicted_pid,
+        })
         if session:
             # Confirmed genuine departure (stayed >= 7.0s): remove session and sync exit
             self.sessions.pop(tid_str, None)
@@ -1687,14 +1780,18 @@ class VisitorZoneTracker:
                 session["exit_image_base64"] = exit_b64
             self._sync_session(session, now_ts, is_departure=True)
         else:
-            pid = self.track_to_pid.get(track_id)
-            if not pid and hasattr(self, "identity_manager") and self.identity_manager:
-                pid = self.identity_manager.get_person_id(track_id)
+            pid = None
+            # Skip the track's own mapping when its face just contradicted that visitor;
+            # otherwise the rejected visitor would be departed anyway via track_to_pid.
+            if not contradicted_pid:
+                pid = self.track_to_pid.get(track_id)
+                if not pid and hasattr(self, "identity_manager") and self.identity_manager:
+                    pid = self.identity_manager.get_person_id(track_id)
             if not pid and exit_face_emb is not None and hasattr(self, "identity_manager") and self.identity_manager:
                 vs = getattr(self.identity_manager, "vector_store", None)
                 if vs and hasattr(vs, "find_best_visitor_match"):
                     m_pid, m_sim = vs.find_best_visitor_match(exit_face_emb, similarity_threshold=0.65)
-                    if m_pid and m_sim >= 0.65:
+                    if m_pid and m_sim >= 0.65 and m_pid != contradicted_pid:
                         pid = m_pid
                         print(f"[*] Biometric face match in vector store: exit track #{track_id} -> {m_pid} (sim={m_sim:.3f})")
 
@@ -1713,6 +1810,8 @@ class VisitorZoneTracker:
                 }
                 if exit_b64:
                     exit_payload["exit_image_base64"] = exit_b64
+                if contradicted_pid:
+                    exit_payload["exclude_person_id"] = str(contradicted_pid)
                 self.sync_client.send_visitor_zone_update(exit_payload)
 
     def _sync_session(self, session: dict, now_ts: float, is_departure: bool = False) -> None:
@@ -4109,26 +4208,43 @@ def run_local_detector(
                             checked_out_employee_ids[emp_id] = now_ts
                             sync_client.send_employee_punch_event(emp_id, event_type="CHECK_OUT", confidence=0.95)
                             print(f"[<-- STAFF EXIT] Staff member {emp_label} (#{exit_id}, EMP: {emp_id}) clocked CHECK_OUT via reverse line crossing.")
+                    log_exit_debug({"stage": "edge_reverse_crossing", "track": exit_id, "branch": "staff_checkout", "employee": emp_id})
                     continue
 
                 # Case 2: Exited within 7.0s bounce window -> cancel immediately (entry & exit not logged)
                 if exit_id in pending_line_crossings:
+                    pending_age = now_ts - pending_line_crossings[exit_id].get("crossed_ts", now_ts)
                     pending_line_crossings.pop(exit_id, None)
                     zone_manager.counted_attendance_ids.discard(exit_id)
-                    pid = identity_manager.get_person_id(exit_id)
-                    if pid:
-                        sync_client.send_delete_visitor(pid)
+                    # No backend delete here: visitor records are only minted after the 7s confirmation
+                    # (detect is gated on confirmed_visitor_tracks), so a pending bounce never owns a record.
+                    # Any person_id resolved for this track is an EXISTING visitor re-identified by face,
+                    # and deleting it would wipe that visitor's record, tags and photos.
                     print(f"[*] Track #{exit_id} entered and stepped back out within 7s. Cancelled (entry not logged).")
+                    log_exit_debug({
+                        "stage": "edge_reverse_crossing", "track": exit_id, "branch": "bounce_cancelled_pending_entry",
+                        "pending_age_s": round(pending_age, 1),
+                    })
                     continue
 
                 # Case 3: Visitor departure across entrance line
+                was_confirmed_track = exit_id in confirmed_visitor_tracks
                 confirmed_visitor_tracks.discard(exit_id)
                 if getattr(zone_manager, "visitor_tracker", None) and is_entrance:
                     exit_box = tracked_objects.get(exit_id)
                     exit_img = None
                     if exit_box is not None:
                         exit_img = extract_visitor_body_crop(get_clean_frame(), exit_box)
+                    log_exit_debug({
+                        "stage": "edge_reverse_crossing", "track": exit_id, "branch": "visitor_departure",
+                        "same_track_as_entry": was_confirmed_track,
+                        "has_session": str(exit_id) in zone_manager.visitor_tracker.sessions,
+                        "active_sessions": len(zone_manager.visitor_tracker.sessions),
+                        "exit_crop": None if exit_img is None else list(exit_img.shape[:2]),
+                    })
                     zone_manager.visitor_tracker.record_visitor_exit(exit_id, now_ts, exit_image=exit_img)
+                else:
+                    log_exit_debug({"stage": "edge_reverse_crossing", "track": exit_id, "branch": "ignored_not_entrance_camera"})
 
             for (p_id, s_id, s_name) in new_sections:
                 sec_tot = zone_manager.section_totals.get(s_id, 0)
@@ -5001,6 +5117,11 @@ def run_local_detector(
                     # Person crossed entry line and sustained presence for >= 7s -> Confirmed VISITOR!
                     pending_line_crossings.pop(cid, None)
                     pid = identity_manager.get_person_id(cid)
+                    log_exit_debug({
+                        "stage": "edge_entry_confirmed", "track": cid, "person_id": pid,
+                        "visible_at_confirmation": cid in tracked_objects,
+                        "seconds_since_last_seen": round(now_ts - track_last_seen.get(cid, now_ts), 1),
+                    })
                     zone_manager.record_visitor_entry(cid, pid)
                     confirmed_visitor_tracks.add(cid)
                     pid_desc = f" (PID: {pid})" if pid else " (PID: Unresolved)"

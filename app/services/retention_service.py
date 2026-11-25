@@ -55,7 +55,7 @@ class RetentionService:
     ) -> RetentionCleanupReport:
         """
         Executes an idempotent biometric cleanup job.
-        Deletes face embeddings older than retention_days (default 14 days from last_seen_at)
+        Deletes face/body embeddings older than retention_days (default FACE_RETENTION_DAYS from last_seen_at)
         from both the database and vector store.
         """
         start_time = time.time()
@@ -115,9 +115,7 @@ class RetentionService:
                 # Also purge any unlinked orphaned files older than retention days
                 deleted_files += self._purge_orphaned_snapshots(snapshots_dir, days)
 
-            # 3. Purge biometric embeddings from database (sets face_embedding = None, avatar_url = None, is_expired = True)
-            for r in expired_records:
-                r.avatar_url = None
+            # 3. Purge biometric data from database (face + body vectors, entry + exit snapshot URLs, is_expired = True)
             purged_count = repo.expire_identities(expired_person_ids, expired_at=current_time)
 
             elapsed = time.time() - start_time

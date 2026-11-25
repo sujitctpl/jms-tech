@@ -289,96 +289,12 @@ class BodyEmbedder:
     @staticmethod
     def estimate_clothing_appearance(crop: Optional[np.ndarray]) -> str:
         """
-        Estimates the primary upper-torso clothing appearance (color/attire tag).
-        Used for customer session notes and quick reception identification.
-        Filters out low-saturation background floors & walls (e.g. white doors/tiles)
-        to prevent background bleed from corrupting clothing classification.
+        Upper-garment colour tag (e.g. "White / Light Shirt") for visitor notes and exit matching.
+        Pose-located torso, wall-relative lightness and white balance; see app/vision/clothing_color.py.
         """
-        patch = BodyEmbedder.extract_salient_torso_patch(crop)
-        if patch is None or patch.size == 0:
-            return "Casual Attire"
-        try:
-            hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-            h_chan = hsv[:, :, 0].flatten()
-            s_chan = hsv[:, :, 1].flatten()
-            v_chan = hsv[:, :, 2].flatten()
+        from app.vision.clothing_color import estimate_tag
 
-            # Exclude bright white door/wall background if clothing pixels are present
-            is_wall = (s_chan < 20) & (v_chan > 140)
-            fg = ~is_wall
-            if np.sum(fg) >= (len(v_chan) * 0.25):
-                eff_v = v_chan[fg]
-                eff_s = s_chan[fg]
-                mean_v = float(np.mean(eff_v))
-                mean_s = float(np.mean(eff_s))
-                eff_h = h_chan[fg]
-            else:
-                mean_v = float(np.mean(v_chan))
-                mean_s = float(np.mean(s_chan))
-                eff_h = h_chan
-                eff_s = s_chan
-                eff_v = v_chan
-
-            # Saturated chromatic pixels (sufficient saturation S >= 30 and brightness V >= 35)
-            chroma_mask = (eff_s >= 30) & (eff_v >= 35)
-            chroma_pct = float(np.sum(chroma_mask)) / float(len(eff_h)) if len(eff_h) > 0 else 0.0
-
-            # Chromatic classification: requires >= 45% chromatic pixels AND mean saturation >= 38
-            if chroma_pct >= 0.45 and mean_s >= 38:
-                h_chroma = eff_h[chroma_mask]
-                counts = {
-                    "Red / Maroon Top": np.sum((h_chroma < 14) | (h_chroma >= 162)),
-                    "Orange / Rust Top": np.sum((h_chroma >= 14) & (h_chroma < 24)),
-                    "Yellow / Mustard Top": np.sum((h_chroma >= 24) & (h_chroma < 38)),
-                    "Green Top": np.sum((h_chroma >= 38) & (h_chroma < 85)),
-                    "Blue / Navy Top": np.sum((h_chroma >= 85) & (h_chroma < 135)),
-                    "Purple / Violet Top": np.sum((h_chroma >= 135) & (h_chroma < 162)),
-                }
-                best_tag, max_cnt = max(counts.items(), key=lambda x: x[1])
-                if max_cnt >= 0.45 * len(h_chroma) and max_cnt >= 0.20 * len(eff_h):
-                    return best_tag
-
-            # Achromatic garments (Black, Gray, White, Cream) via Perceptual Vector Quantization
-            # Instead of rigid step-function thresholds that break under illumination shifts,
-            # we classify achromatic garments into their nearest perceptual centroid in [S, V, Warmth] space.
-            # Warmth = mean(R) - mean(B) separates neutral/cool grays from warm creams/beiges.
-            b_chan = patch[:, :, 0].flatten()
-            r_chan = patch[:, :, 2].flatten()
-            mean_r = float(np.mean(r_chan))
-            mean_b = float(np.mean(b_chan))
-            warmth = mean_r - mean_b
-
-            # Feature vector: [Saturation, Value, Warmth]
-            feat = np.array([mean_s, mean_v, warmth], dtype=np.float32)
-
-            # Calibrated anchor centroids: [S, V, Warmth]
-            # Black: low V, low S, neutral warmth
-            # Gray: mid V, low S, neutral/cool warmth
-            # White: high V, low S, neutral warmth
-            # Cream/Khaki: mid-high V, moderate S, positive warmth (R > B)
-            achromatic_anchors = {
-                "Black / Dark Attire": np.array([10.0, 50.0, 0.0], dtype=np.float32),
-                "Gray Attire": np.array([12.0, 110.0, 0.0], dtype=np.float32),
-                "White / Light Shirt": np.array([8.0, 160.0, 0.0], dtype=np.float32),
-                "Cream / Khaki Shirt": np.array([24.0, 120.0, 8.0], dtype=np.float32),
-            }
-
-            # Perceptual metric weights: [w_s, w_v, w_warmth]
-            weights = np.array([1.5, 0.8, 2.0], dtype=np.float32)
-
-            best_tag = "Casual Attire"
-            min_dist = float("inf")
-            for tag, anchor in achromatic_anchors.items():
-                dist = float(np.sqrt(np.sum((weights * (feat - anchor)) ** 2)))
-                if dist < min_dist:
-                    min_dist = dist
-                    best_tag = tag
-
-            return best_tag
-
-            return "Casual Attire"
-        except Exception:
-            return "Casual Attire"
+        return estimate_tag(crop)
 
     @staticmethod
     def compute_color_similarity(hist1: Optional[np.ndarray], hist2: Optional[np.ndarray]) -> float:
@@ -443,213 +359,55 @@ class BodyEmbedder:
             except Exception:
                 pass
 
-        torso_sim = 0.0
-        legs_sim = 0.0
-        hsv1 = None
-        hsv2 = None
-        hsv_l1 = None
-        hsv_l2 = None
-        both_have_legs = False
-        legs_contradiction = False
+        if crop1 is None or crop2 is None:
+            # Embedding-only comparison: no clothing evidence, never enough on its own.
+            return reid_sim, 0.0, float(reid_sim * 0.40), False
 
-        if crop1 is not None and crop2 is not None:
-            # 1. Torso Region Color Extraction (inner 60% of bounding box)
-            hist_torso1 = self.extract_body_part_hist(crop1, 0.18, 0.52, 0.20, 0.80)
-            hist_torso2 = self.extract_body_part_hist(crop2, 0.18, 0.52, 0.20, 0.80)
-            torso_sim = self.compute_color_similarity(hist_torso1, hist_torso2)
+        # Garment evidence from pose-located torso/legs (see app/vision/clothing_color.py).
+        # Fixed-fraction boxes on this doorway camera were mostly wall, so every pair looked alike.
+        from app.vision import clothing_color as cc
 
-            h1, w1 = crop1.shape[:2]
-            h2, w2 = crop2.shape[:2]
-            p1 = crop1[int(h1 * 0.18):int(h1 * 0.52), int(w1 * 0.20):int(w1 * 0.80)]
-            p2 = crop2[int(h2 * 0.18):int(h2 * 0.52), int(w2 * 0.20):int(w2 * 0.80)]
-            if p1.size > 0 and p2.size > 0:
-                hsv1 = cv2.cvtColor(p1, cv2.COLOR_BGR2HSV)
-                hsv2 = cv2.cvtColor(p2, cv2.COLOR_BGR2HSV)
+        d1 = cc.describe(crop1)
+        d2 = cc.describe(crop2)
+        torso_sim = cc.hist_similarity(d1.torso, d2.torso)
+        both_have_legs = d1.legs is not None and d2.legs is not None
+        legs_sim = cc.hist_similarity(d1.legs, d2.legs) if both_have_legs else 0.0
+        # Trousers are dark for most visitors, so legs carry less identity than the torso.
+        clothing_sim = float(0.65 * torso_sim + 0.35 * legs_sim) if both_have_legs else float(torso_sim)
 
-            # 2. Lower-Body (Trousers/Skirt) Region Extraction
-            both_have_legs = (h1 >= 140 and h2 >= 140)
-            if both_have_legs:
-                hist_legs1 = self.extract_body_part_hist(crop1, 0.56, 0.90, 0.20, 0.80)
-                hist_legs2 = self.extract_body_part_hist(crop2, 0.56, 0.90, 0.20, 0.80)
-                legs_sim = self.compute_color_similarity(hist_legs1, hist_legs2)
-
-                leg1 = crop1[int(h1 * 0.56):int(h1 * 0.90), int(w1 * 0.20):int(w1 * 0.80)]
-                leg2 = crop2[int(h2 * 0.56):int(h2 * 0.90), int(w2 * 0.20):int(w2 * 0.80)]
-                if leg1.size > 0 and leg2.size > 0:
-                    hsv_l1 = cv2.cvtColor(leg1, cv2.COLOR_BGR2HSV)
-                    hsv_l2 = cv2.cvtColor(leg2, cv2.COLOR_BGR2HSV)
-
-                    # Direct Lower-Body Color & Luminance Contradiction Check:
-                    med_l1 = np.median(hsv_l1, axis=(0, 1))
-                    med_l2 = np.median(hsv_l2, axis=(0, 1))
-                    v1_leg, v2_leg = float(med_l1[2]), float(med_l2[2])
-                    h1_leg, h2_leg = float(med_l1[0]), float(med_l2[0])
-                    s1_leg, s2_leg = float(med_l1[1]), float(med_l2[1])
-                    v1_leg_p25 = float(np.percentile(hsv_l1[:, :, 2], 25))
-                    v2_leg_p25 = float(np.percentile(hsv_l2[:, :, 2], 25))
-
-                    is_dark1 = (v1_leg <= 65.0 and v1_leg_p25 <= 50.0)
-                    is_dark2 = (v2_leg <= 65.0 and v2_leg_p25 <= 50.0)
-                    is_light1 = (v1_leg >= 110.0 and v1_leg_p25 >= 80.0)
-                    is_light2 = (v2_leg >= 110.0 and v2_leg_p25 >= 80.0)
-                    is_denim1 = (s1_leg >= 25.0 and 85.0 <= h1_leg <= 135.0 and v1_leg >= 85.0)
-                    is_denim2 = (s2_leg >= 25.0 and 85.0 <= h2_leg <= 135.0 and v2_leg >= 85.0)
-
-                    # Contradiction: one has dark trousers while other has light/denim pants
-                    if (is_dark1 and (is_light2 or is_denim2)) or (is_dark2 and (is_light1 or is_denim1)):
-                        legs_contradiction = True
-
-        # Composite clothing similarity: balanced upper torso and lower legs when full body is present
-        if both_have_legs:
-            clothing_sim = float(0.50 * torso_sim + 0.50 * legs_sim)
-        else:
-            # Portrait / bust: evaluate based on torso fabric
-            clothing_sim = float(torso_sim)
-
-        # Check high-level clothing appearance tags (e.g. Red / Maroon Top vs Blue / Navy Top)
-        tag1 = None
-        tag2 = None
-        if crop1 is not None and crop2 is not None:
-            tag1 = BodyEmbedder.estimate_clothing_appearance(crop1)
-            tag2 = BodyEmbedder.estimate_clothing_appearance(crop2)
-
-            compatible_clusters = [
-                # Warm / Earth / Neutral cluster: sunlight vs indoor shadows shift these continuously
-                {"Yellow / Mustard Top", "Orange / Rust Top", "Cream / Khaki Shirt", "White / Light Shirt"},
-                # Dark / Deep cluster: navy garments desaturate to black/dark under low light
-                {"Black / Dark Attire", "Blue / Navy Top"},
-                # Warm chromatic cluster
-                {"Red / Maroon Top", "Orange / Rust Top"},
-                # Cool chromatic cluster
-                {"Blue / Navy Top", "Green Top", "Purple / Violet Top"},
-            ]
-
-            # Check if tags are identical, neutral, have strong direct torso & clothing agreement, or in a shared compatible lighting cluster
-            is_neutral = (tag1 in ("Casual Attire", "Neutral / Casual Attire", None) or tag2 in ("Casual Attire", "Neutral / Casual Attire", None))
-            tag_compatible = (tag1 == tag2) or is_neutral or (torso_sim >= 0.68 and clothing_sim >= 0.60) or any(tag1 in c and tag2 in c for c in compatible_clusters)
-
-            # Polar opposite veto: Only veto if tags belong to completely incompatible families
-            # and torso clothing correlation is low (if torso_sim >= 0.60, the color histograms directly agree)
-            if not tag_compatible and torso_sim < 0.60 and reid_sim < 0.82:
-                logger.info(
-                    "Appearance veto: incompatible clothing tags '%s' vs '%s' (reid=%.3f < 0.82, torso_sim=%.3f).",
-                    tag1,
-                    tag2,
-                    reid_sim,
-                    torso_sim,
-                )
-                return reid_sim, min(clothing_sim, 0.20), float(reid_sim * 0.15), False
-
-            # Direct Torso Luminance Verification:
-            # Veto if one garment is deep pitch black (V < 45) and the other is bright white/light (V > 155)
-            if hsv1 is not None and hsv2 is not None:
-                try:
-                    v1_median = float(np.median(hsv1[:, :, 2]))
-                    v2_median = float(np.median(hsv2[:, :, 2]))
-                    if (v1_median < 45.0 and v2_median > 155.0) or (v2_median < 45.0 and v1_median > 155.0):
-                        if reid_sim < 0.85:
-                            logger.info("Appearance veto: true black vs white conflict (V1=%.1f vs V2=%.1f).", v1_median, v2_median)
-                            return reid_sim, clothing_sim, float(reid_sim * 0.20), False
-                except Exception:
-                    pass
-
-            # HARD VETO: Torso Chromatic Contradiction
-            # Veto if one garment is achromatic / white / gray (S_med <= 16, chroma < 12%)
-            # while the other is clearly chromatic / colored (S_med >= 28, chroma >= 35%) and torso_sim < 0.65
-            if hsv1 is not None and hsv2 is not None:
-                try:
-                    s1_med = float(np.median(hsv1[:, :, 1]))
-                    s2_med = float(np.median(hsv2[:, :, 1]))
-                    chroma1 = np.sum((hsv1[:, :, 1] >= 30) & (hsv1[:, :, 2] >= 35)) / float(hsv1[:, :, 0].size)
-                    chroma2 = np.sum((hsv2[:, :, 1] >= 30) & (hsv2[:, :, 2] >= 35)) / float(hsv2[:, :, 0].size)
-                    chromatic_conflict = (
-                        (s1_med <= 16.0 and chroma1 < 0.12 and s2_med >= 28.0 and chroma2 >= 0.35 and torso_sim < 0.65)
-                        or (s2_med <= 16.0 and chroma2 < 0.12 and s1_med >= 28.0 and chroma1 >= 0.35 and torso_sim < 0.65)
-                    )
-                    if chromatic_conflict and reid_sim < 0.85:
-                        logger.info(
-                            "Appearance veto: torso chromatic conflict (S1=%.1f, chroma1=%.1f%% vs S2=%.1f, chroma2=%.1f%%, torso_sim=%.3f, reid=%.3f).",
-                            s1_med,
-                            chroma1 * 100,
-                            s2_med,
-                            chroma2 * 100,
-                            torso_sim,
-                            reid_sim,
-                        )
-                        return reid_sim, min(clothing_sim, 0.20), float(reid_sim * 0.15), False
-                except Exception:
-                    pass
-
-        # HARD VETO: Inverted Attire Polarity Veto (e.g. Light Top + Dark Pants vs Dark Top + Light Pants)
-        if both_have_legs and hsv1 is not None and hsv2 is not None and hsv_l1 is not None and hsv_l2 is not None:
-            try:
-                v1_torso = float(np.median(hsv1[:, :, 2]))
-                v2_torso = float(np.median(hsv2[:, :, 2]))
-                v1_leg = float(np.median(hsv_l1[:, :, 2]))
-                v2_leg = float(np.median(hsv_l2[:, :, 2]))
-                contrast1 = v1_torso - v1_leg
-                contrast2 = v2_torso - v2_leg
-                inverted_polarity = (
-                    (v1_torso >= 105.0 and v1_leg <= 75.0 and contrast1 >= 30.0 and v2_torso <= 80.0 and v2_leg >= 105.0 and contrast2 <= -25.0)
-                    or (v2_torso >= 105.0 and v2_leg <= 75.0 and contrast2 >= 30.0 and v1_torso <= 80.0 and v1_leg >= 105.0 and contrast1 <= -25.0)
-                )
-                if inverted_polarity and reid_sim < 0.88:
-                    logger.info(
-                        "Appearance veto: inverted attire polarity (contrast1=%.1f, contrast2=%.1f, reid=%.3f).",
-                        contrast1,
-                        contrast2,
-                        reid_sim,
-                    )
-                    return reid_sim, min(clothing_sim, 0.20), float(reid_sim * 0.15), False
-            except Exception:
-                pass
-
-        # HARD VETO: Lower-Body Contradiction Veto (e.g. black trousers vs light blue jeans)
-        if both_have_legs and legs_contradiction and reid_sim < 0.85:
+        # VETO 1: clearly different upper-garment colours (lighting drift between neighbours is allowed).
+        if not cc.tags_compatible(d1.torso, d2.torso) and reid_sim < 0.82:
             logger.info(
-                "Appearance veto: lower-body clothing contradiction (legs_sim=%.3f, reid=%.3f < 0.85).",
-                legs_sim,
-                reid_sim,
+                "Appearance veto: incompatible clothing '%s' vs '%s' (reid=%.3f < 0.82, torso_sim=%.3f).",
+                d1.tag, d2.tag, reid_sim, torso_sim,
             )
-            return reid_sim, clothing_sim, float(reid_sim * 0.20), False
+            return reid_sim, min(clothing_sim, 0.20), float(reid_sim * 0.15), False
 
-        # Multi-Factor Decision:
-        # In single-camera doorway CCTV, static background (door frame, floor tiles)
-        # artificially inflates OSNet embeddings (often 0.70 - 0.85 for any two people).
-        # However, 180-degree turnarounds (front entering vs back exiting) reduce OSNet to 0.58-0.75,
-        # and front accessories (lanyards/badges/collars) reduce torso histogram to 0.15-0.30.
-        if tag_compatible:
-            if both_have_legs:
-                # Branch 1: High Re-ID (>= 0.70) with verified compatible clothing tags (e.g. VIS-1051)
-                if reid_sim >= 0.70 and clothing_sim >= 0.22:
-                    is_match = True
-                    combined = float(0.60 * reid_sim + 0.40 * clothing_sim)
-                # Branch 2: Standard turnaround Re-ID (>= 0.58) with balanced clothing agreement
-                elif reid_sim >= 0.58 and clothing_sim >= 0.25 and (torso_sim >= 0.14 or legs_sim >= 0.25):
-                    is_match = True
-                    combined = float(0.55 * reid_sim + 0.45 * clothing_sim)
-                else:
-                    is_match = False
-                    combined = float(reid_sim * 0.40 + clothing_sim * 0.60)
-            else:
-                # Portrait / partial crops
-                if reid_sim >= 0.68 and torso_sim >= 0.16:
-                    is_match = True
-                    combined = float(0.60 * reid_sim + 0.40 * torso_sim)
-                elif reid_sim >= 0.58 and torso_sim >= 0.22:
-                    is_match = True
-                    combined = float(0.50 * reid_sim + 0.50 * torso_sim)
-                else:
-                    is_match = False
-                    combined = float(reid_sim * 0.40 + clothing_sim * 0.60)
+        # VETO 2: dark trousers vs light trousers/jeans (wall-relative lightness, robust to exposure).
+        # Only on reliably located legs (side-on walkers get knees placed between the legs, sampling the
+        # floor), and never against strong body + shirt agreement (VIS-2026-1041: reid 0.81, torso ~0.9).
+        strong_upper_match = reid_sim >= 0.78 and torso_sim >= 0.85
+        if (both_have_legs and d1.legs_reliable and d2.legs_reliable
+                and reid_sim < 0.85 and not strong_upper_match):
+            l1, l2 = d1.legs.rel_l, d2.legs.rel_l
+            if abs(l1 - l2) >= 0.40 and min(l1, l2) <= 0.35:
+                logger.info(
+                    "Appearance veto: lower-body contradiction (legs rel L %.2f vs %.2f, reid=%.3f < 0.85).",
+                    l1, l2, reid_sim,
+                )
+                return reid_sim, clothing_sim, float(reid_sim * 0.20), False
+
+        # Decision. Validated on Main Gate entry/exit pairs: same-person turnarounds keep reid >= 0.70
+        # with torso_sim >= 0.43 even front-vs-back; strangers in the same colour are left to reid.
+        # No low-reid "clothing agrees" branch: dark tops + jeans are too common here, and a reid 0.62-0.70
+        # branch departed the wrong visitor (VIS-2026-1047 at 12:46, reid 0.685, long vs short sleeves).
+        if reid_sim >= 0.70 and torso_sim >= 0.40:
+            is_match = True
+            combined = float(0.60 * reid_sim + 0.40 * clothing_sim)
         else:
-            # Incompatible color clusters (e.g. Gray vs Black): requires extraordinary Re-ID proof (>= 0.82)
-            # or high clothing correlation, which safely rejects different people in dark attire.
-            if (reid_sim >= 0.82 and clothing_sim >= 0.40) or (reid_sim >= 0.74 and clothing_sim >= 0.60):
-                is_match = True
-                combined = float(0.50 * reid_sim + 0.50 * clothing_sim)
-            else:
-                is_match = False
-                combined = float(reid_sim * 0.40 + clothing_sim * 0.60)
+            is_match = False
+            # Keep non-matches under the backend's 0.48 exit-eligibility bar so the logged score never
+            # reads like a confident match.
+            combined = min(0.45, float(0.40 * reid_sim + 0.60 * clothing_sim))
 
         return reid_sim, clothing_sim, combined, is_match

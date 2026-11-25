@@ -42,6 +42,9 @@ class Settings(BaseSettings):
 
     # Face Embedding & Identity Recovery Settings
     ARCFACE_MODEL_PATH: str = "models/w600k_r50.onnx"
+    # Pose model that locates torso/legs for clothing colour tags and exit appearance matching.
+    # Auto-downloaded on first use if missing; without it a fixed torso box is used (less accurate).
+    CLOTHING_POSE_MODEL_PATH: str = "models/yolo11n-pose.pt"
     FACE_SIMILARITY_THRESHOLD: float = 0.65  # Calibrated operating threshold for ArcFace cosine similarity (>= 0.65)
     VISITOR_REID_THRESHOLD: float = 0.65  # Calibrated biometric threshold for cross-camera visitor re-identification
     FACE_MATCH_MARGIN: float = 0.030  # Minimum difference between Top-1 and Top-2 distinct candidate matches
