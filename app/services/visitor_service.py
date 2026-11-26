@@ -48,6 +48,33 @@ def to_ist(dt: Optional[datetime]) -> Optional[datetime]:
 
 EXIT_DEBUG_DIR = os.path.join("logs", "exit_debug")
 
+# Exit attribution for a person_id/tracker supplied by the edge that is NOT the visitor's own registration
+# track: the edge's face re-ID (single frame, cosine >= 0.55) labelled strangers with "hub" faces, and every
+# such exit checked on 2026-11-26 was the wrong person. A reliable face at this level, or a body is_match,
+# is required before trusting it.
+DIRECT_EXIT_FACE_EVIDENCE = 0.52
+# Body search: the combined score lets clothing outvote Re-ID. When another eligible visitor out-scores the
+# score-winner on Re-ID by this much (and every other eligible one too), trust Re-ID. 2026-11-26 10:56: the
+# true visitor had reid 0.827 vs 0.724, but the wrong one won on clothing (0.761 vs 0.749 combined).
+REID_OVERRIDE_MARGIN = 0.08
+
+_TRACKER_TOKEN_RE = re.compile(r"Tracker #(\d+)")
+
+
+def registration_tracker(notes: Optional[str]) -> Optional[str]:
+    """The tracker that minted the visitor: the first 'Tracker #N' token, written at registration."""
+    m = _TRACKER_TOKEN_RE.search(notes or "")
+    return m.group(1) if m else None
+
+
+def latest_exit_match_pct(notes: Optional[str]) -> Optional[float]:
+    """Score of the most recent exit attached to this visitor (earlier exits may have been re-opened)."""
+    found = re.findall(r"Exit Match:\s*([0-9.]+)\s*%", notes or "")
+    try:
+        return float(found[-1]) if found else None
+    except ValueError:
+        return None
+
 
 def _write_exit_debug(event: dict, exit_crop: Optional[np.ndarray] = None) -> None:
     """Appends one JSON line per exit attempt (and saves the crop of unresolved exits) for diagnosis."""
@@ -228,13 +255,9 @@ class VisitorService:
         # Resolve Entry-Exit matching confidence score for debugging and verification
         exit_match_conf = None
         if exit_avatar_url_res:
-            notes_str = record.notes or ""
-            m_pct = re.search(r"Exit Match:\s*([0-9.]+)\s*%", notes_str)
-            if m_pct:
-                try:
-                    exit_match_conf = round(float(m_pct.group(1)) / 100.0, 3)
-                except Exception:
-                    pass
+            latest_pct = latest_exit_match_pct(record.notes)
+            if latest_pct is not None:
+                exit_match_conf = round(latest_pct / 100.0, 3)
             elif avatar_url_res:
                 try:
                     clean_c1 = avatar_url_res.lstrip("/").split("?")[0]
@@ -404,11 +427,30 @@ class VisitorService:
                 "exit_body_emb": exit_body_emb is not None,
                 "candidates": [],
             }
+
+        # Only a visitor still inside the showroom today may receive an exit. A departed record, or one
+        # from a previous day, picked by person_id would otherwise get its departure time and photo
+        # overwritten (observed: yesterday's visitors closed by today's strangers).
+        direct_trusted = False
+        if record and payload.exit_time:
+            rec_created = to_ist(record.created_at)
+            if (record.is_expired or record.exit_time is not None
+                    or (rec_created is not None and rec_created.date() < datetime.now(IST).date())):
+                dbg["direct_rejected"] = "visitor not inside today"
+                record = None
+            else:
+                # Same continuous track that registered the visitor: the tracker itself is the evidence.
+                direct_trusted = bool(payload.tracker_id) and registration_tracker(record.notes) == str(payload.tracker_id)
+                dbg["direct_trusted"] = direct_trusted
+
+        direct_face_sim: Optional[float] = None
+        direct_body_match = False
         # Verify biometric consistency if candidate record has a stored face embedding and exit photo has a reliable frontal face
         if record and payload.exit_time and exit_face_emb is not None and is_reliable_exit_face:
             cand_emb = record.get_embedding_vector()
             if cand_emb is not None:
                 sim = FaceEmbedder.compute_similarity(exit_face_emb, cand_emb)
+                direct_face_sim = float(sim)
                 dbg["direct_face_sim"] = round(float(sim), 3)
                 if sim < 0.40:
                     logger.warning(
@@ -442,6 +484,7 @@ class VisitorService:
                 )
                 dbg["direct_body"] = {"reid": round(reid_s, 3), "cloth": round(clothing_s, 3),
                                       "score": round(app_score, 3), "is_match": bool(is_match)}
+                direct_body_match = bool(is_match)
                 # Direct continuous track verification: only veto if body/clothing is a proven contradiction (reid < 0.45 and cloth < 0.15)
                 # Front-to-back turnarounds naturally reduce clothing match due to collars/lanyards.
                 if not is_match and (reid_s < 0.45 and clothing_s < 0.15):
@@ -456,6 +499,21 @@ class VisitorService:
                     exit_match_note = None
                 elif exit_match_note is None:
                     exit_match_note = f"Exit Match: {app_score*100:.1f}% (Re-ID: {reid_s*100:.0f}%, Cloth: {clothing_s*100:.0f}%)"
+
+        # An ID the edge supplied from anything other than the registering track (face re-ID, handoff)
+        # must be backed by the exit photo. Without that, fall through to the normal search over everyone
+        # still inside, where this visitor is scored by the same rules as the others (no veto).
+        if (record and payload.exit_time and not direct_trusted and exit_crop_img is not None
+                and not direct_body_match
+                and not (direct_face_sim is not None and direct_face_sim >= DIRECT_EXIT_FACE_EVIDENCE)):
+            logger.info(
+                "Edge-supplied exit ID %s (tracker %s) not supported by the exit photo; searching all active visitors.",
+                record.person_id,
+                payload.tracker_id,
+            )
+            dbg["direct_rejected"] = "no matching evidence for edge-supplied ID"
+            record = None
+            exit_match_note = None
 
         # Fallback for store exit: if tracker ID was reset on 180-deg turnaround (e.g. #2 became #6)
         if not record and payload.exit_time:
@@ -571,6 +629,7 @@ class VisitorService:
                 best_reid_score = 0.0
                 best_color_sim = 0.0
                 second_body_sim = 0.0
+                eligible = []  # (combined score, reid, clothing, candidate) passing is_match/dwell/score
                 all_reids = {}  # person_id -> reid, every candidate scored (for the weak-band margin)
                 weak_band = []  # (reid, clothing, candidate, why) with 0.60 <= reid < 0.70 and clothing backing
                 for active_cand in active_cands:
@@ -642,18 +701,32 @@ class VisitorService:
                             if ok_w:
                                 weak_band.append((float(reid_s), float(clothing_s), active_cand, why_w))
                         if is_match and time_in_store >= 7.0 and app_score >= 0.48:
-                            if app_score > best_body_sim:
-                                second_body_sim = best_body_sim
-                                best_body_sim = app_score
-                                best_color_sim = clothing_s
-                                best_reid_score = reid_s
-                                best_body_match = active_cand
-                            elif app_score > second_body_sim:
-                                second_body_sim = app_score
+                            eligible.append((float(app_score), float(reid_s), float(clothing_s), active_cand))
+
+                reid_override = False
+                if eligible:
+                    best_body_sim, best_reid_score, best_color_sim, best_body_match = max(eligible, key=lambda e: e[0])
+                    second_body_sim = max([e[0] for e in eligible if e[3] is not best_body_match] + [0.0])
+                    # Re-ID override: clothing histograms are weak on this washed-out camera (cream vs olive
+                    # scored 0.82), so a clear Re-ID winner beats a small combined-score lead.
+                    by_reid = max(eligible, key=lambda e: e[1])
+                    other_reids = [e[1] for e in eligible if e[3] is not by_reid[3]]
+                    if (by_reid[3] is not best_body_match
+                            and by_reid[1] - max(other_reids) >= REID_OVERRIDE_MARGIN):
+                        dbg["reid_override"] = {"from": best_body_match.person_id, "from_reid": round(best_reid_score, 3),
+                                                "to": by_reid[3].person_id, "to_reid": round(by_reid[1], 3)}
+                        logger.info(
+                            "Exit Re-ID override: %s (reid %.3f) chosen over combined-score winner %s (reid %.3f).",
+                            by_reid[3].person_id, by_reid[1], best_body_match.person_id, best_reid_score,
+                        )
+                        best_body_sim, best_reid_score, best_color_sim, best_body_match = by_reid
+                        reid_override = True
 
                 # Ambiguity guard: two similarly dressed visitors scoring within 0.03 of each other
                 # cannot be told apart reliably. Leave the exit unattached rather than depart the wrong one.
-                if best_body_match and second_body_sim > 0.0 and (best_body_sim - second_body_sim) < 0.03:
+                # A Re-ID override already proved a clear separation, so it skips this score-based guard.
+                if (best_body_match and not reid_override and second_body_sim > 0.0
+                        and (best_body_sim - second_body_sim) < 0.03):
                     logger.warning(
                         "Ambiguous body exit match for tracker %s: best %s=%.3f vs runner-up=%.3f (margin < 0.03). Suppressed.",
                         payload.tracker_id,
@@ -727,7 +800,9 @@ class VisitorService:
             record.is_waiting = False
             # Persist the direct-path verification score so list_visitors can read it from notes
             # instead of re-running OSNet on both photos for every departed visitor on each poll.
-            if exit_match_note and "Exit Match:" not in (record.notes or ""):
+            # Always record THIS exit's score: a visitor can carry an older one from an exit that was later
+            # re-opened, and readers take the latest (latest_exit_match_pct / VisitorsView).
+            if exit_match_note and exit_match_note not in (record.notes or ""):
                 record.notes = f"{record.notes} | {exit_match_note}" if record.notes else exit_match_note
         if payload.zone_dwell:
             record.zone_dwell = json.dumps(payload.zone_dwell)

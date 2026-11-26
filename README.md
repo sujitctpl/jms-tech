@@ -12,12 +12,12 @@ The platform operates on a high-efficiency **Edge-AI Hybrid Architecture**:
 graph TD
     subgraph Edge Layer [Showroom Edge / Local Machine]
         CCTV["CCTV / IP Cameras (RTSP TCP)"]
-        Detector["Edge AI Engine (local_detector.py)\n• RF-DETR Transformer / YOLO Detection\n• SCRFD / YuNet Face Tracking (Anatomical Validation)\n• ArcFace 512-D Face & OSNet 512-D Body Re-ID\n• Multi-Part 3D HSV Color Histograms\n• ByteTrack / BoT-SORT Tracking\n• Multi-Frame Best-Shot Photo Selection\n• Visitor Zone Dwell & Journey Tracking\n• Directional Entry & Exit Line Crossing\n• Departure Snapshot Capture (exit_avatar_url)\n• Local MJPEG Stream Server\n• Zero-Downtime Hot-Reloading"]
-        SyncQueue["Background Sync Client (Memory Queue)"]
+        Detector["Edge AI Engine (local_detector.py)\n• RF-DETR Transformer / YOLO Detection\n• SCRFD / YuNet Face Tracking (Anatomical Validation)\n• ArcFace 512-D Face & OSNet 512-D Body Re-ID\n• Pose-Located Garment Colour & Soft Lab Histograms\n• ByteTrack / BoT-SORT Tracking\n• Multi-Frame Best-Shot Photo Selection\n• Visitor Zone Dwell & Journey Tracking\n• Directional Entry & Exit Line Crossing\n• Departure Snapshot Capture (exit_avatar_url)\n• Local MJPEG Stream Server\n• Zero-Downtime Hot-Reloading"]
+        SyncQueue["Background Sync Client (DashboardSyncClient)\n• Crash-Resilient In-Order FIFO Queue\n• Backend Auto-Reconnect & Retry"]
     end
 
     subgraph Backend Layer [FastAPI & Express Backend]
-        API["FastAPI Analytics Backend (:8000)\n• Dynamic Camera Configuration & Stream Probing\n• Footfall Analytics & Real-Time Telemetry\n• Dual-Factor Visitor Ingestion & Zone Updates\n• Departure Verification & Biometric Exit Check\n• Dynamic Department Management\n• Employee Registration & Attendance\n• Biometric Rolling Retention Worker"]
+        API["FastAPI Analytics Backend (:8000)\n• Dynamic Camera Configuration & Stream Probing\n• Footfall Analytics & Real-Time Telemetry\n• Dual-Factor Visitor Ingestion & Zone Updates\n• Departure Verification & Weak Re-ID Band Matching\n• Dynamic Department Management\n• Employee Registration & Attendance\n• Biometric Rolling Retention Worker"]
         AuthSrv["Express Auth Server (:5000)\n• User & Admin Authentication\n• PostgreSQL Session Pool"]
         DB[("PostgreSQL Database (:5432)\n• cameras & departments\n• employees & employee_attendance\n• person_identities (pgvector 512 face + 512 body Re-ID)\n• visitor_tracks & footfall_events")]
     end
@@ -65,7 +65,13 @@ Detailed architectural flows, mathematical models, and sequence diagrams are doc
   - **Pose-Located Clothing Colour** (`app/vision/clothing_color.py`): a YOLO pose model (`models/yolo11n-pose.pt`, auto-downloaded) finds the shoulder→hip torso and the hip→ankle legs, so samples exclude the head, arms and doorway wall. Colours are white-balanced against the wall and measured in CIE Lab with lightness *relative to the wall*, so a shirt reads the same lit and in shadow. Clothing similarity is the Bhattacharyya overlap of soft Lab histograms: $0.65 	imes \text{torso} + 0.35 	imes \text{legs}$.
   - **Clothing Vetoes**: incompatible upper-garment colours (lighting neighbours such as Gray↔White/Cream/Green are allowed; patterned tops are compatible with neutrals) unless $\text{ReID} \ge 0.82$; dark vs light trousers (relative lightness gap $\ge 0.40$) unless $\text{ReID} \ge 0.85$.
   - **Appearance Verification (`verify_appearance`)**: match only when $\text{ReID} \ge 0.70$ and torso similarity $\ge 0.40$; there is no low-ReID branch, because similar dark outfits caused wrong departures. See `flow.md` for the full rules.
+  - **Weak Re-ID Band ($0.60 \le \text{ReID} < 0.70$) & Sleeve-Aware Departure Resolver**: In `visitor_service.update_visitor_zone`, departures that do not meet the primary $\ge 0.70$ threshold (e.g. frontal ingress vs overhead back-of-head egress) are resolved using weak-band verification: requires $\text{torso\_sim} \ge 0.80$, compatible color tags, sleeve length agreement (short = skin-toned forearms vs long = fabric sleeves), trouser agreement, and a $\ge 0.08$ score gap over every other active visitor (or $0.50$ stranger baseline). Non-matches are capped at $0.45$, safely below the $0.48$ exit eligibility threshold.
   - **15-Minute Ingress Turnaround Re-ID**: Automatically re-identifies showroom visitors who entered within the last 15 minutes and turned around or whose tracker IDs flipped under overhead CCTV occlusion. Requires a passing `verify_appearance` plus ($\text{ReID} \ge 0.65$ and $\text{clothing} \ge 0.28$) or $\text{ReID} \ge 0.74$, without requiring frontal facial biometrics.
+- **Crash-Resilient Edge Event Delivery (`DashboardSyncClient`)**:
+  - **Restart-Proof FIFO Sync Queue**: Detects when the FastAPI backend is temporarily down or reloading (e.g., `uvicorn --reload` or network disruption) and preserves critical visitor ingress (`/visitors/detect`) and departure (`/visitors/update-zone`) events in an in-memory queue.
+  - **Strict In-Order Retry**: Queued events are dispatched in strict chronological order upon reconnect without dropping visitor records or corrupting session sequences.
+  - **Smart Error Classification (`_is_unreachable_error`)**: Classifies connection errors (e.g. `ConnectionRefusedError`, `WinError 10061`) to trigger backoff retries, while standard HTTP client/server responses (400, 404, 500) are handled without redundant retry loops.
+  - **Selective Heartbeat Dropping**: Non-critical runtime telemetry (heartbeats and frame FPS) is dropped during outages to prevent queue backlog from starving critical visitor data upon reconnect.
 - **Biometric Face Recognition & Staff vs. Visitor Segregation**:
   - Neural face detection via **SCRFD** (`scrfd_2.5g_bnkps.onnx`) or **YuNet** with anatomical bounding box validation (aspect ratio $0.45$–$1.55$, vertical center $c_y \le 0.50 \cdot h$ on standing crops, eliminating false triggers on floor items, shoes, and dustbins).
   - **ArcFace** (`w600k_r50.onnx`) 512-dimensional feature embedding extraction.
@@ -78,8 +84,13 @@ Detailed architectural flows, mathematical models, and sequence diagrams are doc
   - **CLAHE Backlight Compensation**: Corrects severe silhouettes caused by sunny showroom glass facades via adaptive histogram equalization on the LAB luminance channel.
   - **Automatic Clothing Appearance Tagging**: Pose-located torso colour generates human-readable attire badges (e.g. *Blue / Navy Top*, *White / Light Shirt*, *Green / Olive Top*, *Checked / Patterned Shirt*).
   - **High-Resolution Departure Snapshot (`exit_avatar_url`) & Turnaround Departure Forwarding**: Grabs an un-annotated high-resolution exit crop when visitors cross the entrance line in reverse (after dwell $\ge 7.0$s). If a visitor was assigned a fresh turnaround track ID ($< 7.0$s), it is forwarded to the backend appearance engine so active showroom visitors are properly departed.
+  - **Exact Tracker Token Lookup & Edge Exclusion Propagation**: Resolves `tracker_id` with strict regex word boundaries against `Tracker #N` notes, ensuring `Tracker #4` never mistakenly matches `Tracker #42`. If the edge detector's exit face contradicts the local track ($< 0.40$), it drops local fallback and transmits `exclude_person_id` to prevent the backend from incorrectly re-attaching that candidate.
+  - **Evidence-Gated Edge Exit IDs**: An exit only attaches to a visitor still inside today (not departed, not from a previous day). A `person_id` / tracker sent by the edge is trusted outright only when it is the visitor's own registration tracker (the first `Tracker #N` in notes). Any other edge-supplied ID (face re-ID, handoff) needs the exit photo to back it (body `is_match` or reliable face $\ge 0.52$); otherwise the exit goes to the normal search over all active visitors.
+  - **Re-ID Override in Body Search**: Candidates rank by combined score, but an eligible visitor whose Re-ID beats every other eligible one by $\ge 0.08$ wins (clothing histograms are weak on the washed-out doorway camera).
+  - **Stale Prior-Day Visit Auto-Closure**: Visitors with unclosed visits from previous calendar days are automatically marked as `"Timed out"` (`is_expired = True`) before matching today's exits, eliminating false departure attachments to legacy records.
+  - **Safe Collision-Resistant Visitor ID Minting**: Sequential count-based ID minting (`VIS-2026-XXXX`) performs database uniqueness collision checks (`_mint_person_id`) to prevent silent ID collisions and record overwrites.
   - **Reliable Exit Face Biometric Gating**: Requires minimum eye distance ($eye\_d \ge 16.0\text{ px}$) and face width ($w \ge 42\text{ px}$) before face biometrics can veto an exit crop, preventing blurry or side-profile departure frames from rejecting valid departures.
-  - **Entry-Exit Match Confidence (`exitMatchConfidence`) & Verification Badge**: Calculates verified match confidence (e.g. `82%`) and surfaces an interactive **`ENTRY-EXIT MATCH [XX]%`** pill with live status pulses on visitor cards.
+  - **Entry-Exit Match Confidence (`exitMatchConfidence`) & Verification Badge**: Calculates verified match confidence (e.g. `82%`), persists `Exit Match: XX% (...)` in visitor notes for every attached exit (readers use the latest one) for instantaneous retrieval without re-computing embeddings on every poll, and surfaces an interactive **`ENTRY-EXIT MATCH [XX]%`** pill with live status pulses on visitor cards.
   - **Dual-Photo Lightbox UX**: Visitor cards display an intuitive **"+1 Exit Image"** badge, with interactive Entry Snapshot vs Departure Snapshot toggle tabs in `VisitorsView.tsx`, an AI matching & verification debug breakdown card, Escape key dismissal, click-outside modal close, and sticky scrollable headers.
 - **Real-Time Visitor Journey & Zone Dwell Tracking**:
   - **`VisitorZoneTracker` & Dual Line Crossing**: Continuously tracks customer movement and accumulates dwell time across custom departments (e.g. Sales Section, Luxury Lounge, Diamond Counter) and the general showroom floor (`Main Showroom`).
@@ -144,7 +155,7 @@ Detailed architectural flows, mathematical models, and sequence diagrams are doc
 | Component | Technologies |
 |---|---|
 | **Edge AI Engine** | Python 3.11+, Roboflow RF-DETR, Ultralytics YOLO, ByteTrack, BoT-SORT, OpenCV, ONNX Runtime, NumPy |
-| **Biometrics & Vision** | InsightFace ArcFace (512-D), OSNet Full-Body Re-ID (512-D), SCRFD, YuNet Face Detector, 3D HSV Color Histograms, pgvector / Cosine Similarity |
+| **Biometrics & Vision** | InsightFace ArcFace (512-D), OSNet Full-Body Re-ID (512-D), YOLO Pose (YOLO11n-Pose), SCRFD, YuNet Face Detector, CIE Lab Relative Lightness & Soft Histograms, 3D HSV Color Histograms, pgvector / Cosine Similarity |
 | **Backend API** | FastAPI, SQLAlchemy 2.x, Alembic, Pydantic v2, PostgreSQL (`psycopg` 3), `pgvector` |
 | **Auth Service** | Node.js, Express 5, TypeScript (`tsx`), `pg`, bcryptjs |
 | **Frontend Web** | React 19, TypeScript, Vite, Tailwind CSS v4, Recharts, Lucide Icons |
@@ -232,8 +243,14 @@ jms/
 │   ├── test_cross_camera_tracker.py     # Cross-camera tracking & re-ID tests
 │   ├── test_returning_visitor.py        # Returning visitor recognition tests
 │   ├── test_identity_and_retention.py   # Rolling retention & biometric purge tests
-│   └── test_entry_exit_fixes.py         # Exit matching, visitor ID minting & body-only retention regressions
+│   ├── test_entry_exit_fixes.py         # Exit matching, visitor ID minting & body-only retention regressions
+│   ├── test_exit_attribution.py         # Evidence-gated edge exit IDs, Re-ID override, latest exit score
+│   ├── test_clothing_color.py           # Pose-located garment extraction, CIE Lab soft histograms & sleeves
+│   ├── test_sync_retry.py               # Crash-resilient DashboardSyncClient FIFO retry & reconnect tests
+│   ├── test_entry_counter.py            # Directional line crossing geometry & duplicate prevention
+│   └── test_vision.py                   # Model wrapper, detector & tracker integration tests
 ├── .cross_camera_state.json             # Cross-camera persistent state registry
+├── CLAUDE.md                            # Claude Code project guidelines and operational notes
 ├── alembic/                             # Database migration scripts
 ├── local_detector.py                    # Standalone Local Edge AI Video Processing Engine
 ├── start_detector.bat                   # 1-Click Windows Batch Launcher for Single-Camera Detector
@@ -598,6 +615,18 @@ pytest tests/test_returning_visitor.py -v
 
 # Run Biometric Retention & Purge test
 pytest tests/test_identity_and_retention.py -v
+
+# Run Entry/Exit fixes & Body-only Retention test
+pytest tests/test_entry_exit_fixes.py -v
+
+# Run Clothing Color, Pose & Garment Similarity test
+pytest tests/test_clothing_color.py -v
+
+# Run Edge Sync Reconnection & FIFO Retry test
+pytest tests/test_sync_retry.py -v
+
+# Run Directional Entry Line Counter test
+pytest tests/test_entry_counter.py -v
 ```
 
 ---

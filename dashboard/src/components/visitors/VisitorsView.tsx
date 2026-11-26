@@ -58,7 +58,9 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
     const entryScore = inspectedVisitor.confidenceScore ? Math.round(inspectedVisitor.confidenceScore * 100) : 96;
 
     const notesStr = inspectedVisitor.notes || '';
-    const matchMatch = notesStr.match(/Exit Match:\s*([0-9.]+)\s*%(?:\s*\(([^)]+)\))?/i);
+    // Use the latest exit score: older ones belong to exits that were later re-opened.
+    const exitMatches = [...notesStr.matchAll(/Exit Match:\s*([0-9.]+)\s*%(?:\s*\(([^)]+)\))?/gi)];
+    const matchMatch = exitMatches.length ? exitMatches[exitMatches.length - 1] : null;
 
     let exitScore = 88;
     let breakdown = '';

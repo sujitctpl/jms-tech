@@ -18,7 +18,7 @@ graph TD
             Detector["Person Detector\n• Roboflow RF-DETR (v2)\n• Ultralytics YOLO26s (v1)\n• RTMDet (ONNX)"]
             FaceDet["Face Detector\n• SCRFD (2.5G ONNX)\n• OpenCV YuNet (Anatomical Validation)"]
             Embedder["Biometric Face Extractor\n• ArcFace ResNet50 (512-D)\n• Calibrated Cosine Operating Thresh (>= 0.65)\n• Landmark Affine Alignment"]
-            BodyEmbedder["Body Re-ID & Appearance\n• OSNet Feature Extractor (512-D)\n• Adaptive Salient Torso & Legs Patches\n• Multi-Part 3D HSV Histograms (512 bins)\n• Inverted Polarity & Lower-Body Hard Vetoes\n• Multi-Factor Appearance Verification"]
+            BodyEmbedder["Body Re-ID & Appearance\n• OSNet Feature Extractor (512-D)\n• Pose-Located Torso & Legs (YOLO Pose)\n• Wall White-Balance & Relative Lightness\n• CIE Lab Soft Histograms & Sleeve Check\n• Multi-Factor Appearance Verification"]
             Tracker["Multi-Object Tracker\n• ByteTrack (bytetrack.yaml)\n• BoT-SORT + GMC (botsort.yaml)\n• Fallback Kalman Tracker"]
             Handoff["Spatial-Temporal Handoff Tracker\n• 25s Multi-Cue Coasting Pool\n• Torso HSV Color Correlation\n• Unbroken Waiting Timers"]
             StaffClassifier["Employee vs Visitor Classifier\n• Cosine Similarity (thresh = 0.65)\n• Temporal Voting Buffer (win = 5)"]
@@ -30,11 +30,11 @@ graph TD
             HotReload["Config Hot-Reloader\n(Watches camera_config.json mtime)"]
         end
         
-        SyncQueue["Background Sync Client\n(Non-blocking Memory Queue)"]
+        SyncQueue["Background Sync Client (DashboardSyncClient)\n• Crash-Resilient In-Order FIFO Queue\n• Backend Auto-Reconnect & Retry"]
     end
 
     subgraph Central Backend [FastAPI & Express Backend]
-        API["FastAPI Backend (:8000)\n• /api/v1/cameras (Config, CRUD, Stream Testing)\n• /api/v1/visitors (Detect, Tag, Dwell, Walk-In)\n• /api/v1/departments (Dynamic CRUD)\n• /api/v1/employees (Profiles, Photos, Gallery)\n• /api/v1/attendance (Punch & Daily Report)\n• /api/v1/analytics (Footfall & Heatmaps)\n• /api/v1/identity (Retention & Cleanup)"]
+        API["FastAPI Backend (:8000)\n• /api/v1/cameras (Config, CRUD, Stream Testing)\n• /api/v1/visitors (Detect, Tag, Dwell, Weak-Band Exit)\n• /api/v1/departments (Dynamic CRUD)\n• /api/v1/employees (Profiles, Photos, Gallery)\n• /api/v1/attendance (Punch & Daily Report)\n• /api/v1/analytics (Footfall & Heatmaps)\n• /api/v1/identity (Retention & Cleanup)"]
         RetentionWorker["Scheduled Retention Worker\n(7-Day Rolling Biometric Purge\n& Physical Snapshot Cleanup)"]
         AuthSrv["Express Auth Server (:5000)\n• /api/auth/login & /register\n• Admin Role-Based Access"]
         ServerWorker["Optional Server VideoWorker\n(app/workers/video_worker.py)"]
@@ -155,6 +155,22 @@ In overhead showroom CCTV feeds, visitors frequently turn 180° away from the en
    - **Match** only if $\text{reid} \ge 0.70 \land \text{torso\_sim} \ge 0.40$ (score $0.6\,\text{reid} + 0.4\,\text{clothing}$). There is deliberately no low-reid branch: dark tops with jeans are too common, and a reid 0.62-0.70 \"clothing agrees\" branch departed the wrong visitor (a long-sleeve shirt matched to a short-sleeve tee). A missed exit is preferred to a wrong one.
    - **Weak Re-ID band (backend exit resolver, `visitor_service.update_visitor_zone`)**: front-in vs side/back-out views of the same person often score $0.60 \le \text{reid} < 0.70$. When no candidate passes the main rule, the top band candidate is accepted only if (a) $\text{torso\_sim} \ge 0.80$, colours are compatible, sleeves (short = warm skin-coloured forearms, long = fabric) do not contradict, and reliable trousers do not contradict (`clothing_color.weak_reid_support`); and (b) its reid beats every other in-store visitor by $\ge 0.08$ (with a single visitor, against a stranger baseline of 0.50). Logged in `exit_debug_backend.jsonl` under `weak_band`. Non-matches are capped at 0.45, below the backend's 0.48 exit-eligibility bar.
    - Known limit: two different people in the same plain colours (white shirt + dark trousers) are only separated by reid.
+
+### 2.6 Edge Sync Queue with Crash-Resilient Reconnection (`DashboardSyncClient`)
+Edge-to-backend communication operates over HTTP REST, but physical deployments encounter transient network disruptions, backend server reloads (`uvicorn --reload`), or process restarts. Under naive sync queues, dropped requests result in missed footfall counts, lost visitor portraits, or unclosed visitor sessions. 
+
+The edge detector employs `DashboardSyncClient` with a resilient in-memory retry mechanism:
+1. **Dedicated Worker Thread**: A background daemon thread drains an internal FIFO `queue.Queue`, decoupling high-FPS OpenCV video decoding from network I/O.
+2. **Error Classification (`_is_unreachable_error`)**:
+   - Analyzes low-level socket and URL errors (e.g. `ConnectionRefusedError`, `[WinError 10061] No connection could be made because the target machine actively refused it`, or transient network dropouts).
+   - If the backend is unreachable, the failed event is preserved at the front of the queue, and the worker enters an exponential backoff loop ($1.0\text{s} \to 2.0\text{s} \to 4.0\text{s}$, capped at $10.0\text{s}$).
+3. **Strict In-Order Delivery**:
+   - Critical visitor lifecycle events (`/api/v1/visitors/detect` for ingress creation followed by `/api/v1/visitors/update-zone` for departure/dwell) are guaranteed to arrive in exact chronological sequence once connectivity is restored.
+   - When a visitor enters during a backend reload, the registration payload is held and immediately mints the persistent ID (e.g. `VIS-2026-1099`) as soon as the server wakes, invoking `on_visitor_registered_callback`.
+4. **Selective Telemetry Dropping**:
+   - While critical ingress and egress events are held indefinitely, high-frequency non-critical heartbeats (`send_heartbeat`) are immediately dropped during outages. This prevents stale status telemetry from clogging the pipe or starving visitor registration on reconnect.
+5. **No Redundant 4xx/5xx Retries**:
+   - Standard HTTP client/server responses (such as `404 Not Found` when attempting an exit on an already-departed visitor, or `400 Bad Request`) are treated as authoritative backend answers and are not retried, avoiding infinite poison-pill loops.
 
 ---
 
@@ -337,7 +353,8 @@ When a visitor completes their visit and crosses the entrance line in reverse:
   - In `local_detector.py`: Inter-ocular distance $eye\_d \ge 16.0\text{ px}$ and face crop width $w \ge 42\text{ px}$.
   - In `VisitorService`: Inter-ocular distance $eye\_d \ge 16.0\text{ px}$ and face crop width $w \ge 28\text{ px}$.
   - Face similarity rejection threshold is calibrated to $< 0.40$. If exit face is angled or non-frontal, biometric veto is bypassed and identity is resolved via deep body Re-ID and appearance matching.
-* **Entry-Exit Match Confidence Reporting (`exitMatchConfidence`)**: The backend parses matching confidence from record notes (e.g. `Exit Match: 82.5%`) or computes live verification score using `BodyEmbedder.verify_appearance(entry_crop, exit_crop)`, exposing `exitMatchConfidence` (e.g. `0.825`) in `VisitorResponse`.
+* **Edge-Supplied Exit IDs Need Evidence**: An exit only attaches to a visitor still inside today. A `person_id` / tracker from the edge is trusted outright only when it equals the visitor's registration tracker (first `Tracker #N` in notes). Otherwise the exit photo must back it (body `is_match` or reliable face $\ge 0.52$), or the exit falls through to the search over all active visitors. In that search, an eligible visitor whose OSNet Re-ID beats every other eligible one by $\ge 0.08$ wins over the combined-score leader.
+* **Entry-Exit Match Confidence Reporting (`exitMatchConfidence`)**: The backend parses matching confidence from the latest `Exit Match: XX%` in record notes (e.g. `Exit Match: 82.5%`) or computes live verification score using `BodyEmbedder.verify_appearance(entry_crop, exit_crop)`, exposing `exitMatchConfidence` (e.g. `0.825`) in `VisitorResponse`.
 * **Storage & Persistence**: Saved to `static/uploads/visitors/` as `VIS-..._exit_<timestamp>.jpg` and stored in `person_identities.exit_avatar_url`.
 * **Dashboard Dual-Photo Lightbox UX (`VisitorsView.tsx` & `OverviewView.tsx`)**:
   - Visitor cards display a **"+1 Exit Image"** pill.
@@ -437,6 +454,14 @@ sequenceDiagram
   - Any candidate whose reliable face contradicts the exit face ($< 0.40$, or $< 0.38$ on the body path) is vetoed, as is any `exclude_person_id` sent by the edge.
 * **Exact Tracker Lookup**: When the payload has no `person_id`, the backend resolves `tracker_id` against the `Tracker #N` note with an exact token match (`Tracker #4` never matches `Tracker #42`).
 * **Edge Face-Contradiction Exclusion**: If the exit face contradicts the local session ($< 0.40$), the edge drops that visitor (it no longer falls back to the track's own `person_id`) and sends `exclude_person_id` so the backend cannot re-select it.
+* **Weak Re-ID Band ($0.60 \le \text{ReID} < 0.70$) Departure Resolver**:
+  - When no candidate passes the primary appearance verification threshold ($\text{ReID} \ge 0.70 \land \text{torso\_sim} \ge 0.40$), the top candidate in the weak Re-ID band ($0.60 \le \text{ReID} < 0.70$) is evaluated.
+  - Requires `clothing_color.weak_reid_support`: $\text{torso\_sim} \ge 0.80$, compatible attire tags, sleeve consistency (short skin-toned forearms vs long fabric sleeves), and trouser agreement.
+  - Requires candidate to beat every other active showroom visitor by $\ge 0.08$ (or beat stranger baseline $0.50$ for solitary visitors).
+  - Unmatched scores are capped at $0.45$, safely beneath the backend's $0.48$ exit eligibility threshold.
+* **Safe Collision-Resistant Visitor ID Minting**:
+  - `VisitorService._mint_person_id()` uses atomic count-based generation (`VIS-2026-XXXX`) with rigorous database uniqueness checks.
+  - Guarantees that even if visitor rows are deleted or concurrent transactions run, new visitors never overwrite existing active identities.
 * **Persisted Match Score**: Direct-path departures write `Exit Match: XX% (...)` to notes, so `exitMatchConfidence` is read from notes instead of recomputing OSNet on every dashboard poll.
 * **Indian Standard Time (IST) Clock**: When reverse crossing is confirmed, the departure timestamp is calculated in `Asia/Kolkata` time (`UTC+05:30`) and recorded:
   ```python
@@ -893,10 +918,11 @@ erDiagram
                                                 ├─► Multi-Frame Best-Shot Quality Scoring (Laplacian + Pose)
                                                 ├─► Expanded Bust Framing (Hair + Collar + Upper Chest)
                                                 ├─► CLAHE Backlight Compensation (Shadow lifting)
-                                                ├─► Torso HSV Attire Extraction (e.g. "Blue / Navy Top")
+                                                ├─► Pose-Located Attire & Soft Lab Histograms (YOLO Pose + CIE Lab)
                                                 ├─► High-DPI Snapshot Dispatch (@ 320x320 Q95) to /visitors/detect
                                                 ├─► Progressive Upgrade & Occlusion Recovery (3.5s window, ar >= 0.32)
-                                                ├─► Non-blocking HTTP POST to /visitors/detect & /footfall
+                                                ├─► Crash-Resilient Sync: DashboardSyncClient FIFO Queue (Retry on reload/drop)
+                                                ├─► Sequential Collision-Safe Visitor ID Minting (_mint_person_id)
                                                 │
                                                 ├─► Store Interior: Real-time department dwell accumulation
                                                 │   └─► Periodic HTTP POST to /visitors/update-zone (every 4s)
@@ -916,7 +942,9 @@ erDiagram
                                                     ├─► Turnaround Track Departure Forwarding (< 7s fresh tracks)
                                                     ├─► Grab high-DPI departure portrait crop (exit_avatar_url)
                                                     ├─► Reliable Face Biometrics (eye_d >= 16px, w >= 42px) & Appearance Check
-                                                    ├─► Inverted Attire Polarity & Lower-Body Contradiction Vetoes
+                                                    ├─► Weak Re-ID Band ($0.60 <= ReID < 0.70) & Sleeve Consistency Check
+                                                    ├─► Exact Tracker Token Lookup & Edge Exclusion Propagation
+                                                    ├─► Auto-close Stale Prior-Day Unclosed Visits ("Timed out")
                                                     ├─► Resolve Entry-Exit Match Confidence (exitMatchConfidence)
                                                     └─► HTTP POST to /visitors/update-zone (exit_time in IST)
 ```
