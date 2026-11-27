@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, List, Optional
 import numpy as np
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Boolean, DateTime, Integer, String, func
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import Uuid
 from app.db.base import Base
@@ -59,6 +59,8 @@ class PersonIdentity(Base):
     camera_source: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     exit_time: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     zone_dwell: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    # JSON list of {"in": iso, "out": iso|null} entry/exit segments (one per showroom entry).
+    visit_log: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     waiting_seconds: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     is_waiting: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     waiting_breach: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

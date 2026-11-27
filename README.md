@@ -12,8 +12,8 @@ The platform operates on a high-efficiency **Edge-AI Hybrid Architecture**:
 graph TD
     subgraph Edge Layer [Showroom Edge / Local Machine]
         CCTV["CCTV / IP Cameras (RTSP TCP)"]
-        Detector["Edge AI Engine (local_detector.py)\n• RF-DETR Transformer / YOLO Detection\n• SCRFD / YuNet Face Tracking (Anatomical Validation)\n• ArcFace 512-D Face & OSNet 512-D Body Re-ID\n• Pose-Located Garment Colour & Soft Lab Histograms\n• ByteTrack / BoT-SORT Tracking\n• Multi-Frame Best-Shot Photo Selection\n• Visitor Zone Dwell & Journey Tracking\n• Directional Entry & Exit Line Crossing\n• Departure Snapshot Capture (exit_avatar_url)\n• Local MJPEG Stream Server\n• Zero-Downtime Hot-Reloading"]
-        SyncQueue["Background Sync Client (DashboardSyncClient)\n• Crash-Resilient In-Order FIFO Queue\n• Backend Auto-Reconnect & Retry"]
+        Detector["Edge AI Engine (local_detector.py)\n• RF-DETR Transformer / YOLO Detection\n• SCRFD / YuNet Face Tracking (Anatomical Validation)\n• ArcFace 512-D Face & OSNet 512-D Body Re-ID\n• Pose-Located Garment Colour & Soft Lab Histograms\n• ByteTrack / BoT-SORT Tracking\n• Multi-Frame Best-Shot Photo Selection\n• Visitor Zone Dwell & Journey Tracking\n• Directional Entry & Exit Line Crossing\n• Departure Snapshot Capture (exit_avatar_url)\n• Local OpenCV Preview Window\n• Zero-Downtime Hot-Reloading"]
+        SyncQueue["Background Sync Client (DashboardSyncClient)\n• In-Order FIFO Queue\n• Retry While Backend Unreachable (≤ 180 s)"]
     end
 
     subgraph Backend Layer [FastAPI & Express Backend]
@@ -23,7 +23,7 @@ graph TD
     end
 
     subgraph Client Layer [Modern Web UI]
-        Dashboard["React 19 Dashboard (:5173)\n• Live CCTV Preview & AI Overlays\n• Dynamic Camera & AI Settings Panel\n• Visit Purpose Tagging & High-Res Lightbox\n• Dual Entry vs Departure Photo Review\n• 1-Click Bounced Visitor Removal\n• Real-Time Zone Dwell & Customer Journey\n• Staff Attendance & Daily Rolls\n• Section Dwell Time & Exportable Reports"]
+        Dashboard["React 19 Dashboard (:5173)\n• Dynamic Camera & AI Settings Panel\n• Visit Purpose Tagging & High-Res Lightbox\n• Dual Entry vs Departure Photo Review\n• 1-Click Bounced Visitor Removal\n• Real-Time Zone Dwell & Customer Journey\n• Staff Attendance & Daily Rolls\n• Section Dwell Time & Exportable Reports"]
     end
 
     CCTV -->|RTSP TCP Stream| Detector
@@ -33,8 +33,9 @@ graph TD
     AuthSrv --> DB
     Dashboard -->|Analytics, Cameras, Visitors & Staff| API
     Dashboard -->|Auth| AuthSrv
-    Dashboard -.->|MJPEG Live Stream| Detector
 ```
+
+> **Live preview:** browser live preview is currently disabled. `GET /api/v1/cameras/{id}/frame` and `/stream` return `410 Gone`, and the edge detector has no stream server. Annotated video is shown only in the detector's local OpenCV window (omit `--headless`).
 
 Detailed architectural flows, mathematical models, and sequence diagrams are documented in [flow.md](file:///c:/Users/capermint/Desktop/Abhishek/jms/flow.md). Full configuration reference is in [config.md](file:///c:/Users/capermint/Desktop/Abhishek/jms/config.md).
 
@@ -55,7 +56,8 @@ Detailed architectural flows, mathematical models, and sequence diagrams are doc
 - **Entry-Line Gated Ingress, 7s Dwell Bounce Filter & Ghost Elimination**:
   - **Strict Entry-Line Gating**: Walk-in visitor creation, footfall counts, waiting timers, and photo capture are strictly gated by directional virtual entry-line crossing.
   - **7-Second Dwell Threshold (Bounce Filter)**: When a person crosses the entry line, the system waits for $\ge 7.0$ seconds of showroom dwell before confirming the visitor and incrementing footfall. If someone turns around or leaves in under 7 seconds (e.g. delivery persons, wrong-store turnarounds, or pacing near the doorway), the entry is discarded with zero ghost records.
-  - **Reverse Line Departure & Staff Checkout**: Crossing the line in reverse triggers departure logging only after $\ge 7.0$ seconds of stay, and automatically logs `CHECK_OUT` attendance punches for recognized showroom employees.
+  - **Reverse Line Departure & Staff Checkout**: Crossing the line in reverse triggers departure logging only after $\ge 7.0$ seconds of stay, and automatically logs `CHECK_OUT` attendance punches for recognized showroom employees. Edge punches for the same employee are deduplicated within 300 s (`CHECK_IN` and `CHECK_OUT` separately).
+  - **Pending Bounce Cancellation**: A reverse crossing while the entry is still pending (under 7 s) cancels the entry locally. No backend delete is sent: no record exists yet, and any `person_id` on that track belongs to an existing visitor re-identified by face.
   - **Ghost Visitor Suppression**: Persons visible in camera view who have not crossed the entry line are marked as *Unconfirmed* with a neutral slate border `(180, 180, 180)` and tracker ID only, completely preventing transient passersby, outdoor foot traffic, or glass facade reflections from skewing visitor analytics.
   - **Interior Camera Guard**: Non-entrance cameras (`is_entrance: false`) suppress minting new walk-ins (`IGNORED_INTERIOR`) unless verified via cross-camera biometric matching against an entered visitor.
 - **Dual-Factor Re-Identification & Deep Body Embedding (`BodyEmbedder`)**:
@@ -67,11 +69,11 @@ Detailed architectural flows, mathematical models, and sequence diagrams are doc
   - **Appearance Verification (`verify_appearance`)**: match only when $\text{ReID} \ge 0.70$ and torso similarity $\ge 0.40$; there is no low-ReID branch, because similar dark outfits caused wrong departures. See `flow.md` for the full rules.
   - **Weak Re-ID Band ($0.60 \le \text{ReID} < 0.70$) & Sleeve-Aware Departure Resolver**: In `visitor_service.update_visitor_zone`, departures that do not meet the primary $\ge 0.70$ threshold (e.g. frontal ingress vs overhead back-of-head egress) are resolved using weak-band verification: requires $\text{torso\_sim} \ge 0.80$, compatible color tags, sleeve length agreement (short = skin-toned forearms vs long = fabric sleeves), trouser agreement, and a $\ge 0.08$ score gap over every other active visitor (or $0.50$ stranger baseline). Non-matches are capped at $0.45$, safely below the $0.48$ exit eligibility threshold.
   - **15-Minute Ingress Turnaround Re-ID**: Automatically re-identifies showroom visitors who entered within the last 15 minutes and turned around or whose tracker IDs flipped under overhead CCTV occlusion. Requires a passing `verify_appearance` plus ($\text{ReID} \ge 0.65$ and $\text{clothing} \ge 0.28$) or $\text{ReID} \ge 0.74$, without requiring frontal facial biometrics.
-- **Crash-Resilient Edge Event Delivery (`DashboardSyncClient`)**:
-  - **Restart-Proof FIFO Sync Queue**: Detects when the FastAPI backend is temporarily down or reloading (e.g., `uvicorn --reload` or network disruption) and preserves critical visitor ingress (`/visitors/detect`) and departure (`/visitors/update-zone`) events in an in-memory queue.
-  - **Strict In-Order Retry**: Queued events are dispatched in strict chronological order upon reconnect without dropping visitor records or corrupting session sequences.
-  - **Smart Error Classification (`_is_unreachable_error`)**: Classifies connection errors (e.g. `ConnectionRefusedError`, `WinError 10061`) to trigger backoff retries, while standard HTTP client/server responses (400, 404, 500) are handled without redundant retry loops.
-  - **Selective Heartbeat Dropping**: Non-critical runtime telemetry (heartbeats and frame FPS) is dropped during outages to prevent queue backlog from starving critical visitor data upon reconnect.
+- **Edge Event Delivery with Reconnect Retry (`DashboardSyncClient`)**:
+  - **In-Memory FIFO Queue**: One worker thread drains a `queue.Queue(maxsize=1000)`. Events that arrive while the queue is full are dropped.
+  - **In-Order Retry While Unreachable**: footfall entries, section entries, employee punches, `/visitors/detect`, `/visitors/update-zone` and visitor deletes are retried in place when the backend is unreachable (e.g. during `uvicorn --reload`). Backoff runs 1 s → 2 s → 4 s, capped at 10 s. The queue is blocked during the retry, so an entry always reaches the backend before its exit. After **180 s** (`_RETRY_MAX_WAIT_S`) the event is dropped and logged as `edge_send_dropped`.
+  - **Error Classification (`_is_unreachable_error`)**: only errors where the request certainly never arrived are retried (`ConnectionRefusedError`, `WinError 10061`, no route to host, DNS failure). Timeouts are **not** retried, because the backend may already have processed the request. HTTP error responses (400, 404, 500) are final answers and are never retried.
+  - **Heartbeats are not retried**: a failed heartbeat is skipped, so a stale backlog can't delay visitor events after reconnect.
 - **Biometric Face Recognition & Staff vs. Visitor Segregation**:
   - Neural face detection via **SCRFD** (`scrfd_2.5g_bnkps.onnx`) or **YuNet** with anatomical bounding box validation (aspect ratio $0.45$–$1.55$, vertical center $c_y \le 0.50 \cdot h$ on standing crops, eliminating false triggers on floor items, shoes, and dustbins).
   - **ArcFace** (`w600k_r50.onnx`) 512-dimensional feature embedding extraction.
@@ -86,7 +88,12 @@ Detailed architectural flows, mathematical models, and sequence diagrams are doc
   - **High-Resolution Departure Snapshot (`exit_avatar_url`) & Turnaround Departure Forwarding**: Grabs an un-annotated high-resolution exit crop when visitors cross the entrance line in reverse (after dwell $\ge 7.0$s). If a visitor was assigned a fresh turnaround track ID ($< 7.0$s), it is forwarded to the backend appearance engine so active showroom visitors are properly departed.
   - **Exact Tracker Token Lookup & Edge Exclusion Propagation**: Resolves `tracker_id` with strict regex word boundaries against `Tracker #N` notes, ensuring `Tracker #4` never mistakenly matches `Tracker #42`. If the edge detector's exit face contradicts the local track ($< 0.40$), it drops local fallback and transmits `exclude_person_id` to prevent the backend from incorrectly re-attaching that candidate.
   - **Evidence-Gated Edge Exit IDs**: An exit only attaches to a visitor still inside today (not departed, not from a previous day). A `person_id` / tracker sent by the edge is trusted outright only when it is the visitor's own registration tracker (the first `Tracker #N` in notes). Any other edge-supplied ID (face re-ID, handoff) needs the exit photo to back it (body `is_match` or reliable face $\ge 0.52$); otherwise the exit goes to the normal search over all active visitors.
-  - **Re-ID Override in Body Search**: Candidates rank by combined score, but an eligible visitor whose Re-ID beats every other eligible one by $\ge 0.08$ wins (clothing histograms are weak on the washed-out doorway camera).
+  - **Edge Turnaround Face Match**: When the exiting track has no local session, the edge compares a reliable exit face against the other active sessions and against the visitor vector store, both at cosine $\ge 0.65$. If neither matches, it sends `person_id: null` and leaves the match to the backend.
+  - **Direct-Path Vetoes**: A directly addressed visitor (by `person_id` or tracker token) is rejected when a reliable exit face scores $< 0.40$, or when the body clearly contradicts ($\text{ReID} < 0.45$ and clothing $< 0.15$). The visitor is then excluded from the fallback search.
+  - **Fallback Search Order**: (1) reliable face $\ge 0.52$ with margin $\ge 0.035$, rejected only if the body clearly contradicts ($\text{ReID} < 0.40$ and clothing $< 0.20$); (2) body search, where `verify_appearance` must pass, time in store must be $\ge 7$ s and the combined score $\ge 0.48$; (3) the weak Re-ID band. If nothing passes, the exit is not attached.
+  - **Re-ID Override in Body Search**: Candidates rank by combined score, but an eligible visitor whose Re-ID beats every other eligible one by $\ge 0.08$ wins (clothing histograms are weak on the washed-out doorway camera). An override skips the $0.03$ ambiguity guard. When that guard suppresses a match, the weak band is not tried.
+  - **Exit Debug Logs**: Every entry and exit decision is appended as one JSON line to `logs/exit_debug_edge.jsonl` (edge stages such as `edge_entry_confirmed`, `edge_reverse_crossing`, `edge_exit_resolved`, `edge_send_dropped`) and to `logs/exit_debug_backend.jsonl` (candidate scores, `reid_override`, `ambiguous`, `weak_band`, `resolved_to`). Crops of unresolved exits are saved to `logs/exit_debug/`. Backend logging is disabled when `APP_ENV=testing`.
+  - **Edge-Supplied IDs on `/visitors/detect`**: The edge links tracks to visitors at face cosine $0.55$. Before the backend reuses that `person_id` and overwrites the stored entry photo, it checks the new crop against the stored entry photo with `verify_appearance`. On a mismatch, the track is treated as a separate person.
   - **Stale Prior-Day Visit Auto-Closure**: Visitors with unclosed visits from previous calendar days are automatically marked as `"Timed out"` (`is_expired = True`) before matching today's exits, eliminating false departure attachments to legacy records.
   - **Safe Collision-Resistant Visitor ID Minting**: Sequential count-based ID minting (`VIS-2026-XXXX`) performs database uniqueness collision checks (`_mint_person_id`) to prevent silent ID collisions and record overwrites.
   - **Reliable Exit Face Biometric Gating**: Requires minimum eye distance ($eye\_d \ge 16.0\text{ px}$) and face width ($w \ge 42\text{ px}$) before face biometrics can veto an exit crop, preventing blurry or side-profile departure frames from rejecting valid departures.
@@ -111,7 +118,9 @@ Detailed architectural flows, mathematical models, and sequence diagrams are doc
   - **Dashboard SLA Breach & Waiting Badges**: Live counters, waiting duration pills, and unattended alerts surfaced across `OverviewView`, `VisitorsView`, and `VisitPurposeView`.
 - **Dynamic Multi-Camera Handover & Dual-Factor Cross-Camera Re-Identification**:
   - **CrossCameraTracker & Global Identity Synchronization**: Coordinates tracks between entrance cameras (`is_entrance: true`) and interior section cameras (`is_entrance: false`) via `.cross_camera_state.json`.
-  - **Dual-Factor Biometric Matching**: Re-identifies customers moving from entrance to floor sections using both ArcFace facial biometrics ($\ge 0.65$) and OSNet 512-D body Re-ID vectors ($\ge 0.65$) via `PgVectorStoreManager.find_best_visitor_body_match()`, preventing duplicate footfall counts.
+  - **Dual-Factor Biometric Matching** (`process_detection`): A face first matches an *ongoing* visit from today, at cosine $\ge 0.55$ on interior cameras and $\ge 0.60$ on entrance cameras (entrance only for visitors created in the last 4 h). Otherwise it matches the history at `VISITOR_REID_THRESHOLD` ($0.65$). A same-day history match also needs `verify_appearance` to agree when both crops are full-body. Interior cameras have one more net: a face $\ge 0.65$ seen within the last 2 h. The 15-minute body Re-ID window below then catches tracker flips without a usable face.
+  - **Same-day Re-entry (resume)**: A visitor who exits and re-enters the entrance the same day (face match ≥ `VISITOR_REID_THRESHOLD` plus the clothing check) keeps the **same ID**. The old record is reopened (`exit_time` cleared) and a new `{in, out}` segment is appended to `person_identities.visit_log`. The dashboard shows the entry/exit log, and `durationMinutes` is the sum of the segments, so gaps outside the showroom are not counted. A visitor from a previous calendar day still gets a new ID, linked as "Returning (previously VIS-…)".
+  - **Visit Auto-Closure on Re-detection**: An ongoing visit unseen for more than 2 h is closed at its last-seen time. A same-day visitor seen again at the entrance after more than 90 s away (or 30 min on an interior camera) has the previous segment closed at its last-seen time, then re-entry resumes the same record.
   - **Active 15-Minute Re-ID Window**: Automatically merges tracker ID flips for visitors who entered in the last 15 minutes and are looking down or occluded under overhead cameras (passing `verify_appearance` plus $\text{ReID} \ge 0.65$ and $\text{clothing} \ge 0.28$, or $\text{ReID} \ge 0.74$).
   - **Synchronized Identity Linking Callback (`on_visitor_registered_callback`)**: Automatically updates local tracker IDs, zone manager, and snapshots as soon as the persistent ID is minted by the backend.
   - **Cross-Camera Waiting Sync**: Seamlessly syncs accumulated waiting seconds and breach flags between camera streams.
@@ -136,11 +145,11 @@ Detailed architectural flows, mathematical models, and sequence diagrams are doc
   - 2D ground-plane foot contact point calculation ($\frac{x_1 + x_2}{2}, y_2$) with strict directional validation (`top_to_bottom`, `bottom_to_top`, `left_to_right`, `right_to_left`).
 - **Strict Multi-Tier Duplicate Prevention**:
   - In-memory tracker lock (`counted_track_ids: Set[str]`) combined with database-level uniqueness (`UNIQUE` constraint on `visitor_track_id` in `footfall_events`).
-- **Live Video Streaming & Overlays**:
-  - Built-in HTTP MJPEG streaming server for low-latency live preview with AI bounding boxes and tracks directly in the web dashboard.
+- **Local Video Preview & Overlays**:
+  - Each detector process shows AI bounding boxes, tracks and HUD labels in its own OpenCV window (`Capermint Edge AI Detector - Cam <channel>`). Browser live preview is disabled: the backend `/frame` and `/stream` endpoints return `410 Gone`, so the dashboard's Live Preview page shows no video.
 - **Modern Web Dashboard (`dashboard/`)**:
   - Built with React 19, Vite, TypeScript, and Tailwind CSS.
-  - Live CCTV preview, dynamic camera settings, dynamic department configuration, waiting time & SLA alert configuration, employee attendance management, peak hour heatmaps, visitor tagging, and exportable reports.
+  - Dynamic camera settings, dynamic department configuration, waiting time & SLA alert configuration, employee attendance management, peak hour heatmaps, visitor tagging, and exportable reports.
 - **Single-Command & Batch Multi-Camera Orchestration**:
   - Concurrently launch all 3 services (FastAPI, Express Auth, and Vite Dashboard) via `python scripts/run_all.py` or Windows `.bat` / `.ps1` scripts.
   - 1-Click edge detector launch via [`start_detector.bat`](file:///c:/Users/capermint/Desktop/Abhishek/jms/start_detector.bat).
@@ -197,15 +206,21 @@ jms/
 │   ├── repositories/                    # Database repositories
 │   ├── schemas/                         # Pydantic validation schemas (camera, visitor, employee, etc.)
 │   ├── services/                        # Business logic (camera, visitor, analytics, employee, retention)
-│   ├── vision/                          # Server-side vision pipeline & stream readers
+│   ├── vision/                          # Vision pipeline (shared by backend and local_detector.py)
 │   │   ├── detector.py                  # RF-DETR & YOLO model wrapper
 │   │   ├── tracker.py                   # Multi-object tracker integration
+│   │   ├── persistent_tracker.py        # Persistent track ID handling
+│   │   ├── identity_tracker.py          # Track ↔ person identity manager
+│   │   ├── entry_counter.py             # EntryLineCounter (directional line crossings, process_events)
+│   │   ├── stream_reader.py             # RTSP / video stream readers
 │   │   ├── cross_camera_tracker.py      # Cross-camera entity coordination & global ID state
 │   │   ├── face_embedder.py             # ArcFace 512-D embedding extractor
 │   │   ├── body_embedder.py             # OSNet Re-ID embedding & appearance verification
 │   │   ├── clothing_color.py            # Pose-located garment colour tags & clothing similarity
 │   │   ├── employee_recognizer.py       # Biometric matching & voting manager
-│   │   └── vector_store.py              # pgvector search manager
+│   │   ├── vector_store.py              # pgvector search manager
+│   │   ├── cctv_evaluator.py            # Offline CCTV accuracy evaluation
+│   │   └── threshold_evaluator.py       # Offline threshold calibration
 │   └── workers/
 │       └── video_worker.py              # Server-side background ingestion worker
 ├── dashboard/                           # Modern React 19 Web Dashboard
@@ -231,24 +246,41 @@ jms/
 │   ├── run_all_cameras.bat              # Batch script to launch all 4 channels concurrently
 │   ├── run_detector.bat                 # Quick-launch batch script for local_detector.py
 │   ├── benchmark_trackers.py            # ByteTrack vs BoT-SORT performance benchmark
+│   ├── benchmark_vector_search.py       # pgvector search benchmark
+│   ├── verify_hnsw_indexes.py           # Check pgvector HNSW indexes
 │   ├── download_models.py               # Automated weights downloader
+│   ├── enroll_employee_image.py         # Enroll an employee face from an image file
+│   ├── enroll_employee_webcam.py        # Enroll an employee face from a webcam
+│   ├── evaluate_cctv.py                 # Run CCTV accuracy evaluation
+│   ├── evaluate_thresholds.py           # Evaluate face / Re-ID thresholds
+│   ├── test_employee_attendance_interactive.py  # Manual attendance check
 │   ├── start_services.bat / .ps1        # Multi-window startup scripts for Windows
 │   └── stop_services.bat / .ps1         # Safe shutdown scripts for all background services
 ├── static/                              # Static file uploads (employee and visitor photos)
 │   └── uploads/
 │       ├── employees/                   # Registered employee gallery photos
 │       └── visitors/                    # 320x320 retina visitor portrait crops & SLA breach captures
-├── tests/                               # Comprehensive Automated Test Suites
-│   ├── test_waiting_timer.py            # Unit tests for waiting timer, handoff, SLA breach & monotonic bounds
-│   ├── test_cross_camera_tracker.py     # Cross-camera tracking & re-ID tests
-│   ├── test_returning_visitor.py        # Returning visitor recognition tests
-│   ├── test_identity_and_retention.py   # Rolling retention & biometric purge tests
+├── logs/                                # exit_debug_edge.jsonl, exit_debug_backend.jsonl, exit_debug/ crops
+├── tests/                               # pytest suites (in-memory SQLite via conftest.py)
+│   ├── conftest.py                      # Test DB & client fixtures
+│   ├── test_waiting_timer.py            # Waiting timer, handoff, SLA breach & monotonic bounds
+│   ├── test_cross_camera_tracker.py     # Cross-camera tracking & re-ID
+│   ├── test_returning_visitor.py        # Returning visitor recognition (writes into static/uploads/visitors/)
+│   ├── test_identity_and_retention.py   # Rolling retention & biometric purge
 │   ├── test_entry_exit_fixes.py         # Exit matching, visitor ID minting & body-only retention regressions
 │   ├── test_exit_attribution.py         # Evidence-gated edge exit IDs, Re-ID override, latest exit score
 │   ├── test_clothing_color.py           # Pose-located garment extraction, CIE Lab soft histograms & sleeves
-│   ├── test_sync_retry.py               # Crash-resilient DashboardSyncClient FIFO retry & reconnect tests
+│   ├── test_sync_retry.py               # DashboardSyncClient in-order retry & reconnect
 │   ├── test_entry_counter.py            # Directional line crossing geometry & duplicate prevention
-│   └── test_vision.py                   # Model wrapper, detector & tracker integration tests
+│   ├── test_video_worker.py             # Server-side VideoWorker
+│   ├── test_employee_attendance.py      # Punches & daily attendance roll
+│   ├── test_face_recognition_accuracy.py # Face matching accuracy
+│   ├── test_analytics.py / test_cameras.py / test_health.py  # API endpoints
+│   ├── test_database_models.py          # ORM models
+│   ├── test_pgvector_migration.py       # pgvector migration
+│   ├── test_rf_detr_pipeline.py         # RF-DETR detection pipeline
+│   ├── test_tracking_benchmarks.py      # Tracker benchmarks
+│   └── test_vision.py                   # Model wrapper, detector & tracker integration
 ├── .cross_camera_state.json             # Cross-camera persistent state registry
 ├── CLAUDE.md                            # Claude Code project guidelines and operational notes
 ├── alembic/                             # Database migration scripts
@@ -513,7 +545,7 @@ flowchart TD
         I2 --> I3{"Cosine Match against Database?"}
         DB -.->|Query Active Embeddings| I3
         I3 -->|Staff Match| I4["Tagged as STAFF [Name] #ID<br/>Logs Section Dwell Time"]
-        I3 -->|Visitor Match: edge >= 0.55, backend >= 0.65| I5["Matched to VIS-2026-1043<br/>Links Track & Updates Zone Dwell"]
+        I3 -->|Visitor Match: edge >= 0.55, backend active visit >= 0.55| I5["Matched to VIS-2026-1043<br/>Links Track & Updates Zone Dwell"]
         I5 --> I6["POST /api/v1/visitors/update-zone<br/>Footfall count is NOT duplicated"]
     end
 ```
@@ -525,7 +557,7 @@ flowchart TD
 2. **Interior Floor Camera (Channel 201, `is_entrance: false`)**:
    - Runs neural detection and face embedding extraction locally.
    - Queries the active showroom visitor gallery via `visitor_vector_store.find_best_visitor_match()`.
-   - The edge identity manager links the track locally at cosine similarity $\ge 0.55$; the backend (`/visitors/detect`) confirms cross-camera visitor matches at $\ge 0.65$ (`VISITOR_REID_THRESHOLD`) before the track is linked to `VIS-2026-1043`.
+   - The edge identity manager links the track locally at cosine similarity $\ge 0.55$. The backend (`/visitors/detect`) matches today's ongoing visits at $\ge 0.55$ on interior cameras ($\ge 0.60$ on entrance cameras), and matches history at $\ge 0.65$ (`VISITOR_REID_THRESHOLD`). With no match, an interior camera answers `IGNORED_INTERIOR`.
    - The HUD label updates to `Person #ID | VIS-2026-1043 | [Zone Name]`.
    - `VisitorZoneTracker` sends periodic zone dwell updates to `/api/v1/visitors/update-zone` without incrementing walk-in footfall counts.
 
@@ -538,32 +570,42 @@ flowchart TD
 - **Resilient RTSP Auto-Reconnection**: Detects consecutive dropped frames ($> 1.5\text{s}$) and automatically cycles the RTSP TCP socket without crashing or freezing.
 
 ### Detector CLI Arguments Reference
+Most defaults come from `camera_config.json` when the key is set there; the values below are the fallbacks in code.
+
 | Flag | Description | Default |
 |---|---|---|
-| `--channel`, `-c` | Camera channel key defined in `camera_config.json` | `101` |
-| `--source`, `-s` | Direct RTSP URL, video file path, or webcam index (`0`) | Loaded from channel |
-| `--v2` | Enable Roboflow RF-DETR Detection Transformer mode | `False` |
-| `--v1` | Enable YOLO CNN mode | `True` |
-| `--model-type` | Detector architecture: `'yolo'`, `'rtmdet'`, `'rf-detr'`, `'rtdetr'`, or `'auto'` | `'yolo'` |
+| positional `channel_args` | Channel and/or version keyword, e.g. `python local_detector.py 101 v2` | — |
+| `--channel`, `--cam` | Camera channel key defined in `camera_config.json` | `default_channel` from config |
+| `--source` | Direct RTSP URL, video file path, or webcam index (`0`) | Loaded from channel |
+| `--camera-id` | Camera UUID in the backend database | Loaded from channel |
+| `--v2` | Enable Roboflow RF-DETR Detection Transformer mode | off |
+| `--v1` | Force YOLO CNN mode | off |
+| `--model-type` | Detector architecture: `'yolo'`, `'rtmdet'`, `'rf-detr'`, `'rtdetr'`, or `'auto'` | `model_type` from config |
 | `--rf-detr-variant`| RF-DETR model variant: `'nano'`, `'small'`, `'medium'`, `'base'`, `'large'` | `'small'` |
-| `--model`, `-m` | Path to detector weights checkpoint | `'models/yolo26s.pt'` |
+| `--model` | Path to detector weights checkpoint | `'models/yolo26s.pt'` |
 | `--conf` | Person detection confidence threshold | `0.31` |
 | `--imgsz` | Inference input resolution in pixels | `960` / `1024` |
-| `--tracker` | Multi-object tracker: `'bytetrack'`, `'botsort'`, or path to YAML | `bytetrack.yaml` |
-| `--face-model` | Path to SCRFD or YuNet face model | `'models/scrfd_2.5g_bnkps.onnx'` |
+| `--tracker` | Multi-object tracker: `'bytetrack'`, `'botsort'`, or path to YAML | `TRACKER_TYPE` (`bytetrack.yaml`) |
+| `--line-y` | Legacy horizontal entry line position (fraction of frame height) | `0.55` |
+| `--direction` | Legacy entry direction: `top_to_bottom` / `bottom_to_top` | `top_to_bottom` |
+| `--face-model` | Path to SCRFD or YuNet face model | `'models/scrfd_2.5g_bnkps.pt'` |
 | `--face-conf` | Neural face detection confidence threshold | `0.36` |
 | `--face-scale` | Face bounding box scale multiplier | `1.05` |
-| `--sim-thresh` | Biometric face cosine similarity threshold for staff identification | `0.65` |
-| `--show-line` | Display virtual entry line & calculate crossings | `True` |
+| `--sim-thresh` | Biometric face cosine similarity threshold for staff identification | `FACE_SIMILARITY_THRESHOLD` (`0.65`) |
+| `--show-line` | Display virtual entry line & calculate crossings | `show_entry_line` from config (`False`) |
 | `--deadband` | Pixel displacement deadband to eliminate stationary jitter | `6.0` |
+| `--no-smoothing` | Disable EMA box smoothing and face hysteresis | off |
 | `--smoothing-alpha`| EMA coordinate smoothing factor (0.1 to 1.0) | `0.35` |
 | `--face-persistence`| Frames to buffer face detections across temporary drops | `8` |
 | `--body-persistence`| Missing frames before an un-detected person track is purged | `26` |
+| `--max-visual-coast`| Frames a lost box keeps being drawn | `20` |
+| `--min-feet-y` | Minimum normalised feet Y (filters ceiling objects) | `0.20` |
 | `--standalone-faces`| Enable detection of standalone faces behind cubicle partitions | `False` |
-| `--head-fallback` | Enable synthetic anatomical head box fallback when face is turned away | `False` |
-| `--headless` | Run as background service without local OpenCV window | `False` |
+| `--head-fallback` / `--no-head-fallback` | Enable / disable synthetic head box when face is turned away | `show_head_fallback` from config |
+| `--headless` | Run as background service without local OpenCV window | off |
 | `--api-url` | Base URL of FastAPI backend for syncing events | `'http://127.0.0.1:8000'` |
-| `waiting_cutoff_seconds` | Configurable in `camera_config.json` & UI: Cutoff SLA threshold in seconds (e.g. `900.0` for 15 mins) | `900.0` |
+
+`waiting_cutoff_seconds` is not a flag: set it in `camera_config.json` or in the dashboard (default `900`).
 
 ---
 
@@ -600,34 +642,29 @@ flowchart LR
 
 The repository includes end-to-end automated test suites for all major vision and intelligence subsystems:
 
+Tests use an in-memory SQLite database (`tests/conftest.py`), so they don't need PostgreSQL. Run them with the project venv:
+
 ```bash
 # Run all tests
-pytest tests/ -v
+.venv\Scripts\python.exe -m pytest tests -q
 
-# Run Waiting Timer & SLA Breach unit test
-pytest tests/test_waiting_timer.py -v
+# Exit matching (entry/exit fixes, evidence-gated attribution)
+.venv\Scripts\python.exe -m pytest tests/test_entry_exit_fixes.py tests/test_exit_attribution.py -q
 
-# Run Cross-Camera Tracking test
-pytest tests/test_cross_camera_tracker.py -v
+# Clothing colour, pose & garment similarity
+.venv\Scripts\python.exe -m pytest tests/test_clothing_color.py -q
 
-# Run Returning Visitor identification test
-pytest tests/test_returning_visitor.py -v
+# Waiting timer & SLA breach
+.venv\Scripts\python.exe -m pytest tests/test_waiting_timer.py -q
 
-# Run Biometric Retention & Purge test
-pytest tests/test_identity_and_retention.py -v
+# Edge sync reconnection & in-order retry
+.venv\Scripts\python.exe -m pytest tests/test_sync_retry.py -q
 
-# Run Entry/Exit fixes & Body-only Retention test
-pytest tests/test_entry_exit_fixes.py -v
-
-# Run Clothing Color, Pose & Garment Similarity test
-pytest tests/test_clothing_color.py -v
-
-# Run Edge Sync Reconnection & FIFO Retry test
-pytest tests/test_sync_retry.py -v
-
-# Run Directional Entry Line Counter test
-pytest tests/test_entry_counter.py -v
+# Cross-camera tracking, returning visitors, retention, entry line counter
+.venv\Scripts\python.exe -m pytest tests/test_cross_camera_tracker.py tests/test_returning_visitor.py tests/test_identity_and_retention.py tests/test_entry_counter.py -q
 ```
+
+Note: `test_returning_visitor.py` writes snapshot files into the real `static/uploads/visitors/` using IDs such as `VIS-2026-1041`, the same numbering as live data.
 
 ---
 
@@ -669,8 +706,8 @@ All registered endpoints exposed by the FastAPI backend:
 | `POST` | `/api/v1/cameras/{camera_id}/start` | Start server-side background video ingestion worker |
 | `POST` | `/api/v1/cameras/{camera_id}/stop` | Stop server-side background video ingestion worker |
 | `GET` | `/api/v1/cameras/{camera_id}/status` | Check processing status, FPS, and frame counters |
-| `GET` | `/api/v1/cameras/{camera_id}/frame` | Retrieve latest JPEG frame snapshot from camera |
-| `GET` | `/api/v1/cameras/{camera_id}/stream` | Stream live MJPEG video with AI annotations |
+| `GET` | `/api/v1/cameras/{camera_id}/frame` | Disabled: returns `410 Gone` (detection runs on the edge) |
+| `GET` | `/api/v1/cameras/{camera_id}/stream` | Disabled: returns `410 Gone` (detection runs on the edge) |
 | `POST` | `/api/v1/cameras/{camera_id}/footfall` | Synchronize footfall entry events from edge detector |
 | `POST` | `/api/v1/cameras/{camera_id}/heartbeat`| Synchronize periodic runtime telemetry and occupancy |
 
@@ -730,7 +767,7 @@ All registered endpoints exposed by the FastAPI backend:
 ### Running Unit & Integration Tests
 Execute the comprehensive test suite with `pytest`:
 ```bash
-python -m pytest tests -v
+.venv\Scripts\python.exe -m pytest tests -q
 ```
 
 The test suite validates:

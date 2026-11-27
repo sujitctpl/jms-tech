@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { ShowroomProvider } from './context/ShowroomContext';
 import { ErrorBoundary } from './components/common/ErrorBoundary';
@@ -16,9 +17,24 @@ import { TagVisitorModal } from './components/modals/TagVisitorModal';
 import { QuickAddVisitorModal } from './components/modals/QuickAddVisitorModal';
 import { VisitorRecord } from './types';
 
+const VALID_TABS: ActiveTab[] = [
+  'overview',
+  'visitors',
+  'attendance',
+  'peak-hours',
+  'visit-purpose',
+  'reports',
+  'settings',
+];
+
 const DashboardContent: React.FC = () => {
   const { isAuthenticated, isLoading } = useAuth();
-  const [activeTab, setActiveTab] = useState<ActiveTab>('overview');
+  const location = useLocation();
+  const navigate = useNavigate();
+  const pathTab = location.pathname.replace(/^\//, '').split('/')[0] as ActiveTab;
+  const activeTab: ActiveTab = VALID_TABS.includes(pathTab) ? pathTab : 'overview';
+  // Keep the query string (e.g. ?range=last7) when switching pages
+  const setActiveTab = (tab: ActiveTab) => navigate({ pathname: `/${tab}`, search: location.search });
   const [isMobileOpen, setIsMobileOpen] = useState(false);
 
   // Modals state
@@ -59,32 +75,37 @@ const DashboardContent: React.FC = () => {
         />
 
         <main className="flex-1 p-4 sm:p-6 lg:p-8 w-full">
-          {activeTab === 'overview' && (
-            <OverviewView
-              onNavigateTab={(tab) => setActiveTab(tab)}
-              onTagVisitor={(vis) => setSelectedVisitorForTag(vis)}
-              onOpenQuickAdd={() => setIsQuickAddOpen(true)}
+          <Routes>
+            <Route path="/" element={<Navigate to={{ pathname: '/overview', search: location.search }} replace />} />
+            <Route
+              path="/overview"
+              element={
+                <OverviewView
+                  onNavigateTab={(tab) => setActiveTab(tab)}
+                  onTagVisitor={(vis) => setSelectedVisitorForTag(vis)}
+                  onOpenQuickAdd={() => setIsQuickAddOpen(true)}
+                />
+              }
             />
-          )}
-
-          {activeTab === 'visitors' && (
-            <VisitorsView
-              onTagVisitor={(vis) => setSelectedVisitorForTag(vis)}
-              onOpenQuickAdd={() => setIsQuickAddOpen(true)}
+            <Route
+              path="/visitors"
+              element={
+                <VisitorsView
+                  onTagVisitor={(vis) => setSelectedVisitorForTag(vis)}
+                  onOpenQuickAdd={() => setIsQuickAddOpen(true)}
+                />
+              }
             />
-          )}
-
-          {activeTab === 'attendance' && <AttendanceView />}
-
-          {activeTab === 'peak-hours' && <PeakHoursView />}
-
-          {activeTab === 'visit-purpose' && (
-            <VisitPurposeView onTagVisitor={(vis) => setSelectedVisitorForTag(vis)} />
-          )}
-
-          {activeTab === 'reports' && <ReportsView />}
-
-          {activeTab === 'settings' && <SettingsView />}
+            <Route path="/attendance" element={<AttendanceView />} />
+            <Route path="/peak-hours" element={<PeakHoursView />} />
+            <Route
+              path="/visit-purpose"
+              element={<VisitPurposeView onTagVisitor={(vis) => setSelectedVisitorForTag(vis)} />}
+            />
+            <Route path="/reports" element={<ReportsView />} />
+            <Route path="/settings" element={<SettingsView />} />
+            <Route path="*" element={<Navigate to="/overview" replace />} />
+          </Routes>
         </main>
       </div>
 

@@ -178,7 +178,58 @@ def test_same_day_return_after_exit(db_session: Session):
         zone="Entrance",
     )
     resp2 = service.process_detection(req2)
-    assert resp2.status == "VISITOR_CREATED"
+    # Same-day re-entry resumes the SAME record: same ID, a second entry/exit segment.
+    assert resp2.status == "VISITOR_REIDENTIFIED"
     assert resp2.is_new is False
-    assert resp2.visitor.visitorType == "Returning"
-    assert resp2.person_id != morning_pid
+    assert resp2.person_id == morning_pid
+    assert resp2.visitor.exitTime is None  # inside again
+    log = resp2.visitor.visitLog
+    assert len(log) == 2
+    assert log[0].exitTime is not None
+    assert log[1].exitTime is None
+    assert "Re-entry #1" in resp2.visitor.notes
+
+
+def test_same_day_reentry_sums_segments_and_logs_second_exit(db_session: Session):
+    from app.schemas.visitor import VisitorZoneUpdateRequest
+
+    service = VisitorService(db_session)
+    emb = generate_embedding(606)
+    resp1 = service.process_detection(VisitorDetectRequest(
+        camera_name="Entrance Camera",
+        face_image_base64=generate_face_b64(606),
+        face_embedding=emb,
+        zone="Entrance",
+    ))
+    pid = resp1.person_id
+
+    # Rewrite history: first visit 40 min (4:00-4:40 pm IST), departed; last seen 4:40 pm.
+    rec = service.repo.get_by_person_id(pid)
+    today = datetime.now(IST).replace(hour=16, minute=0, second=0, microsecond=0)
+    rec.created_at = today.astimezone(timezone.utc)
+    rec.last_seen_at = (today + timedelta(minutes=40)).astimezone(timezone.utc)
+    rec.exit_time = "04:40 PM"
+    rec.visit_log = None
+    db_session.add(rec)
+    db_session.commit()
+
+    resp2 = service.process_detection(VisitorDetectRequest(
+        camera_name="Entrance Camera",
+        face_image_base64=generate_face_b64(606),
+        face_embedding=emb,
+        zone="Entrance",
+    ))
+    assert resp2.person_id == pid
+    assert len(resp2.visitor.visitLog) == 2
+    assert resp2.visitor.visitLog[0].entryTime == "04:00:00 PM"
+    assert resp2.visitor.visitLog[0].exitTime == "04:40:00 PM"
+
+    # Second exit is appended to the second segment, and the visitor is departed again.
+    service.update_visitor_zone(VisitorZoneUpdateRequest(person_id=pid, exit_time="05:10 PM"))
+    rec = service.repo.get_by_person_id(pid)
+    assert rec.exit_time == "05:10 PM"
+    resp3 = service._to_visitor_response(rec)
+    assert len(resp3.visitLog) == 2
+    assert resp3.visitLog[1].exitTime is not None
+    # Total = first segment (40 min) + a short second one; the idle gap is not counted.
+    assert 40 <= resp3.durationMinutes < 50

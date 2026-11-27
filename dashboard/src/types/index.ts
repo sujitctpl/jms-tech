@@ -25,6 +25,11 @@ export type TaggingStatus = 'Tagged' | 'Untagged';
 
 export type VisitorType = 'New' | 'Returning';
 
+export interface VisitLogEntry {
+  entryTime: string; // e.g. "10:01:00 AM"
+  exitTime: string | null; // null while still inside
+}
+
 export interface VisitorRecord {
   id: string;
   visitorId: string;
@@ -51,6 +56,7 @@ export interface VisitorRecord {
   isWaiting?: boolean;
   waitingBreach?: boolean;
   waitingFormatted?: string;
+  visitLog?: VisitLogEntry[]; // entry/exit pairs; more than one when the visitor left and re-entered
 }
 
 export type AttendanceStatus = 'Present' | 'Absent' | 'Late' | 'On Leave';

@@ -3,6 +3,11 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
+class VisitLogEntry(BaseModel):
+    entryTime: str
+    exitTime: Optional[str] = None
+
+
 class VisitorResponse(BaseModel):
     id: str
     visitorId: str
@@ -21,7 +26,7 @@ class VisitorResponse(BaseModel):
     genderEstimated: Optional[str] = "Unspecified"
     ageGroupEstimated: Optional[str] = "26-35"
     zoneEntered: Optional[str] = "Main Showroom"
-    confidenceScore: float = 0.95
+    confidenceScore: Optional[float] = None  # Entry re-ID score; None for brand-new visitors (nothing to match against)
     exitMatchConfidence: Optional[float] = None
     cameraSource: Optional[str] = "Entrance Camera"
     zoneDwell: Optional[Dict[str, str]] = None
@@ -29,6 +34,7 @@ class VisitorResponse(BaseModel):
     isWaiting: bool = False
     waitingBreach: bool = False
     waitingFormatted: Optional[str] = None
+    visitLog: List[VisitLogEntry] = Field(default_factory=list)
 
 
 class VisitorListResponse(BaseModel):

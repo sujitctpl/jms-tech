@@ -76,6 +76,15 @@ def latest_exit_match_pct(notes: Optional[str]) -> Optional[float]:
         return None
 
 
+def latest_entry_match_pct(notes: Optional[str]) -> Optional[float]:
+    """Re-ID score of the most recent entry that matched a known visitor (None for brand-new visitors)."""
+    found = re.findall(r"Entry Match:\s*([0-9.]+)\s*%", notes or "")
+    try:
+        return float(found[-1]) if found else None
+    except ValueError:
+        return None
+
+
 def _write_exit_debug(event: dict, exit_crop: Optional[np.ndarray] = None) -> None:
     """Appends one JSON line per exit attempt (and saves the crop of unresolved exits) for diagnosis."""
     if settings.APP_ENV == "testing":
@@ -118,6 +127,123 @@ class VisitorService:
         self.embedder = FaceEmbedder()
         self.body_embedder = BodyEmbedder()
 
+    # ------------------------------------------------------------------
+    # Visit log: one {"in", "out"} segment per showroom entry. A same-day re-entry reopens the
+    # existing record (same ID) and appends a segment instead of minting a new visitor.
+    # ------------------------------------------------------------------
+    def _load_visit_log(self, record: PersonIdentity) -> List[dict]:
+        raw = getattr(record, "visit_log", None)
+        if raw:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    segs = [
+                        {"in": s.get("in"), "out": s.get("out")}
+                        for s in data
+                        if isinstance(s, dict) and s.get("in")
+                    ]
+                    if segs:
+                        return segs
+            except Exception:
+                pass
+        # Legacy rows (no log yet): one segment from created_at to exit_time.
+        created = to_ist(record.created_at)
+        if not created:
+            return []
+        out_iso = None
+        ev = getattr(record, "exit_time", None)
+        if ev:
+            out_dt = None
+            try:
+                t = datetime.strptime(ev.strip(), "%I:%M %p").time()
+                out_dt = datetime.combine(created.date(), t, tzinfo=IST)
+            except Exception:
+                out_dt = to_ist(record.last_seen_at)
+            out_iso = max(out_dt or created, created).isoformat()
+        return [{"in": created.isoformat(), "out": out_iso}]
+
+    def _save_visit_log(self, record: PersonIdentity, segs: List[dict]) -> None:
+        record.visit_log = json.dumps(segs)
+
+    def _close_visit_segment(self, record: PersonIdentity, when: Optional[datetime]) -> None:
+        """Close the open segment (if any) at `when`. Safe to call repeatedly."""
+        segs = self._load_visit_log(record)
+        if not segs or segs[-1]["out"] is not None:
+            return
+        entry = datetime.fromisoformat(segs[-1]["in"])
+        end = to_ist(when) or entry
+        segs[-1]["out"] = max(end, entry).isoformat()
+        self._save_visit_log(record, segs)
+
+    def _open_visit_segment(self, record: PersonIdentity, when: datetime) -> int:
+        """Append a new open segment. Returns the number of re-entries (segments - 1)."""
+        segs = self._load_visit_log(record)
+        if segs and segs[-1]["out"] is None:
+            segs[-1]["out"] = (to_ist(record.last_seen_at) or to_ist(when)).isoformat()
+        segs.append({"in": to_ist(when).isoformat(), "out": None})
+        self._save_visit_log(record, segs)
+        return len(segs) - 1
+
+    @staticmethod
+    def _fmt_clock(iso: Optional[str]) -> Optional[str]:
+        if not iso:
+            return None
+        try:
+            return datetime.fromisoformat(iso).astimezone(IST).strftime("%I:%M:%S %p")
+        except Exception:
+            return None
+
+    def _reopen_visit(
+        self,
+        record: PersonIdentity,
+        req: VisitorDetectRequest,
+        now_utc: datetime,
+        similarity: float,
+    ) -> VisitorDetectResponse:
+        """Resume a same-day visitor who left and came back: same ID, new entry segment."""
+        n_reentries = self._open_visit_segment(record, now_utc)
+        record.exit_time = None
+        record.last_seen_at = now_utc
+        if req.camera_name:
+            record.camera_source = req.camera_name
+        if req.zone:
+            record.zone_entered = req.zone
+        if not record.assigned_salesperson:
+            record.is_waiting = bool(getattr(req, "is_waiting", False) or False)
+        # The previous exit photo belongs to the closed segment; the next exit will save a fresh one.
+        if getattr(record, "exit_avatar_url", None):
+            old_f = os.path.join(".", record.exit_avatar_url.lstrip("/").split("?")[0])
+            entry_f = os.path.join(".", record.avatar_url.lstrip("/").split("?")[0]) if record.avatar_url else None
+            if os.path.isfile(old_f) and (not entry_f or os.path.abspath(old_f) != os.path.abspath(entry_f)):
+                try:
+                    os.remove(old_f)
+                except Exception:
+                    pass
+            record.exit_avatar_url = None
+        note = f"Re-entry #{n_reentries}"
+        if req.tracker_id:
+            note += f" (Tracker #{req.tracker_id})"
+        if similarity and similarity > 0:
+            note += f" | Entry Match: {similarity*100:.1f}%"
+        new_notes = f"{record.notes} | {note}" if record.notes else note
+        if len(new_notes) <= 500:
+            record.notes = new_notes
+        self.db.add(record)
+        self.db.commit()
+        self.db.refresh(record)
+        logger.info(
+            "Visitor %s RE-ENTERED (re-entry #%d, similarity %.3f). Resumed same record.",
+            record.person_id, n_reentries, similarity,
+        )
+        return VisitorDetectResponse(
+            status="VISITOR_REIDENTIFIED",
+            is_employee=False,
+            person_id=record.person_id,
+            is_new=False,
+            visitor=self._to_visitor_response(record),
+            message=f"Visitor {record.person_id} re-entered (visit #{n_reentries + 1}). Resumed existing record.",
+        )
+
     def _to_visitor_response(self, record: PersonIdentity) -> VisitorResponse:
         # Convert created_at and last_seen_at to Indian Standard Time (IST) 12-hour AM/PM format
         created_ist = to_ist(record.created_at)
@@ -149,6 +275,7 @@ class VisitorService:
             if created_ist.date() < now_ist.date():
                 exit_time_val = last_seen_str or first_seen_str
                 record.exit_time = exit_time_val
+                self._close_visit_segment(record, last_seen_ist or created_ist)
                 record.is_waiting = False
                 try:
                     self.db.add(record)
@@ -160,12 +287,21 @@ class VisitorService:
                 if (now_ist - last_seen_ist).total_seconds() > 14400:
                     exit_time_val = last_seen_str
                     record.exit_time = exit_time_val
+                    self._close_visit_segment(record, last_seen_ist)
                     record.is_waiting = False
                     try:
                         self.db.add(record)
                         self.db.commit()
                     except Exception:
                         pass
+
+        visit_segs = self._load_visit_log(record)
+        visit_log_out = []
+        for idx, seg in enumerate(visit_segs):
+            out_str = self._fmt_clock(seg["out"])
+            if out_str is None and idx == len(visit_segs) - 1 and exit_time_val:
+                out_str = exit_time_val  # closed via legacy path without a stored out time
+            visit_log_out.append({"entryTime": self._fmt_clock(seg["in"]) or first_seen_str, "exitTime": out_str})
 
         # Calculate duration in minutes (till exit if departed, or till now if active inside)
         duration = 0
@@ -192,6 +328,18 @@ class VisitorService:
                 end_time = now_ist
 
             delta_sec = max(0.0, (end_time - created_ist).total_seconds())
+            # With re-entries, total time is the sum of the in-showroom segments (gaps excluded).
+            if len(visit_segs) > 1:
+                delta_sec = 0.0
+                for idx, seg in enumerate(visit_segs):
+                    s_in = datetime.fromisoformat(seg["in"])
+                    if seg["out"]:
+                        s_out = datetime.fromisoformat(seg["out"])
+                    elif idx == len(visit_segs) - 1:
+                        s_out = end_time
+                    else:
+                        s_out = s_in
+                    delta_sec += max(0.0, (s_out - s_in).total_seconds())
             duration = int(round(delta_sec / 60.0))
 
         # Parse and resolve zone dwell breakdown
@@ -289,7 +437,11 @@ class VisitorService:
             genderEstimated=record.gender_estimated or "Unspecified",
             ageGroupEstimated=record.age_group_estimated or "26-35",
             zoneEntered=record.zone_entered or "Main Showroom",
-            confidenceScore=0.96,
+            confidenceScore=(
+                round(latest_entry_match_pct(record.notes) / 100.0, 3)
+                if latest_entry_match_pct(record.notes) is not None
+                else None
+            ),
             exitMatchConfidence=exit_match_conf,
             cameraSource=record.camera_source or "Entrance Camera",
             zoneDwell=zone_dwell_dict,
@@ -297,6 +449,7 @@ class VisitorService:
             isWaiting=is_waiting,
             waitingBreach=waiting_breach,
             waitingFormatted=waiting_formatted,
+            visitLog=visit_log_out,
         )
 
     def list_visitors(
@@ -797,6 +950,7 @@ class VisitorService:
             record.zone_entered = payload.current_zone
         if payload.exit_time:
             record.exit_time = payload.exit_time
+            self._close_visit_segment(record, now_utc)
             record.is_waiting = False
             # Persist the direct-path verification score so list_visitors can read it from notes
             # instead of re-running OSNet on both photos for every departed visitor on each poll.
@@ -1083,6 +1237,7 @@ class VisitorService:
                 existing_rec.zone_dwell = json.dumps(req.zone_dwell)
             if getattr(req, "exit_time", None):
                 existing_rec.exit_time = req.exit_time
+                self._close_visit_segment(existing_rec, now_utc)
             if face_img is not None and face_img.size > 0:
                 try:
                     os.makedirs("static/uploads/visitors", exist_ok=True)
@@ -1209,6 +1364,7 @@ class VisitorService:
             c_name = (req.camera_name or "").lower()
             is_cam_entrance = ("entrance" in c_name or "gate" in c_name or "door" in c_name or "entry" in c_name)
 
+        returning_match_sim = None
         if embedding is not None:
             visitor_reid_thresh = float(getattr(settings, "VISITOR_REID_THRESHOLD", 0.65))
 
@@ -1232,6 +1388,7 @@ class VisitorService:
                             # If customer hasn't been seen for > 2 hours, prior visit timed out: close it out
                             if c_last_ist and (now_ist - c_last_ist).total_seconds() > 7200.0:
                                 cand.exit_time = c_last_ist.strftime("%I:%M %p")
+                                self._close_visit_segment(cand, c_last_ist)
                                 cand.is_waiting = False
                                 self.db.add(cand)
                                 self.db.commit()
@@ -1249,6 +1406,7 @@ class VisitorService:
                     else:
                         # Stale visit from a previous calendar day: close it out
                         cand.exit_time = c_last_ist.strftime("%I:%M %p") if c_last_ist else "Exited"
+                        self._close_visit_segment(cand, c_last_ist)
                         self.db.add(cand)
                         self.db.commit()
 
@@ -1294,24 +1452,35 @@ class VisitorService:
                                     )
 
                         if appearance_consistent:
-                            # A visit from a previous day OR with an exit_time marked indicates a returning customer
-                            if (hist_ist and hist_ist.date() < now_ist.date()) or history_cand.exit_time is not None:
+                            returning_match_sim = history_sim
+                            if hist_ist and hist_ist.date() < now_ist.date():
+                                # Visit from a previous day: new visit, new ID, linked as a returning customer
                                 is_returning_customer = True
                                 past_record = history_cand
                                 if not history_cand.exit_time:
                                     history_cand.exit_time = h_last_ist.strftime("%I:%M %p") if h_last_ist else "Exited"
+                                    self._close_visit_segment(history_cand, h_last_ist)
                                     self.db.add(history_cand)
                                     self.db.commit()
+                            elif history_cand.exit_time is not None:
+                                # Same day, already departed: this is a re-entry. Resume the same record.
+                                if is_cam_entrance:
+                                    return self._reopen_visit(history_cand, req, now_utc, history_sim)
+                                is_returning_customer = True
+                                past_record = history_cand
                             else:
                                 # Same day and not marked exited:
                                 # If at entrance camera and absent for > 90s, or inside absent for > 30 mins:
-                                # auto-close the previous visit and treat as returning customer
+                                # the previous segment ended when last seen; resume the same record
                                 cutoff_sec = 90.0 if is_cam_entrance else 1800.0
                                 if h_last_ist and (now_ist - h_last_ist).total_seconds() > cutoff_sec:
                                     history_cand.exit_time = h_last_ist.strftime("%I:%M %p")
+                                    self._close_visit_segment(history_cand, h_last_ist)
                                     history_cand.is_waiting = False
                                     self.db.add(history_cand)
                                     self.db.commit()
+                                    if is_cam_entrance:
+                                        return self._reopen_visit(history_cand, req, now_utc, history_sim)
                                     is_returning_customer = True
                                     past_record = history_cand
                                     is_active_session = False
@@ -1484,6 +1653,8 @@ class VisitorService:
         note_text = f"AI Face Detection walk-in (Tracker #{req.tracker_id or 'auto'})"
         if is_returning_customer and past_record:
             note_text = f"Returning customer (previously {past_record.person_id}) | Tracker #{req.tracker_id or 'auto'}"
+            if returning_match_sim:
+                note_text += f" | Entry Match: {returning_match_sim*100:.1f}%"
         elif getattr(req, "appearance", None):
             note_text = f"Appearance: {req.appearance} | Tracker #{req.tracker_id or 'auto'}"
 

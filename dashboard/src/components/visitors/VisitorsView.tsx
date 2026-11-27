@@ -53,9 +53,9 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
 
   // Resolve match confidence metrics for debugging and entry-exit verification
   const { entryMatchPct, exitMatchPct, exitBreakdown } = useMemo(() => {
-    if (!inspectedVisitor) return { entryMatchPct: 96, exitMatchPct: 88, exitBreakdown: '' };
+    if (!inspectedVisitor) return { entryMatchPct: null as number | null, exitMatchPct: 88, exitBreakdown: '' };
 
-    const entryScore = inspectedVisitor.confidenceScore ? Math.round(inspectedVisitor.confidenceScore * 100) : 96;
+    const entryScore = inspectedVisitor.confidenceScore != null ? Math.round(inspectedVisitor.confidenceScore * 100) : null;
 
     const notesStr = inspectedVisitor.notes || '';
     // Use the latest exit score: older ones belong to exits that were later re-opened.
@@ -749,7 +749,7 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
                         : 'bg-emerald-950/90 border-emerald-400/50 text-emerald-300'
                     }`}>
                       <span className={`w-1.5 h-1.5 rounded-full ${inspectedPhotoType === 'exit' ? 'bg-blue-400' : 'bg-emerald-400'} animate-pulse`} />
-                      {inspectedPhotoType === 'exit' ? `ENTRY-EXIT MATCH ${exitMatchPct}%` : `AI MATCH ${entryMatchPct}%`}
+                      {inspectedPhotoType === 'exit' ? `ENTRY-EXIT MATCH ${exitMatchPct}%` : (entryMatchPct != null ? `AI MATCH ${entryMatchPct}%` : 'NEW VISITOR')}
                     </div>
                   </div>
 
@@ -776,17 +776,19 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
                     <p className="text-[11px] text-slate-300 font-medium">
                       {inspectedVisitor.exitAvatarUrl
                         ? (exitBreakdown ? `Verified via ${exitBreakdown}` : 'Verified via Deep OSNet Re-ID & Multi-Part Clothing Color Correlation')
-                        : 'Verified via Biometric Face & OSNet Body Feature Detection'}
+                        : (entryMatchPct != null
+                          ? 'Re-identified via Biometric Face & OSNet Body Features'
+                          : 'First-time visitor: registered on entry line crossing, no prior match to score')}
                     </p>
                   </div>
                   <div className="text-right">
                     <span className={`font-extrabold text-lg sm:text-xl font-mono ${
                       inspectedVisitor.exitAvatarUrl ? 'text-emerald-400' : 'text-cyan-400'
                     }`}>
-                      {inspectedVisitor.exitAvatarUrl ? `${exitMatchPct}%` : `${entryMatchPct}%`}
+                      {inspectedVisitor.exitAvatarUrl ? `${exitMatchPct}%` : (entryMatchPct != null ? `${entryMatchPct}%` : 'NEW')}
                     </span>
                     <span className="text-[9px] text-slate-400 block font-mono">
-                      {inspectedVisitor.exitAvatarUrl ? 'VERIFIED MATCH' : 'CONFIRMED'}
+                      {inspectedVisitor.exitAvatarUrl ? 'VERIFIED MATCH' : (entryMatchPct != null ? 'RE-ID MATCH' : 'REGISTERED')}
                     </span>
                   </div>
                 </div>
@@ -817,6 +819,28 @@ export const VisitorsView: React.FC<VisitorsViewProps> = ({ onTagVisitor, onOpen
                     </p>
                   </div>
                 </div>
+
+                {inspectedVisitor.visitLog && inspectedVisitor.visitLog.length > 0 && (
+                  <div className="p-3 bg-slate-800/60 rounded-xl border border-slate-700/60 text-xs">
+                    <span className="text-slate-400 text-[10px] uppercase font-bold block mb-2">
+                      Entry / Exit Log ({inspectedVisitor.visitLog.length} {inspectedVisitor.visitLog.length === 1 ? 'visit' : 'visits'})
+                    </span>
+                    <div className="space-y-1.5 font-mono">
+                      {inspectedVisitor.visitLog.map((seg, i) => (
+                        <div key={i} className="flex items-center gap-6">
+                          <span className="flex items-center gap-1.5 text-white">
+                            <span className="text-emerald-400 font-bold" title="Entry">↙</span>
+                            {seg.entryTime}
+                          </span>
+                          <span className="flex items-center gap-1.5 text-white">
+                            <span className="text-rose-400 font-bold" title="Exit">↗</span>
+                            {seg.exitTime || <span className="text-emerald-400">Inside</span>}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 {inspectedVisitor.notes && (
                   <div className="p-3 bg-slate-800/40 rounded-xl border border-slate-700/50 text-xs text-slate-300">

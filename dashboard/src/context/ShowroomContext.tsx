@@ -1,3 +1,4 @@
+import { useSearchParams } from 'react-router-dom';
 import React, { createContext, useContext, useState, useEffect, useMemo } from 'react';
 import {
   VisitorRecord,
@@ -283,8 +284,38 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     return saved ? JSON.parse(saved) : INITIAL_SHOWROOM_SETTINGS;
   });
 
-  const [dateFilter, setDateFilter] = useState<DateFilterOption>('today');
-  const [customDateRange, setCustomDateRange] = useState({ start: '2026-10-20', end: '2026-10-26' });
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [dateFilter, setDateFilter] = useState<DateFilterOption>(() => {
+    const r = searchParams.get('range');
+    return r && ['today', 'yesterday', 'last7', 'last30', 'custom'].includes(r) ? (r as DateFilterOption) : 'today';
+  });
+  const [customDateRange, setCustomDateRange] = useState(() => {
+    const qs = searchParams.get('from');
+    const qe = searchParams.get('to');
+    if (qs && qe) return { start: qs, end: qe };
+    const t = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
+    return { start: t, end: t };
+  });
+
+  // Persist the selected analytics period in the URL (shareable / survives refresh)
+  useEffect(() => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (dateFilter === 'today') next.delete('range');
+        else next.set('range', dateFilter);
+        if (dateFilter === 'custom') {
+          next.set('from', customDateRange.start);
+          next.set('to', customDateRange.end);
+        } else {
+          next.delete('from');
+          next.delete('to');
+        }
+        return next;
+      },
+      { replace: true },
+    );
+  }, [dateFilter, customDateRange, setSearchParams]);
   const [isLiveSimulationActive, setIsLiveSimulationActive] = useState<boolean>(false);
   const [lastSimulatedEvent, setLastSimulatedEvent] = useState<string | null>(null);
 
@@ -465,13 +496,14 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           genderEstimated: v.genderEstimated || 'Male',
           ageGroupEstimated: v.ageGroupEstimated || '26-35',
           zoneEntered: v.zoneEntered || 'Main Showroom',
-          confidenceScore: v.confidenceScore || 0.96,
+          confidenceScore: v.confidenceScore ?? undefined,
           cameraSource: v.cameraSource || 'Entrance Camera',
           zoneDwell: v.zoneDwell || { [v.zoneEntered || 'Main Showroom']: `${v.durationMinutes || 1} mins` },
           waitingSeconds: v.waitingSeconds || 0,
           isWaiting: Boolean(v.isWaiting && !v.exitTime && !v.assignedSalesperson),
           waitingBreach: Boolean((v.waitingBreach || (v.waitingSeconds && v.waitingSeconds >= 900)) && !v.exitTime && !v.assignedSalesperson),
           waitingFormatted: v.waitingFormatted || (v.waitingSeconds ? `${Math.floor(v.waitingSeconds / 60)}m ${v.waitingSeconds % 60}s` : '0s'),
+          visitLog: Array.isArray(v.visitLog) ? v.visitLog : [],
         }));
 
         setVisitors(mapped);
@@ -527,7 +559,7 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       genderEstimated: record.genderEstimated || 'Male',
       ageGroupEstimated: record.ageGroupEstimated || '26-35',
       zoneEntered: record.zoneEntered || 'Main Showroom',
-      confidenceScore: 0.96,
+      confidenceScore: undefined,
       cameraSource: record.cameraSource || 'Reception Front Desk',
     };
 
@@ -910,6 +942,16 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       activeVisitors = visitors.filter((v) => !v.date || v.date === todayStr);
     } else if (dateFilter === 'yesterday') {
       activeVisitors = visitors.filter((v) => v.date === yesterdayStr);
+    } else if (dateFilter === 'last7' || dateFilter === 'last30') {
+      const startObj = new Date();
+      startObj.setDate(startObj.getDate() - (dateFilter === 'last7' ? 6 : 29));
+      const startStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(startObj);
+      activeVisitors = visitors.filter((v) => !!v.date && v.date >= startStr && v.date <= todayStr);
+    } else if (dateFilter === 'custom') {
+      const { start, end } = customDateRange;
+      activeVisitors = visitors.filter(
+        (v) => !!v.date && (!start || v.date >= start) && (!end || v.date <= end),
+      );
     }
 
     // Total visitors
@@ -1172,7 +1214,7 @@ export const ShowroomProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       slaCompliancePct,
       currentlyWaitingVisitors,
     };
-  }, [visitors, attendance, sectionCounts, sectionOccupancy, dateFilter, waitingConfig, lastSyncedFootfall]);
+  }, [visitors, attendance, sectionCounts, sectionOccupancy, dateFilter, customDateRange, waitingConfig, lastSyncedFootfall]);
 
   // Export functions
   const exportVisitorsCSV = () => {

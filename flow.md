@@ -26,11 +26,11 @@ graph TD
             PhotoPipeline["Visitor Photo & Exit Optimization\n• Multi-Frame Best-Shot Scoring\n• Occlusion-Aware Upgrades (3.5s)\n• CLAHE Backlight & HSV Attire\n• Departure Capture & Turnaround Forwarding"]
             ZoneTracker["Visitor Zone & Dwell Tracker\n• Live Zone Dwell Accumulator\n• Reverse Exit Line Detector\n• 2-Param Waiting SLA Monitor\n• Cross-Camera Waiting Sync"]
             LineZone["Spatial Analytics Engine\n• Directional Entry-Line Crossing\n• Dynamic Department Dwell Timers"]
-            MJPEG["Local MJPEG Live Stream Server"]
+            Preview["Local OpenCV Preview Window\n(omitted with --headless)"]
             HotReload["Config Hot-Reloader\n(Watches camera_config.json mtime)"]
         end
         
-        SyncQueue["Background Sync Client (DashboardSyncClient)\n• Crash-Resilient In-Order FIFO Queue\n• Backend Auto-Reconnect & Retry"]
+        SyncQueue["Background Sync Client (DashboardSyncClient)\n• In-Order FIFO Queue\n• Retry While Backend Unreachable (≤ 180 s)"]
     end
 
     subgraph Central Backend [FastAPI & Express Backend]
@@ -45,7 +45,7 @@ graph TD
     end
 
     subgraph Client Layer [Modern Web UI]
-        UI["React 19 Dashboard (:5173)\n(Vite + TypeScript + Tailwind CSS)\n• Live CCTV Preview & Stream Playback\n• Dynamic Camera & AI Settings Panel\n• Waiting Time & SLA Alert Settings\n• Visit Purpose Tagging & Zoom Lightbox\n• Dual Entry vs Departure Lightbox Review\n• Real-Time Zone Dwell & Journey Analytics\n• Staff Attendance & Daily Rolls\n• Section Dwell Time & Export Reports"]
+        UI["React 19 Dashboard (:5173)\n(Vite + TypeScript + Tailwind CSS)\n• Dynamic Camera & AI Settings Panel\n• Waiting Time & SLA Alert Settings\n• Visit Purpose Tagging & Zoom Lightbox\n• Dual Entry vs Departure Lightbox Review\n• Real-Time Zone Dwell & Journey Analytics\n• Staff Attendance & Daily Rolls\n• Section Dwell Time & Export Reports"]
     end
 
     CCTV -->|RTSP TCP Stream| RTSP
@@ -61,7 +61,7 @@ graph TD
     EntryGate --> ZoneTracker
     ZoneTracker --> LineZone
     LineZone --> SyncQueue
-    LineZone -.->|Annotated Buffer| MJPEG
+    LineZone -.->|Annotated Frame| Preview
     HotReload -.->|Zero-Downtime Reload| LineZone
 
     SyncQueue -->|HTTP REST JSON| API
@@ -72,8 +72,9 @@ graph TD
     AuthSrv -->|pg Pool / bcrypt| DB
     UI -->|REST API Requests| API
     UI -->|Authentication Requests| AuthSrv
-    UI -.->|MJPEG Live Stream Preview| MJPEG
 ```
+
+Browser live preview is currently disabled. `GET /api/v1/cameras/{id}/frame` and `/stream` return `410 Gone`, and `local_detector.py` has no stream server. Annotated video is shown only in each detector's OpenCV window.
 
 ---
 
@@ -156,21 +157,19 @@ In overhead showroom CCTV feeds, visitors frequently turn 180° away from the en
    - **Weak Re-ID band (backend exit resolver, `visitor_service.update_visitor_zone`)**: front-in vs side/back-out views of the same person often score $0.60 \le \text{reid} < 0.70$. When no candidate passes the main rule, the top band candidate is accepted only if (a) $\text{torso\_sim} \ge 0.80$, colours are compatible, sleeves (short = warm skin-coloured forearms, long = fabric) do not contradict, and reliable trousers do not contradict (`clothing_color.weak_reid_support`); and (b) its reid beats every other in-store visitor by $\ge 0.08$ (with a single visitor, against a stranger baseline of 0.50). Logged in `exit_debug_backend.jsonl` under `weak_band`. Non-matches are capped at 0.45, below the backend's 0.48 exit-eligibility bar.
    - Known limit: two different people in the same plain colours (white shirt + dark trousers) are only separated by reid.
 
-### 2.6 Edge Sync Queue with Crash-Resilient Reconnection (`DashboardSyncClient`)
-Edge-to-backend communication operates over HTTP REST, but physical deployments encounter transient network disruptions, backend server reloads (`uvicorn --reload`), or process restarts. Under naive sync queues, dropped requests result in missed footfall counts, lost visitor portraits, or unclosed visitor sessions. 
+### 2.6 Edge Sync Queue with Reconnect Retry (`DashboardSyncClient`)
+Edge-to-backend communication uses HTTP REST (`urllib`). Backend reloads (`uvicorn --reload`), restarts and network blips would otherwise lose footfall counts, visitor registrations or exits.
 
-The edge detector employs `DashboardSyncClient` with a resilient in-memory retry mechanism:
-1. **Dedicated Worker Thread**: A background daemon thread drains an internal FIFO `queue.Queue`, decoupling high-FPS OpenCV video decoding from network I/O.
-2. **Error Classification (`_is_unreachable_error`)**:
-   - Analyzes low-level socket and URL errors (e.g. `ConnectionRefusedError`, `[WinError 10061] No connection could be made because the target machine actively refused it`, or transient network dropouts).
-   - If the backend is unreachable, the failed event is preserved at the front of the queue, and the worker enters an exponential backoff loop ($1.0\text{s} \to 2.0\text{s} \to 4.0\text{s}$, capped at $10.0\text{s}$).
-3. **Strict In-Order Delivery**:
-   - Critical visitor lifecycle events (`/api/v1/visitors/detect` for ingress creation followed by `/api/v1/visitors/update-zone` for departure/dwell) are guaranteed to arrive in exact chronological sequence once connectivity is restored.
-   - When a visitor enters during a backend reload, the registration payload is held and immediately mints the persistent ID (e.g. `VIS-2026-1099`) as soon as the server wakes, invoking `on_visitor_registered_callback`.
-4. **Selective Telemetry Dropping**:
-   - While critical ingress and egress events are held indefinitely, high-frequency non-critical heartbeats (`send_heartbeat`) are immediately dropped during outages. This prevents stale status telemetry from clogging the pipe or starving visitor registration on reconnect.
-5. **No Redundant 4xx/5xx Retries**:
-   - Standard HTTP client/server responses (such as `404 Not Found` when attempting an exit on an already-departed visitor, or `400 Bad Request`) are treated as authoritative backend answers and are not retried, avoiding infinite poison-pill loops.
+`DashboardSyncClient` (top of `local_detector.py`) works as follows:
+1. **Dedicated Worker Thread**: A daemon thread drains a FIFO `queue.Queue(maxsize=1000)`, so video decoding never waits on network I/O. Events enqueued while the queue is full are dropped.
+2. **Error Classification (`_is_unreachable_error`)**: an error counts as "unreachable" only when the request certainly never reached the backend: `ConnectionRefusedError` / `ConnectionAbortedError`, `actively refused`, `WinError 10061`, no route to host, network unreachable, `getaddrinfo failed`. **Timeouts are excluded**, because the backend may already have processed the request and a retry could duplicate it.
+3. **In-Order Retry (`_send_with_retry`)**:
+   - Retried event types (`_RETRY_EVENTS`): `entry`, `section_entry`, `employee_punch`, `visitor_detect`, `visitor_zone_update`, `delete_visitor`.
+   - The worker retries the **same** event in place with backoff ($1\text{s} \to 2\text{s} \to 4\text{s}$, capped at $10\text{s}$). Nothing behind it is sent meanwhile, so `/visitors/detect` always reaches the backend before the visitor's `/visitors/update-zone` exit.
+   - Retries stop after `_RETRY_MAX_WAIT_S = 180 s`. The event is then dropped and logged as `edge_send_dropped` in `logs/exit_debug_edge.jsonl`.
+   - When a held `/visitors/detect` finally succeeds, the returned `person_id` is passed to `on_visitor_registered` as usual.
+4. **Heartbeats are not retried**: a failed heartbeat is simply skipped, so stale telemetry never delays visitor events after reconnect.
+5. **No 4xx/5xx Retries**: An HTTP error response (e.g. `404` for an exit on an already-departed visitor, `400`) is a final answer from the backend and is never retried.
 
 ---
 
@@ -342,8 +341,8 @@ $$Q = 0.35 \cdot S_{\text{sharpness}} + 0.25 \cdot S_{\text{resolution}} + 0.20 
 * **CLAHE Equalization**: High dynamic range backlighting from showroom glass facades is corrected in LAB color space by applying Contrast Limited Adaptive Histogram Equalization (`clipLimit = 2.2`, `tileGridSize = 8x8`) exclusively to the luminance ($L$) channel, lifting facial shadows without bleaching background highlights.
 * **Retina Standard**: Snapshots are standardized to $320 \times 320\text{ px}$ with Lanczos4 interpolation (`cv2.INTER_LANCZOS4`) and encoded at JPEG quality 95.
 
-### 5.4 Torso HSV Attire Classification
-The upper-torso region ($22\%$ to $60\%$ of total body height) is sampled in HSV color space to classify dominant attire colors (e.g. *Blue / Navy Top*, *White / Light Shirt*, *Red / Maroon Top*, *Black Attire*). This clothing tag is passed into the visitor record and rendered as a visual badge in the dashboard for instant customer association.
+### 5.4 Attire Classification
+`estimate_torso_appearance` (edge) and `BodyEmbedder.estimate_clothing_appearance` (backend) both call `clothing_color.estimate_tag`. That is the pose-located, wall-relative CIE Lab pipeline in §2.5 (items 4–5), not a fixed HSV box. The tag (e.g. *Blue / Navy Top*, *White / Light Shirt*, *Checked / Patterned Shirt*) is stored in the visitor's notes as `Appearance: <tag>` and shown as a badge in the dashboard. On `/visitors/detect` the backend re-estimates the tag from the portrait when the edge sent a weak one (`Casual Attire`, `Walk-in Visitor`, `Gray Attire`).
 
 ### 5.5 Departure Snapshot Capture, Turnaround Forwarding & Dual-Photo Lightbox UX
 When a visitor completes their visit and crosses the entrance line in reverse:
@@ -440,17 +439,28 @@ sequenceDiagram
   To eliminate tracker noise, doorway turnarounds, or delivery people pacing at the threshold from triggering premature exits, `record_visitor_exit` enforces a minimum physical dwell threshold ($\text{dwell} \ge 7.0\text{ seconds}$). If reverse crossing fires with dwell $< 7.0\text{s}$ for an existing active session, the exit update is suppressed and not dispatched to the backend.
 * **Turnaround Forwarding to Backend Appearance Engine**:
   If a turnaround track was newly assigned on departure ($< 7.0\text{s}$ presence) and was not part of an existing local session, it is forwarded directly to the backend appearance matcher so that an active showroom visitor who entered earlier can be matched and departed!
-* **Multi-Factor Departure Verification**:
-  When departure update is dispatched with `exit_image_base64`, the backend validates the exit crop:
-  - If a reliable face is detected in the exit crop ($eye\_d \ge 16.0\text{ px}$, $w \ge 28\text{ px}$), cosine similarity with the candidate visitor must be $\ge 0.40$.
-  - If a full-body crop is available, `BodyEmbedder.verify_appearance` validates OSNet Re-ID and multi-part clothing color consistency.
-  - If appearance contradicts (e.g. inverted attire polarity, different clothing tags, or lower-body conflict), the exit is rejected, preventing accidental attachment of departure timestamps to wrong visitors.
+* **Edge Reverse-Crossing Branches** (main loop, for each `new_exits` track):
+  1. **Staff** → `CHECK_OUT` punch (at most once per employee per 300 s).
+  2. **Entry still pending** (< 7 s since crossing) → entry cancelled locally, footfall not counted. No backend delete is sent: the record is only minted after the 7 s confirmation, and a `person_id` on this track belongs to an existing visitor re-identified by face.
+  3. **Visitor departure** (entrance cameras only) → exit crop taken from the clean frame → `VisitorZoneTracker.record_visitor_exit`.
+* **`record_visitor_exit` (edge)**:
+  - Exit face is used only when reliable ($eye\_d \ge 16\text{ px}$ and $w \ge 42\text{ px}$).
+  - Track with no local session: the reliable exit face is compared against the other active sessions' face embeddings at cosine $\ge 0.65$.
+  - Session found but its face contradicts the exit face ($< 0.40$): the session is dropped and its visitor sent as `exclude_person_id`.
+  - Session with dwell $< 7$ s: suppressed if it has a visitor ID. Without an ID it is a fresh turnaround track and is forwarded to the backend.
+  - Forwarded exits carry `person_id` from `track_to_pid` / the identity manager (not when contradicted), else a vector-store face match $\ge 0.65$, else `null`.
+* **Backend Resolution Order (`update_visitor_zone`, when `exit_time` is set)**:
+  1. **Direct lookup**: `person_id` (unless it equals `exclude_person_id`), then exact `Tracker #N` token among not-departed visitors.
+  2. **Inside-today gate**: a direct record that is expired, already departed, or created before today (IST) is dropped.
+  3. **Direct vetoes**: reliable exit face $< 0.40$ against the record, or body contradiction ($\text{reid} < 0.45 \land \text{clothing} < 0.15$, front-to-back turnarounds lower clothing naturally). Either veto drops the record and excludes it from the search.
+  4. **Evidence gate**: if the tracker is not the record's registration tracker (first `Tracker #N`), the exit photo must back it: body `is_match` or reliable face $\ge 0.52$ (`DIRECT_EXIT_FACE_EVIDENCE`). Otherwise the record is dropped, without a veto, and re-scored in the search like everyone else.
+  5. **Fallback search** over today's not-departed visitors (after auto-closing prior-day ones): face path, then body path, then weak Re-ID band (details below). If nothing passes, the exit is not attached and the request returns `404`.
 * **Turnaround Fallback Search & Stale Record Auto-Closure**:
   If tracker ID flipped on a 180° exit turnaround (e.g. #2 became #6):
   - Stale unclosed visitor records from prior calendar days are automatically closed (`exit_time = "Timed out"`, `is_expired = True`) to prevent contamination.
   - Only visitors created today who have **not yet departed** (`exit_time IS NULL`) are candidates, so a later stranger's exit can never overwrite an earlier departure.
-  - **Face path**: used only when the exit face is reliable ($eye\_d \ge 16\text{ px}$ and $w \ge 28\text{ px}$). Match requires cosine $\ge 0.52$ and a Top-1 vs Top-2 margin $\ge 0.035$ (or a single candidate), plus no clear body/clothing contradiction. Blurry or side-profile faces skip this path, because ArcFace scores on them are poorly separated.
-  - **Body path**: `verify_appearance` must pass with combined score $\ge 0.48$ and time in store $\ge 7.0\text{s}$. If the runner-up candidate scores within $0.03$ of the best (two similarly dressed visitors), the exit is left unattached rather than departing the wrong person.
+  - **Face path**: used only when the exit face is reliable ($eye\_d \ge 16\text{ px}$ and $w \ge 28\text{ px}$). Match requires cosine $\ge 0.52$ and a Top-1 vs Top-2 margin $\ge 0.035$ (or a single candidate). The body must not clearly contradict ($\text{reid} < 0.40 \land \text{clothing} < 0.20$ rejects). Blurry or side-profile faces skip this path, because ArcFace scores on them are poorly separated.
+  - **Body path**: `verify_appearance` must pass with combined score $\ge 0.48$ and time in store $\ge 7.0\text{s}$. The highest combined score wins, unless another eligible visitor's Re-ID beats every other eligible one by $\ge 0.08$ (`REID_OVERRIDE_MARGIN`, the **Re-ID override**). Without an override, a runner-up within $0.03$ of the best (two similarly dressed visitors) leaves the exit unattached rather than departing the wrong person. An ambiguous result also skips the weak band.
   - Any candidate whose reliable face contradicts the exit face ($< 0.40$, or $< 0.38$ on the body path) is vetoed, as is any `exclude_person_id` sent by the edge.
 * **Exact Tracker Lookup**: When the payload has no `person_id`, the backend resolves `tracker_id` against the `Tracker #N` note with an exact token match (`Tracker #4` never matches `Tracker #42`).
 * **Edge Face-Contradiction Exclusion**: If the exit face contradicts the local session ($< 0.40$), the edge drops that visitor (it no longer falls back to the track's own `person_id`) and sends `exclude_person_id` so the backend cannot re-select it.
@@ -462,7 +472,10 @@ sequenceDiagram
 * **Safe Collision-Resistant Visitor ID Minting**:
   - `VisitorService._mint_person_id()` uses atomic count-based generation (`VIS-2026-XXXX`) with rigorous database uniqueness checks.
   - Guarantees that even if visitor rows are deleted or concurrent transactions run, new visitors never overwrite existing active identities.
-* **Persisted Match Score**: Direct-path departures write `Exit Match: XX% (...)` to notes, so `exitMatchConfidence` is read from notes instead of recomputing OSNet on every dashboard poll.
+* **Persisted Match Score**: Every attached exit appends `Exit Match: XX% (...)` to notes (face, body or weak-band score), so `exitMatchConfidence` is read from notes instead of recomputing OSNet on every dashboard poll. A visitor can carry several scores from exits that were later re-opened. Both `latest_exit_match_pct` (backend) and `VisitorsView.tsx` use the **last** one.
+* **Exit Debug Logs**: one JSON line per decision.
+  - `logs/exit_debug_edge.jsonl` (edge): `edge_entry_confirmed`, `edge_reverse_crossing` (branch `staff_checkout` / `bounce_cancelled_pending_entry` / `visitor_departure` / `ignored_not_entrance_camera`), `edge_exit_suppressed`, `edge_exit_resolved`, `edge_exit_sent`, `edge_send_dropped`.
+  - `logs/exit_debug_backend.jsonl` (backend, `stage: backend_exit`): direct record and why it was rejected, per-candidate face/reid/clothing scores and eligibility, `reid_override`, `ambiguous`, `weak_band`, `resolved_to`. The crop of each unresolved exit is saved to `logs/exit_debug/`. Backend logging is off when `APP_ENV=testing`.
 * **Indian Standard Time (IST) Clock**: When reverse crossing is confirmed, the departure timestamp is calculated in `Asia/Kolkata` time (`UTC+05:30`) and recorded:
   ```python
   exit_time = datetime.fromtimestamp(now_ts, tz=IST).strftime("%I:%M %p")
@@ -671,8 +684,12 @@ sequenceDiagram
     Note over EdgeFloor,DB: Footfall count is strictly PRESERVED (NO double counting!)
 ```
 
-1. **Dual-Factor Ingress & Interior Re-Identification**:
-   - **ArcFace Facial Biometrics**: Operating threshold $\ge 0.65$ (`FACE_SIMILARITY_THRESHOLD = 0.65`) ensures high biometric confidence.
+1. **Dual-Factor Ingress & Interior Re-Identification** (`VisitorService.process_detection`, in order):
+   - **Edge-supplied `person_id`**: reused only if that visitor has not departed and the new crop passes `verify_appearance` against the stored entry photo. The edge links at face cosine $0.55$, so an unchecked false link would overwrite another visitor's entry photo.
+   - **Same tracker**: an exact `Tracker #N` token on a not-departed visitor seen within the last 30 s.
+   - **Staff check**: face against employee embeddings at $\ge \max(0.55, \text{FACE\_SIMILARITY\_THRESHOLD}) = 0.65$ → `EMPLOYEE_DETECTED` plus a `CHECK_IN` punch.
+   - **Ongoing visit today** (face): cosine $\ge 0.55$ on interior cameras, $\ge 0.60$ on entrance cameras (entrance: visitor created within the last 4 h). An ongoing visit unseen for more than 2 h is closed, and the person treated as returning.
+   - **History** (face): cosine $\ge 0.65$ (`VISITOR_REID_THRESHOLD`). A same-day candidate must also pass `verify_appearance` when both crops are full-body. A same-day departed visit, or an open one unseen for more than 90 s (entrance) or 30 min (interior), is closed at its last-seen time. At an entrance camera the **same record is then reopened** (same ID, new segment appended to `visit_log`, total duration = sum of segments). Interior cameras still continue an open visit, and a previous-calendar-day match still mints a new "Returning" ID.
    - **OSNet Body Appearance Vector**: Vector searches via `find_best_visitor_body_match()` in pgvector compare 512-D normalized body embeddings.
    - **Active 15-Minute Re-ID Window**: If a customer's face is looking down at jewelry counters or tilted away from high-mounted CCTV cameras, not-yet-departed visitors who entered (`created_at`) within the past 15 minutes are evaluated via `BodyEmbedder.verify_appearance`. If it passes and ($\text{ReID} \ge 0.65$ and $\text{clothing} \ge 0.28$) or $\text{ReID} \ge 0.74$, the track is automatically linked without waiting for a frontal face.
 2. **Persistent Cross-Camera State (`.cross_camera_state.json`)**:
@@ -942,7 +959,8 @@ erDiagram
                                                     ├─► Turnaround Track Departure Forwarding (< 7s fresh tracks)
                                                     ├─► Grab high-DPI departure portrait crop (exit_avatar_url)
                                                     ├─► Reliable Face Biometrics (eye_d >= 16px, w >= 42px) & Appearance Check
-                                                    ├─► Weak Re-ID Band ($0.60 <= ReID < 0.70) & Sleeve Consistency Check
+                                                    ├─► Evidence Gate for Edge IDs & Re-ID Override (margin >= 0.08)
+                                                    ├─► Weak Re-ID Band (0.60 <= ReID < 0.70) & Sleeve Consistency Check
                                                     ├─► Exact Tracker Token Lookup & Edge Exclusion Propagation
                                                     ├─► Auto-close Stale Prior-Day Unclosed Visits ("Timed out")
                                                     ├─► Resolve Entry-Exit Match Confidence (exitMatchConfidence)

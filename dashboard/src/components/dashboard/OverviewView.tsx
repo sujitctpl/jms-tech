@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useShowroom } from '../../context/ShowroomContext';
 import { useAuth } from '../../context/AuthContext';
+import type { DateFilterOption } from '../../types';
 import {
   Users,
   UserCheck,
@@ -132,6 +133,10 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
     staffDepartmentDwell,
     departments,
     waitingConfig,
+    dateFilter,
+    setDateFilter,
+    customDateRange,
+    setCustomDateRange,
   } = useShowroom();
 
   // Interactive Chart States (Neon Wave Curve / Dual Comparative Pillars / Stacked)
@@ -240,38 +245,6 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
         </div>
       </div>
 
-      {/* 🚨 CRITICAL UNATTENDED WAITING CUTOFF BREACH ALERT (> 15 MINS) */}
-      {metrics.waitingBreachCount > 0 && (
-        <div className="bg-gradient-to-r from-red-600 via-rose-600 to-red-700 text-white rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 shadow-lg shadow-red-600/25 border-2 border-red-400 animate-pulse">
-          <div className="flex items-start gap-3.5">
-            <div className="p-2.5 bg-white/20 text-white rounded-xl shrink-0 mt-0.5 border border-white/30">
-              <AlertTriangle className="w-6 h-6 text-white" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-white text-red-700">
-                  Critical SLA Breach (&gt; {waitingConfig?.slaCutoffMinutes || 15} Mins)
-                </span>
-                <span className="w-2.5 h-2.5 rounded-full bg-white animate-ping" />
-              </div>
-              <h2 className="text-base font-extrabold font-['Outfit'] mt-1">
-                {metrics.waitingBreachCount} Customer{metrics.waitingBreachCount > 1 ? 's' : ''} Waiting Unassisted for Over {waitingConfig?.slaCutoffMinutes || 15} Minutes!
-              </h2>
-              <p className="text-xs text-red-100 mt-0.5">
-                Immediate showroom floor action required: No salesperson is near the visitor, and they are outside any department desk.
-              </p>
-            </div>
-          </div>
-          <button
-            onClick={() => onNavigateTab('visitors')}
-            className="px-4 py-2.5 bg-white hover:bg-red-50 text-red-700 hover:text-red-800 text-xs font-bold rounded-xl shadow-md transition-all shrink-0 active:scale-[0.98] flex items-center gap-1.5"
-          >
-            <span>Dispatch Sales Rep Now</span>
-            <ChevronRight className="w-4 h-4" />
-          </button>
-        </div>
-      )}
-
       {/* ⚠️ UNATTENDED WAITING ATTENTION BANNER (< 15 MINS) */}
       {metrics.unattendedWaitingCount > 0 && metrics.waitingBreachCount === 0 && (
         <div className="bg-gradient-to-r from-amber-500/15 via-orange-500/10 to-amber-500/5 border-2 border-amber-300 rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 shadow-sm animate-fadeIn">
@@ -353,13 +326,49 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
               </p>
             </div>
           </div>
-          <button
-            onClick={() => onNavigateTab('visitors')}
-            className="text-xs text-blue-600 hover:text-blue-800 font-bold flex items-center gap-1 self-start sm:self-auto px-3 py-1.5 rounded-xl hover:bg-blue-50 transition border border-transparent hover:border-blue-200"
-          >
-            <span>View Full Visitor Registry</span>
-            <ChevronRight className="w-4 h-4" />
-          </button>
+          <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+            <div className="flex items-center gap-1.5 bg-white border border-slate-200 rounded-xl px-2 py-1 shadow-xs">
+              <Calendar className="w-3.5 h-3.5 text-blue-600" />
+              <select
+                value={dateFilter}
+                onChange={(e) => setDateFilter(e.target.value as DateFilterOption)}
+                className="text-xs font-semibold text-slate-700 bg-transparent outline-none cursor-pointer"
+                aria-label="Analytics period"
+              >
+                <option value="today">Today</option>
+                <option value="yesterday">Yesterday</option>
+                <option value="last7">Last 7 Days</option>
+                <option value="last30">Last 30 Days</option>
+                <option value="custom">Custom Range</option>
+              </select>
+              {dateFilter === 'custom' && (
+                <>
+                  <input
+                    type="date"
+                    value={customDateRange.start}
+                    max={customDateRange.end || undefined}
+                    onChange={(e) => setCustomDateRange({ ...customDateRange, start: e.target.value })}
+                    className="text-xs text-slate-700 bg-transparent outline-none border-l border-slate-200 pl-1.5"
+                  />
+                  <span className="text-xs text-slate-400">–</span>
+                  <input
+                    type="date"
+                    value={customDateRange.end}
+                    min={customDateRange.start || undefined}
+                    onChange={(e) => setCustomDateRange({ ...customDateRange, end: e.target.value })}
+                    className="text-xs text-slate-700 bg-transparent outline-none"
+                  />
+                </>
+              )}
+            </div>
+            <button
+              onClick={() => onNavigateTab('visitors')}
+              className="text-xs text-blue-600 hover:text-blue-800 font-bold flex items-center gap-1 px-3 py-1.5 rounded-xl hover:bg-blue-50 transition border border-transparent hover:border-blue-200"
+            >
+              <span>View Full Visitor Registry</span>
+              <ChevronRight className="w-4 h-4" />
+            </button>
+          </div>
         </div>
 
         {/* 5 Elevated KPI Cards */}
@@ -1868,7 +1877,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 <div className="absolute inset-x-12 inset-y-8 border border-emerald-400/80 rounded-xl pointer-events-none shadow-[0_0_15px_rgba(16,185,129,0.4)] flex flex-col justify-between p-2">
                   <div className="flex justify-between items-start">
                     <span className="bg-emerald-600 text-slate-950 text-[9px] font-black px-1.5 py-0.5 rounded font-mono uppercase tracking-wider">
-                      AI MATCH {inspectedVisitor.confidenceScore ? Math.round(inspectedVisitor.confidenceScore * 100) : 96}%
+                      {inspectedVisitor.confidenceScore != null ? `AI MATCH ${Math.round(inspectedVisitor.confidenceScore * 100)}%` : 'NEW VISITOR'}
                     </span>
                     <span className="text-[8px] font-mono text-emerald-300 bg-black/80 px-1 py-0.5 rounded">
                       ID: {inspectedVisitor.visitorId}
@@ -1900,9 +1909,11 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 </div>
                 <div className="text-right">
                   <span className="font-extrabold text-lg font-mono text-emerald-400">
-                    {inspectedVisitor.confidenceScore ? Math.round(inspectedVisitor.confidenceScore * 100) : 96}%
+                    {inspectedVisitor.confidenceScore != null ? `${Math.round(inspectedVisitor.confidenceScore * 100)}%` : 'NEW'}
                   </span>
-                  <span className="text-[9px] text-slate-400 block font-mono">CONFIRMED</span>
+                  <span className="text-[9px] text-slate-400 block font-mono">
+                    {inspectedVisitor.confidenceScore != null ? 'RE-ID MATCH' : 'NO PRIOR MATCH'}
+                  </span>
                 </div>
               </div>
 
